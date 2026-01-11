@@ -1,0 +1,18 @@
+# PVC for Datasets and Model Checkpoints (CephFS - File Storage)
+# Use rook-cephfs for large files, datasets, model checkpoints
+# Can be attached to MULTIPLE pods (ReadWriteMany)
+#
+# Deploy with: kubectl apply -f pvc-data.yaml -n svcl-self-improve
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: unified-model-data-vol
+  namespace: svcl-self-improve
+spec:
+  storageClassName: rook-cephfs
+  accessModes:
+    - ReadWriteMany  # Multiple pods can mount simultaneously
+  resources:
+    requests:
+      storage: 200Gi  # 200GB for datasets + checkpoints

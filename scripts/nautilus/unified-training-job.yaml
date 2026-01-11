@@ -1,0 +1,178 @@
+# Nautilus Kubernetes Job for Unified Agentic Model Training
+# Follows Nautilus cluster policies exactly:
+# - Uses kind: Job (NOT pod or deployment)
+# - Script runs to completion (NO sleep infinity)
+# - Resource limits within 20% of requests
+# - Uses initContainer for git clone (reproducibility)
+# - Mounts proper PVCs for data persistence
+#
+# PREREQUISITES:
+# 1. Create PVCs first:
+#    kubectl apply -f pvc-conda.yaml -n svcl-self-improve
+#    kubectl apply -f pvc-data.yaml -n svcl-self-improve
+# 2. Set your namespace:
+#    kubectl config set-context nautilus --namespace=svcl-self-improve
+#
+# SUBMIT:
+#    kubectl apply -f unified-training-job.yaml -n svcl-self-improve
+#
+# MONITOR:
+#    kubectl get jobs
+#    kubectl logs -f <pod-name>
+#    kubectl describe job unified-agentic-training
+#
+# DELETE WHEN DONE:
+#    kubectl delete job unified-agentic-training
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: unified-agentic-training
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 3  # Retry 3 times on failure
+  template:
+    spec:
+      restartPolicy: Never
+
+      # === INIT CONTAINER: Git clone the repo ===
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          args:
+            - clone
+            - --single-branch
+            - --branch
+            - main
+            - https://github.com/arjunvad123/unified-model-open-instruct.git
+            - /opt/repo/unified-model-open-instruct
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "200m"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+
+      # === MAIN CONTAINER: Training ===
+      containers:
+        - name: unified-training
+          image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+
+          # Command runs training script to completion (NO sleep infinity)
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "=========================================="
+              echo "Unified Agentic Model Training on Nautilus"
+              echo "=========================================="
+              echo "Start time: $(date)"
+
+              # Install dependencies
+              echo "Installing dependencies..."
+              pip install --no-cache-dir torch transformers datasets accelerate peft bitsandbytes tqdm rich wandb
+              pip install --no-cache-dir flash-attn --no-build-isolation
+
+              # Navigate to code directory
+              cd /code/unified-model-open-instruct
+
+              # Install open-instruct
+              pip install -e .
+
+              # Run training (script runs to COMPLETION)
+              echo "Starting training..."
+              python -m open_instruct.unified_finetune \
+                  --exp_name unified_agentic_7b_nautilus \
+                  --model_name_or_path Qwen/Qwen2.5-7B \
+                  --use_flash_attn true \
+                  --use_qlora true \
+                  --use_lora true \
+                  --lora_rank 64 \
+                  --lora_alpha 128 \
+                  --max_seq_length 1024 \
+                  --embedding_max_length 256 \
+                  --per_device_train_batch_size 4 \
+                  --gradient_accumulation_steps 8 \
+                  --learning_rate 2e-4 \
+                  --num_train_epochs 3 \
+                  --max_embedding_samples 50000 \
+                  --max_generation_samples 50000 \
+                  --max_agentic_samples 25000 \
+                  --embedding_sources toucan,msmarco \
+                  --generation_sources tulu3,ragbench,hotpotqa \
+                  --output_dir /data/unified_model_output/ \
+                  --logging_steps 10 \
+                  --checkpointing_steps 500 \
+                  --gradient_checkpointing true \
+                  --with_tracking false
+
+              echo "=========================================="
+              echo "Training COMPLETE!"
+              echo "End time: $(date)"
+              echo "Output saved to: /data/unified_model_output/"
+              echo "=========================================="
+
+          # === RESOURCE REQUESTS/LIMITS ===
+          # CRITICAL: Limits must be within 20% of requests (Nautilus policy)
+          # GPU utilization must stay above 40% or you get violations
+          resources:
+            requests:
+              memory: "40Gi"
+              cpu: "6"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "48Gi"    # 20% above request
+              cpu: "7"          # ~17% above request
+              nvidia.com/gpu: "1"
+
+          # === VOLUME MOUNTS ===
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: conda-storage
+              mountPath: /root  # Conda/pip cache goes here
+            - name: data-storage
+              mountPath: /data  # Checkpoints and outputs go here
+
+          # === ENVIRONMENT VARIABLES ===
+          env:
+            - name: HF_HOME
+              value: "/data/huggingface_cache"
+            - name: TRANSFORMERS_CACHE
+              value: "/data/huggingface_cache"
+            - name: WANDB_MODE
+              value: "disabled"  # Disable wandb by default
+
+      # === VOLUMES ===
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}  # Temporary volume, cloned fresh each run
+        - name: conda-storage
+          persistentVolumeClaim:
+            claimName: unified-model-conda-vol  # RBD storage
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: unified-model-data-vol   # CephFS storage
+
+      # === GPU AFFINITY: Request high-memory GPUs ===
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-SXM4-40GB
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-PCIE-40GB
+                      - NVIDIA-A100-80GB-PCIe
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-RTX-A6000
+                      - Tesla-V100-SXM2-32GB

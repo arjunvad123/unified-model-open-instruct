@@ -1,0 +1,69 @@
+# Unified Agentic Model - Nautilus Full Training Configuration
+# For use on Nautilus cluster with A100 GPUs
+# Run with: torchrun --nproc_per_node=1 -m open_instruct.unified_finetune \
+#           --config configs/train_configs/unified/nautilus_full.yaml
+
+exp_name: unified_agentic_7b_nautilus
+
+# Model
+model_name_or_path: Qwen/Qwen2.5-7B
+model_revision: main
+use_flash_attn: true
+use_qlora: true
+use_lora: true
+lora_rank: 64
+lora_alpha: 128
+lora_dropout: 0.05
+
+# Sequence lengths
+max_seq_length: 1024
+embedding_max_length: 256
+
+# Training hyperparameters (optimized for A100 40GB)
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 8  # Effective batch size: 32
+learning_rate: 2.0e-04
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.01
+num_train_epochs: 3
+max_train_steps: null  # Let it run full epochs
+
+# Loss weighting (GritLM-inspired)
+contrastive_weight: 0.3
+temperature: 0.07
+
+# Dataset settings (full scale)
+max_embedding_samples: 50000
+max_generation_samples: 50000
+max_agentic_samples: 25000
+embedding_sources:
+  - toucan
+  - msmarco
+generation_sources:
+  - tulu3
+  - ragbench
+  - hotpotqa
+
+# Batch composition (40% embedding, 35% generation, 25% agentic)
+embedding_batch_ratio: 0.4
+generation_batch_ratio: 0.35
+agentic_batch_ratio: 0.25
+
+# Output and logging
+output_dir: /data/unified_model_output/  # Nautilus storage path
+logging_steps: 10
+checkpointing_steps: 500
+keep_last_n_checkpoints: 3
+
+# Misc
+seed: 42
+gradient_checkpointing: true
+with_tracking: true
+report_to:
+  - tensorboard
+  - wandb
+
+# WandB settings (optional)
+# wandb_project_name: unified_agentic_model
+# wandb_entity: your_entity

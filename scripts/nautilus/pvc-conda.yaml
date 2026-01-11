@@ -1,0 +1,18 @@
+# PVC for Conda Environment and Code (RBD - Block Storage)
+# Use rook-ceph-block for conda/pip installs, code compilation
+# Can only be attached to ONE pod at a time (ReadWriteOnce)
+#
+# Deploy with: kubectl apply -f pvc-conda.yaml -n svcl-self-improve
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: unified-model-conda-vol
+  namespace: svcl-self-improve
+spec:
+  storageClassName: rook-ceph-block
+  accessModes:
+    - ReadWriteOnce  # Only one pod can mount at a time
+  resources:
+    requests:
+      storage: 50Gi  # 50GB for conda env + pip packages

@@ -1,0 +1,59 @@
+# Unified Agentic Model - Local Test Configuration
+# Run with: python -m open_instruct.unified_finetune --config configs/train_configs/unified/local_test.yaml
+
+exp_name: unified_local_test
+
+# Model
+model_name_or_path: Qwen/Qwen2.5-0.5B  # Smaller model for local testing
+model_revision: main
+use_flash_attn: false  # Disable for CPU/MPS testing
+use_qlora: false  # Disable quantization for local test
+use_lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+# Sequence lengths
+max_seq_length: 512
+embedding_max_length: 128
+
+# Training hyperparameters (small for local test)
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-04
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+weight_decay: 0.01
+num_train_epochs: 1
+max_train_steps: 50  # Just 50 steps for quick test
+
+# Loss weighting
+contrastive_weight: 0.3
+temperature: 0.07
+
+# Dataset settings (very small for testing)
+max_embedding_samples: 100
+max_generation_samples: 100
+max_agentic_samples: 50
+embedding_sources:
+  - msmarco  # Only MS MARCO for quick load
+generation_sources:
+  - hotpotqa  # Only HotpotQA for quick load
+
+# Batch composition
+embedding_batch_ratio: 0.4
+generation_batch_ratio: 0.35
+agentic_batch_ratio: 0.25
+
+# Output and logging
+output_dir: output/unified_local_test/
+logging_steps: 5
+checkpointing_steps: 25
+keep_last_n_checkpoints: 2
+
+# Misc
+seed: 42
+gradient_checkpointing: false  # Disable for small model
+with_tracking: false
+report_to:
+  - tensorboard
