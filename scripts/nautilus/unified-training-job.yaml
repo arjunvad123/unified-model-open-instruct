@@ -60,7 +60,7 @@ spec:
       # === MAIN CONTAINER: Training ===
       containers:
         - name: unified-training
-          image: nvidia/cuda:12.4.0-cudnn-devel-ubuntu22.04
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
           # Command runs training script to completion (NO sleep infinity)
           command: ["/bin/bash", "-c"]
