@@ -51,8 +51,8 @@ spec:
               memory: "256Mi"
               cpu: "100m"
             limits:
-              memory: "512Mi"
-              cpu: "200m"
+              memory: "300Mi"   # ~17% above request (within 20% Nautilus rule)
+              cpu: "120m"       # 20% above request
           volumeMounts:
             - name: git-repo-code
               mountPath: /opt/repo
@@ -73,10 +73,9 @@ spec:
               echo "=========================================="
               echo "Start time: $(date)"
 
-              # Install dependencies
+              # Install dependencies (no flash-attn to avoid long compilation - using PyTorch SDPA instead)
               echo "Installing dependencies..."
-              pip install --no-cache-dir torch transformers datasets accelerate peft bitsandbytes tqdm rich wandb
-              pip install --no-cache-dir flash-attn --no-build-isolation
+              pip install --no-cache-dir transformers datasets accelerate peft bitsandbytes tqdm rich wandb
 
               # Navigate to code directory
               cd /code/unified-model-open-instruct
@@ -89,7 +88,7 @@ spec:
               python -m open_instruct.unified_finetune \
                   --exp_name unified_agentic_7b_nautilus \
                   --model_name_or_path Qwen/Qwen2.5-7B \
-                  --use_flash_attn true \
+                  --use_flash_attn false \
                   --use_qlora true \
                   --use_lora true \
                   --lora_rank 64 \
@@ -103,8 +102,9 @@ spec:
                   --max_embedding_samples 50000 \
                   --max_generation_samples 50000 \
                   --max_agentic_samples 25000 \
-                  --embedding_sources toucan,msmarco \
-                  --generation_sources tulu3,ragbench,hotpotqa \
+                  --embedding_sources msmarco \
+                  --generation_sources tulu3,ragbench,hotpotqa,toucan \
+                  --contrastive_weight 0.3 \
                   --output_dir /data/unified_model_output/ \
                   --logging_steps 10 \
                   --checkpointing_steps 500 \
