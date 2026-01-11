@@ -60,7 +60,7 @@ spec:
       # === MAIN CONTAINER: Training ===
       containers:
         - name: unified-training
-          image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+          image: nvidia/cuda:12.4.0-cudnn-devel-ubuntu22.04
 
           # Command runs training script to completion (NO sleep infinity)
           command: ["/bin/bash", "-c"]
@@ -73,6 +73,25 @@ spec:
               echo "=========================================="
               echo "Start time: $(date)"
 
+              # Install Python 3.12 (required by open-instruct)
+              echo "Installing Python 3.12..."
+              apt-get update && apt-get install -y software-properties-common
+              add-apt-repository -y ppa:deadsnakes/ppa
+              apt-get update && apt-get install -y python3.12 python3.12-venv python3.12-dev python3-pip git
+              update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+              update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+
+              # Install pip for Python 3.12
+              curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
+
+              # Verify Python version
+              echo "Python version:"
+              python --version
+
+              # Install PyTorch with CUDA 12.4
+              echo "Installing PyTorch..."
+              pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
               # Install dependencies (no flash-attn to avoid long compilation - using PyTorch SDPA instead)
               echo "Installing dependencies..."
               pip install --no-cache-dir transformers datasets accelerate peft bitsandbytes tqdm rich wandb
@@ -80,7 +99,14 @@ spec:
               # Navigate to code directory
               cd /code/unified-model-open-instruct
 
+              # Remove flash-attn and liger-kernel from dependencies to avoid long compilation
+              # (We'll use PyTorch's native SDPA attention instead)
+              echo "Removing flash-attn from dependencies..."
+              sed -i '/flash-attn/d' pyproject.toml
+              sed -i '/liger-kernel/d' pyproject.toml
+
               # Install open-instruct
+              echo "Installing open-instruct..."
               pip install -e .
 
               # Run training (script runs to COMPLETION)
@@ -175,4 +201,4 @@ spec:
                       - NVIDIA-A40
                       - NVIDIA-L40
                       - NVIDIA-RTX-A6000
-                      - Tesla-V100-SXM2-32GB
+                      # V100 removed - CUDA 12.4 doesn't support Volta architecture
