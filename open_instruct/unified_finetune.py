@@ -777,9 +777,20 @@ def main():
     else:
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
-    # Calculate training steps
+    # Prepare with accelerator FIRST (before calculating steps)
+    # This is important because accelerator.prepare() shards the dataloaders
+    model, optimizer = accelerator.prepare(model, optimizer)
+    embedding_loader, generation_loader, agentic_loader = accelerator.prepare(
+        embedding_loader, generation_loader, agentic_loader
+    )
+
+    # Calculate training steps AFTER prepare (so we get the correct sharded lengths)
+    # Each GPU sees len(dataloader) batches, and we accumulate gradients
     total_batches = max(len(embedding_loader), len(generation_loader), len(agentic_loader))
     num_update_steps_per_epoch = math.ceil(total_batches / args.gradient_accumulation_steps)
+
+    logger.info(f"Batches per epoch (after DDP sharding): {total_batches}")
+    logger.info(f"Update steps per epoch: {num_update_steps_per_epoch}")
 
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
@@ -793,11 +804,8 @@ def main():
         num_warmup_steps=num_warmup_steps,
     )
 
-    # Prepare with accelerator
-    model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
-    embedding_loader, generation_loader, agentic_loader = accelerator.prepare(
-        embedding_loader, generation_loader, agentic_loader
-    )
+    # Prepare scheduler after creating it
+    lr_scheduler = accelerator.prepare(lr_scheduler)
 
     # ==========================================================================
     # TRAINING LOOP
