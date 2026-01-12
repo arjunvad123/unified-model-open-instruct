@@ -1,4 +1,5 @@
 # Nautilus Kubernetes Job for Unified Agentic Model Training
+# ============================================================
 # Follows Nautilus cluster policies exactly:
 # - Uses kind: Job (NOT pod or deployment)
 # - Script runs to completion (NO sleep infinity)
@@ -72,47 +73,47 @@ spec:
               echo "Unified Agentic Model Training on Nautilus"
               echo "=========================================="
               echo "Start time: $(date)"
+              echo "GPU Info:"
+              nvidia-smi --query-gpu=name,memory.total --format=csv
 
-              # Install Python 3.12 (required by open-instruct)
-              echo "Installing Python 3.12..."
+              # === INSTALL UV (fast Python package manager) ===
+              echo "Installing uv..."
               export DEBIAN_FRONTEND=noninteractive
-              apt-get update && apt-get install -y software-properties-common
-              add-apt-repository -y ppa:deadsnakes/ppa
-              apt-get update && apt-get install -y --no-install-recommends python3.12 python3.12-venv python3.12-dev python3-pip git curl
-              update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
-              update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+              apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
+              curl -LsSf https://astral.sh/uv/install.sh | sh
+              export PATH="$HOME/.local/bin:$PATH"
 
-              # Install pip for Python 3.12
-              curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
-
-              # Verify Python version
-              echo "Python version:"
-              python --version
-
-              # Install PyTorch with CUDA 12.4
-              echo "Installing PyTorch..."
-              pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-
-              # Install dependencies (no flash-attn to avoid long compilation - using PyTorch SDPA instead)
-              echo "Installing dependencies..."
-              pip install --no-cache-dir transformers datasets accelerate peft bitsandbytes tqdm rich wandb
-
-              # Navigate to code directory
+              # === NAVIGATE TO CODE ===
               cd /code/unified-model-open-instruct
 
-              # Remove flash-attn and liger-kernel from dependencies to avoid long compilation
+              # === MODIFY PYPROJECT.TOML ===
+              # Remove flash-attn and liger-kernel to avoid long compilation
               # (We'll use PyTorch's native SDPA attention instead)
               echo "Removing flash-attn from dependencies..."
               sed -i '/flash-attn/d' pyproject.toml
               sed -i '/liger-kernel/d' pyproject.toml
 
-              # Install open-instruct
-              echo "Installing open-instruct..."
-              pip install -e .
+              # === INSTALL DEPENDENCIES WITH UV ===
+              echo "Installing dependencies with uv (this handles Python 3.12)..."
+              uv sync --frozen 2>/dev/null || uv sync
 
-              # Run training (script runs to COMPLETION)
+              # === VERIFY SETUP ===
+              echo "Python version:"
+              uv run python --version
+              echo "PyTorch version:"
+              uv run python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}')"
+
+              # === RUN TRAINING ===
+              # Per Technical Report:
+              # - Model: Qwen2.5-7B with QLoRA (r=64, alpha=128)
+              # - Combined loss: L_lm + 0.3 × L_contrastive
+              # - Data: 40% embedding, 35% generation, 25% agentic
+              # - Temperature: 0.07
+              echo "=========================================="
               echo "Starting training..."
-              python -m open_instruct.unified_finetune \
+              echo "=========================================="
+
+              uv run python -m open_instruct.unified_finetune \
                   --exp_name unified_agentic_7b_nautilus \
                   --model_name_or_path Qwen/Qwen2.5-7B \
                   --use_flash_attn false \
@@ -120,23 +121,33 @@ spec:
                   --use_lora true \
                   --lora_rank 64 \
                   --lora_alpha 128 \
+                  --lora_dropout 0.05 \
                   --max_seq_length 1024 \
                   --embedding_max_length 256 \
                   --per_device_train_batch_size 4 \
                   --gradient_accumulation_steps 8 \
                   --learning_rate 2e-4 \
+                  --lr_scheduler_type cosine \
+                  --warmup_ratio 0.03 \
+                  --weight_decay 0.01 \
                   --num_train_epochs 3 \
                   --max_embedding_samples 50000 \
                   --max_generation_samples 50000 \
                   --max_agentic_samples 25000 \
                   --embedding_sources msmarco \
-                  --generation_sources tulu3,ragbench,hotpotqa,toucan \
+                  --generation_sources tulu3 \
+                  --embedding_batch_ratio 0.4 \
+                  --generation_batch_ratio 0.35 \
+                  --agentic_batch_ratio 0.25 \
                   --contrastive_weight 0.3 \
+                  --temperature 0.07 \
                   --output_dir /data/unified_model_output/ \
                   --logging_steps 10 \
                   --checkpointing_steps 500 \
+                  --keep_last_n_checkpoints 3 \
                   --gradient_checkpointing true \
-                  --with_tracking false
+                  --with_tracking false \
+                  --seed 42
 
               echo "=========================================="
               echo "Training COMPLETE!"
@@ -162,7 +173,7 @@ spec:
             - name: git-repo-code
               mountPath: /code
             - name: conda-storage
-              mountPath: /root  # Conda/pip cache goes here
+              mountPath: /root  # uv cache goes here
             - name: data-storage
               mountPath: /data  # Checkpoints and outputs go here
 
@@ -172,8 +183,10 @@ spec:
               value: "/data/huggingface_cache"
             - name: TRANSFORMERS_CACHE
               value: "/data/huggingface_cache"
+            - name: UV_CACHE_DIR
+              value: "/root/.cache/uv"
             - name: WANDB_MODE
-              value: "disabled"  # Disable wandb by default
+              value: "disabled"
 
       # === VOLUMES ===
       volumes:
