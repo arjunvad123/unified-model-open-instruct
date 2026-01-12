@@ -151,7 +151,9 @@ spec:
                   --embedding_batch_ratio 0.4 \
                   --generation_batch_ratio 0.35 \
                   --agentic_batch_ratio 0.25 \
-                  --contrastive_weight 0.3 \
+                  --embedding_batch_size 32 \
+                  --gather_embeddings_across_gpus true \
+                  --contrastive_weight 0.5 \
                   --temperature 0.07 \
                   --output_dir /data/unified_model_output/ \
                   --logging_steps 10 \

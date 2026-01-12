@@ -551,6 +551,10 @@ class UnifiedFinetuneArguments:
     contrastive_weight: float = 0.3
     temperature: float = 0.07
 
+    # Embedding-specific settings (CRITICAL for good retrieval)
+    embedding_batch_size: int = 32  # Larger batch = more negatives = better embeddings
+    gather_embeddings_across_gpus: bool = True  # Gather across GPUs for even larger effective batch
+
     # Dataset settings
     max_embedding_samples: int = 10000
     max_generation_samples: int = 10000
@@ -715,14 +719,21 @@ def main():
                 f"Generation: {len(generation_dataset)}, Agentic: {len(agentic_dataset)}")
 
     # Create dataloaders
-    # IMPORTANT: Contrastive learning needs batch_size >= 4 for meaningful negatives
-    embedding_batch_size = max(4, int(args.per_device_train_batch_size * args.embedding_batch_ratio * 4))
-    logger.info(f"Embedding batch size: {embedding_batch_size} (minimum 4 for contrastive learning)")
+    # IMPORTANT: Contrastive learning needs large batch size for meaningful negatives
+    # State-of-the-art embedding models use 256-2048 batch size
+    # We use a dedicated embedding_batch_size argument (default 32)
+    effective_embedding_batch = max(args.embedding_batch_size, 16)  # Minimum 16 for decent negatives
+    logger.info(f"Embedding batch size: {effective_embedding_batch} "
+                f"(gather_across_gpus: {args.gather_embeddings_across_gpus})")
+    if args.gather_embeddings_across_gpus:
+        logger.info(f"Effective batch with {accelerator.num_processes} GPUs: "
+                   f"{effective_embedding_batch * accelerator.num_processes}")
 
     embedding_loader = DataLoader(
         embedding_dataset,
-        batch_size=embedding_batch_size,
+        batch_size=effective_embedding_batch,
         shuffle=True,
+        drop_last=True,  # Drop last incomplete batch for consistent contrastive learning
     )
     generation_loader = DataLoader(
         generation_dataset,
@@ -869,8 +880,22 @@ def main():
                                f"norm: {passage_emb.norm(dim=-1).mean():.4f}, "
                                f"has_nan: {torch.isnan(passage_emb).any()}")
 
-                # Contrastive loss
-                emb_loss = contrastive_loss(query_emb, passage_emb, args.temperature, debug=debug_mode)
+                # Gather embeddings across GPUs for larger effective batch (CRITICAL for good embeddings)
+                # This increases the number of negatives dramatically
+                if args.gather_embeddings_across_gpus and accelerator.num_processes > 1:
+                    # Gather all embeddings across GPUs
+                    all_query_emb = accelerator.gather(query_emb)
+                    all_passage_emb = accelerator.gather(passage_emb)
+
+                    if debug_mode and accelerator.is_main_process:
+                        logger.info(f"[DEBUG Step {completed_steps}] After gathering: "
+                                   f"query shape {all_query_emb.shape}, passage shape {all_passage_emb.shape}")
+
+                    # Compute contrastive loss on gathered embeddings (all processes compute same loss)
+                    emb_loss = contrastive_loss(all_query_emb, all_passage_emb, args.temperature, debug=debug_mode)
+                else:
+                    # Single GPU: use local batch only
+                    emb_loss = contrastive_loss(query_emb, passage_emb, args.temperature, debug=debug_mode)
 
                 # Debug: log contrastive loss
                 if debug_mode and accelerator.is_main_process:
