@@ -1,6 +1,6 @@
 # Nautilus Kubernetes Job for Unified Agentic Model Training
 # ============================================================
-# OPTIMIZED FOR 1x A100 GPU
+# OPTIMIZED FOR 2x High-End GPUs (H100, A100, L40S, A40, RTX 4090, etc.)
 #
 # Follows Nautilus cluster policies exactly:
 # - Uses kind: Job (NOT pod or deployment)
@@ -73,7 +73,7 @@ spec:
 
               echo "=========================================="
               echo "Unified Agentic Model Training on Nautilus"
-              echo "1x A100 GPU Configuration"
+              echo "2x GPU Configuration (Distributed Training)"
               echo "=========================================="
               echo "Start time: $(date)"
               echo "GPU Info:"
@@ -114,17 +114,20 @@ spec:
               # - Data: 40% embedding, 35% generation, 25% agentic
               # - Temperature: 0.07
               #
-              # With 1x A100 (40-80GB):
-              # - Batch size 8 per device
+              # With 2x GPUs:
+              # - Batch size 4 per device (8 total)
               # - Gradient accumulation 8 for effective batch 64
-              # - Embedding batch 32 for good contrastive learning
+              # - Embedding batch 32 per GPU, gathered across GPUs = 64 total
               echo "=========================================="
-              echo "Starting training on 1x A100..."
+              echo "Starting distributed training on 2 GPUs..."
               echo "=========================================="
 
-              # Single GPU training
-              uv run python -m open_instruct.unified_finetune \
-                  --exp_name unified_agentic_7b_A100 \
+              # Multi-GPU training with accelerate
+              uv run accelerate launch \
+                  --num_processes 2 \
+                  --mixed_precision no \
+                  -m open_instruct.unified_finetune \
+                  --exp_name unified_agentic_7b_2xGPU \
                   --model_name_or_path Qwen/Qwen2.5-7B \
                   --use_flash_attn false \
                   --use_qlora true \
@@ -134,7 +137,7 @@ spec:
                   --lora_dropout 0.05 \
                   --max_seq_length 1024 \
                   --embedding_max_length 256 \
-                  --per_device_train_batch_size 8 \
+                  --per_device_train_batch_size 4 \
                   --gradient_accumulation_steps 8 \
                   --learning_rate 2e-4 \
                   --lr_scheduler_type cosine \
@@ -169,16 +172,16 @@ spec:
 
           # === RESOURCE REQUESTS/LIMITS ===
           # CRITICAL: Limits must be within 20% of requests (Nautilus policy)
-          # 1x A100 GPU
+          # 2x GPUs for distributed training
           resources:
             requests:
-              memory: "48Gi"
-              cpu: "8"
-              nvidia.com/gpu: "1"
+              memory: "64Gi"
+              cpu: "10"
+              nvidia.com/gpu: "2"
             limits:
-              memory: "56Gi"    # ~17% above request
-              cpu: "9"          # ~12% above request
-              nvidia.com/gpu: "1"
+              memory: "76Gi"    # ~19% above request
+              cpu: "12"         # 20% above request
+              nvidia.com/gpu: "2"
 
           # === VOLUME MOUNTS ===
           volumeMounts:
@@ -188,6 +191,8 @@ spec:
               mountPath: /root  # uv cache goes here
             - name: data-storage
               mountPath: /data  # Checkpoints and outputs go here
+            - name: shm
+              mountPath: /dev/shm  # Shared memory for multi-GPU NCCL
 
           # === ENVIRONMENT VARIABLES ===
           env:
@@ -201,6 +206,8 @@ spec:
               value: "disabled"
             - name: PYTHONUNBUFFERED
               value: "1"
+            - name: NCCL_DEBUG
+              value: "WARN"
 
       # === VOLUMES ===
       volumes:
@@ -212,8 +219,12 @@ spec:
         - name: data-storage
           persistentVolumeClaim:
             claimName: unified-model-data-vol   # CephFS storage
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"  # Shared memory for NCCL
 
-      # === GPU AFFINITY: Request A100 GPUs only ===
+      # === GPU AFFINITY: High-end GPUs with 24GB+ VRAM ===
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -222,8 +233,27 @@ spec:
                   - key: nvidia.com/gpu.product
                     operator: In
                     values:
-                      # A100 GPUs only (user requested)
+                      # Hopper (H100) - Best
+                      - NVIDIA-H100-80GB-HBM3
+                      - NVIDIA-H100-PCIe
+                      # Ampere (A100) - Excellent
                       - NVIDIA-A100-SXM4-40GB
                       - NVIDIA-A100-SXM4-80GB
                       - NVIDIA-A100-PCIE-40GB
                       - NVIDIA-A100-80GB-PCIe
+                      # Ada Lovelace (L40, L40S) - Great
+                      - NVIDIA-L40
+                      - NVIDIA-L40S
+                      # Ampere Pro (A40) - Good
+                      - NVIDIA-A40
+                      # RTX 4090 - Good for training
+                      - NVIDIA-GeForce-RTX-4090
+                      # RTX A6000/A5000 - Good
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-RTX-A5000
+                      # RTX 3090 - Acceptable
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-3090-Ti
+                      # Quadro
+                      - Quadro-RTX-8000
+                      - Quadro-RTX-6000
