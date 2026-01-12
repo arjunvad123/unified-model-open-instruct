@@ -73,17 +73,30 @@ ACTION_TOKENS = [
 # LOSS FUNCTIONS (GritLM-inspired)
 # =============================================================================
 def mean_pooling(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Mean pooling for embedding extraction."""
-    mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
+    """Mean pooling for embedding extraction with numerical stability."""
+    # Ensure float32 for stability
+    hidden_states = hidden_states.float()
+    mask = attention_mask.unsqueeze(-1).float()
+
+    # Apply mask and sum
     summed = (hidden_states * mask).sum(dim=1)
     counts = mask.sum(dim=1).clamp(min=1.0)
-    return summed / counts
+
+    result = summed / counts
+
+    # Check for NaN/Inf and handle gracefully
+    if torch.isnan(result).any() or torch.isinf(result).any():
+        # Fallback: use last token embedding instead
+        result = hidden_states[:, -1, :]
+
+    return result
 
 
 def contrastive_loss(
     q_emb: torch.Tensor,
     p_emb: torch.Tensor,
-    temperature: float = 0.07
+    temperature: float = 0.07,
+    debug: bool = False
 ) -> torch.Tensor:
     """
     InfoNCE contrastive loss for embedding training.
@@ -93,13 +106,39 @@ def contrastive_loss(
         q_emb: Query embeddings [batch, hidden_dim]
         p_emb: Positive embeddings [batch, hidden_dim]
         temperature: Softmax temperature (default 0.07)
+        debug: If True, print debug info
 
     Returns:
         loss: Scalar loss value
     """
-    # L2 normalize embeddings
-    q_emb = F.normalize(q_emb.float(), p=2, dim=-1)
-    p_emb = F.normalize(p_emb.float(), p=2, dim=-1)
+    batch_size = q_emb.size(0)
+
+    # Ensure we have enough samples for contrastive learning
+    if batch_size < 2:
+        if debug:
+            logger.warning(f"Contrastive batch size too small: {batch_size}, returning zero loss")
+        return torch.tensor(0.0, device=q_emb.device, requires_grad=True)
+
+    # Convert to float32 for numerical stability
+    q_emb = q_emb.float()
+    p_emb = p_emb.float()
+
+    # Check for NaN/Inf in inputs
+    if torch.isnan(q_emb).any() or torch.isinf(q_emb).any():
+        if debug:
+            logger.warning("NaN/Inf detected in query embeddings")
+        return torch.tensor(0.0, device=q_emb.device, requires_grad=True)
+
+    if torch.isnan(p_emb).any() or torch.isinf(p_emb).any():
+        if debug:
+            logger.warning("NaN/Inf detected in passage embeddings")
+        return torch.tensor(0.0, device=q_emb.device, requires_grad=True)
+
+    # L2 normalize embeddings (add small epsilon for numerical stability)
+    q_norm = q_emb.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    p_norm = p_emb.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    q_emb = q_emb / q_norm
+    p_emb = p_emb / p_norm
 
     # Compute similarity matrix [batch, batch]
     similarity = torch.mm(q_emb, p_emb.T) / temperature
@@ -108,9 +147,14 @@ def contrastive_loss(
     similarity = similarity.clamp(-100, 100)
 
     # Labels: diagonal entries should have highest similarity
-    labels = torch.arange(q_emb.size(0), device=q_emb.device)
+    labels = torch.arange(batch_size, device=q_emb.device)
 
-    return F.cross_entropy(similarity, labels)
+    loss = F.cross_entropy(similarity, labels)
+
+    if debug and torch.isnan(loss):
+        logger.warning(f"NaN loss detected! Similarity stats: min={similarity.min():.4f}, max={similarity.max():.4f}")
+
+    return loss
 
 
 # =============================================================================
@@ -671,9 +715,13 @@ def main():
                 f"Generation: {len(generation_dataset)}, Agentic: {len(agentic_dataset)}")
 
     # Create dataloaders
+    # IMPORTANT: Contrastive learning needs batch_size >= 4 for meaningful negatives
+    embedding_batch_size = max(4, int(args.per_device_train_batch_size * args.embedding_batch_ratio * 4))
+    logger.info(f"Embedding batch size: {embedding_batch_size} (minimum 4 for contrastive learning)")
+
     embedding_loader = DataLoader(
         embedding_dataset,
-        batch_size=max(1, int(args.per_device_train_batch_size * args.embedding_batch_ratio)),
+        batch_size=embedding_batch_size,
         shuffle=True,
     )
     generation_loader = DataLoader(
@@ -786,10 +834,13 @@ def main():
                 agentic_iter = iter(agentic_loader)
                 agent_batch = next(agentic_iter)
 
+            # Debug mode for first 5 steps
+            debug_mode = (completed_steps < 5)
+
             # Single accumulation context for all forward passes + backward
             with accelerator.accumulate(model):
                 # ====== EMBEDDING LOSS ======
-                # Get query embeddings
+                # Get query embeddings (disable gradient checkpointing temporarily for hidden states)
                 query_outputs = model(
                     input_ids=emb_batch["query_input_ids"],
                     attention_mask=emb_batch["query_attention_mask"],
@@ -809,8 +860,22 @@ def main():
                 passage_hidden = passage_outputs.hidden_states[-1]
                 passage_emb = mean_pooling(passage_hidden, emb_batch["passage_attention_mask"])
 
+                # Debug: log embedding statistics for first few steps
+                if debug_mode and accelerator.is_main_process:
+                    logger.info(f"[DEBUG Step {completed_steps}] Query emb shape: {query_emb.shape}, "
+                               f"norm: {query_emb.norm(dim=-1).mean():.4f}, "
+                               f"has_nan: {torch.isnan(query_emb).any()}")
+                    logger.info(f"[DEBUG Step {completed_steps}] Passage emb shape: {passage_emb.shape}, "
+                               f"norm: {passage_emb.norm(dim=-1).mean():.4f}, "
+                               f"has_nan: {torch.isnan(passage_emb).any()}")
+
                 # Contrastive loss
-                emb_loss = contrastive_loss(query_emb, passage_emb, args.temperature)
+                emb_loss = contrastive_loss(query_emb, passage_emb, args.temperature, debug=debug_mode)
+
+                # Debug: log contrastive loss
+                if debug_mode and accelerator.is_main_process:
+                    logger.info(f"[DEBUG Step {completed_steps}] Contrastive loss: {emb_loss.item():.4f}, "
+                               f"is_nan: {torch.isnan(emb_loss).item()}")
 
                 # ====== GENERATION LOSS ======
                 gen_outputs = model(

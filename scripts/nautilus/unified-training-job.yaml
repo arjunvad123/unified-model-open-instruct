@@ -1,5 +1,7 @@
 # Nautilus Kubernetes Job for Unified Agentic Model Training
 # ============================================================
+# OPTIMIZED FOR 2x A100 GPUs with Distributed Training
+#
 # Follows Nautilus cluster policies exactly:
 # - Uses kind: Job (NOT pod or deployment)
 # - Script runs to completion (NO sleep infinity)
@@ -71,10 +73,12 @@ spec:
 
               echo "=========================================="
               echo "Unified Agentic Model Training on Nautilus"
+              echo "2x A100 GPU Configuration with Distributed Training"
               echo "=========================================="
               echo "Start time: $(date)"
               echo "GPU Info:"
-              nvidia-smi --query-gpu=name,memory.total --format=csv
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              echo "Number of GPUs: $(nvidia-smi -L | wc -l)"
 
               # === INSTALL UV (fast Python package manager) ===
               echo "Installing uv..."
@@ -101,20 +105,28 @@ spec:
               echo "Python version:"
               uv run python --version
               echo "PyTorch version:"
-              uv run python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}')"
+              uv run python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}, GPU count: {torch.cuda.device_count()}')"
 
-              # === RUN TRAINING ===
+              # === RUN DISTRIBUTED TRAINING ===
               # Per Technical Report:
               # - Model: Qwen2.5-7B with QLoRA (r=64, alpha=128)
               # - Combined loss: L_lm + 0.3 × L_contrastive
               # - Data: 40% embedding, 35% generation, 25% agentic
               # - Temperature: 0.07
+              #
+              # With 2x A100 (80GB each):
+              # - Increased batch size to 8 per device (16 effective)
+              # - Reduced gradient accumulation to 4 (still 64 effective batch)
               echo "=========================================="
-              echo "Starting training..."
+              echo "Starting distributed training on 2 GPUs..."
               echo "=========================================="
 
-              uv run python -m open_instruct.unified_finetune \
-                  --exp_name unified_agentic_7b_nautilus \
+              # Use accelerate launch for multi-GPU training
+              uv run accelerate launch \
+                  --num_processes 2 \
+                  --mixed_precision no \
+                  -m open_instruct.unified_finetune \
+                  --exp_name unified_agentic_7b_2xA100 \
                   --model_name_or_path Qwen/Qwen2.5-7B \
                   --use_flash_attn false \
                   --use_qlora true \
@@ -124,8 +136,8 @@ spec:
                   --lora_dropout 0.05 \
                   --max_seq_length 1024 \
                   --embedding_max_length 256 \
-                  --per_device_train_batch_size 4 \
-                  --gradient_accumulation_steps 8 \
+                  --per_device_train_batch_size 8 \
+                  --gradient_accumulation_steps 4 \
                   --learning_rate 2e-4 \
                   --lr_scheduler_type cosine \
                   --warmup_ratio 0.03 \
@@ -157,16 +169,16 @@ spec:
 
           # === RESOURCE REQUESTS/LIMITS ===
           # CRITICAL: Limits must be within 20% of requests (Nautilus policy)
-          # GPU utilization must stay above 40% or you get violations
+          # 2x A100 GPUs with increased memory for distributed training
           resources:
             requests:
-              memory: "40Gi"
-              cpu: "6"
-              nvidia.com/gpu: "1"
+              memory: "80Gi"
+              cpu: "12"
+              nvidia.com/gpu: "2"
             limits:
-              memory: "48Gi"    # 20% above request
-              cpu: "7"          # ~17% above request
-              nvidia.com/gpu: "1"
+              memory: "96Gi"    # 20% above request
+              cpu: "14"         # ~17% above request
+              nvidia.com/gpu: "2"
 
           # === VOLUME MOUNTS ===
           volumeMounts:
@@ -176,6 +188,8 @@ spec:
               mountPath: /root  # uv cache goes here
             - name: data-storage
               mountPath: /data  # Checkpoints and outputs go here
+            - name: shm
+              mountPath: /dev/shm  # Shared memory for multi-GPU
 
           # === ENVIRONMENT VARIABLES ===
           env:
@@ -187,6 +201,12 @@ spec:
               value: "/root/.cache/uv"
             - name: WANDB_MODE
               value: "disabled"
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_IB_DISABLE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
 
       # === VOLUMES ===
       volumes:
@@ -198,8 +218,12 @@ spec:
         - name: data-storage
           persistentVolumeClaim:
             claimName: unified-model-data-vol   # CephFS storage
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"  # Shared memory for NCCL
 
-      # === GPU AFFINITY: Request high-memory GPUs ===
+      # === GPU AFFINITY: Request A100 GPUs only ===
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -208,27 +232,8 @@ spec:
                   - key: nvidia.com/gpu.product
                     operator: In
                     values:
-                      # Hopper (H100)
-                      - NVIDIA-H100-80GB-HBM3
-                      - NVIDIA-H100-PCIe
-                      # Ampere (A100, A40, A30, A10)
+                      # A100 GPUs only (user requested)
                       - NVIDIA-A100-SXM4-40GB
                       - NVIDIA-A100-SXM4-80GB
                       - NVIDIA-A100-PCIE-40GB
                       - NVIDIA-A100-80GB-PCIe
-                      - NVIDIA-A40
-                      - NVIDIA-A30
-                      - NVIDIA-A10
-                      # Ada Lovelace (L40, RTX 4090)
-                      - NVIDIA-L40
-                      - NVIDIA-L40S
-                      - NVIDIA-GeForce-RTX-4090
-                      - NVIDIA-RTX-4000-Ada-Generation
-                      # Ampere Consumer (RTX 3090)
-                      - NVIDIA-GeForce-RTX-3090
-                      - NVIDIA-GeForce-RTX-3090-Ti
-                      - NVIDIA-RTX-A6000
-                      - NVIDIA-RTX-A5000
-                      # Quadro
-                      - Quadro-RTX-8000
-                      - Quadro-RTX-6000
