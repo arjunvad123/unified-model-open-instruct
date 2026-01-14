@@ -785,12 +785,16 @@ def main():
     )
 
     # Calculate training steps AFTER prepare (so we get the correct sharded lengths)
-    # Each GPU sees len(dataloader) batches, and we accumulate gradients
-    total_batches = max(len(embedding_loader), len(generation_loader), len(agentic_loader))
-    num_update_steps_per_epoch = math.ceil(total_batches / args.gradient_accumulation_steps)
+    # Each GPU sees len(dataloader) batches per epoch
+    # With accelerator.accumulate(), we iterate over ALL batches and it handles accumulation
+    total_batches_per_epoch = max(len(embedding_loader), len(generation_loader), len(agentic_loader))
+    # Number of optimizer updates per epoch = total_batches / gradient_accumulation_steps
+    num_update_steps_per_epoch = math.ceil(total_batches_per_epoch / args.gradient_accumulation_steps)
 
-    logger.info(f"Batches per epoch (after DDP sharding): {total_batches}")
+    logger.info(f"Batches per epoch (after DDP sharding): {total_batches_per_epoch}")
+    logger.info(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
     logger.info(f"Update steps per epoch: {num_update_steps_per_epoch}")
+    logger.info(f"Loop will iterate {total_batches_per_epoch} times per epoch (micro-batches)")
 
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
@@ -833,7 +837,7 @@ def main():
         generation_iter = iter(generation_loader)
         agentic_iter = iter(agentic_loader)
 
-        for step in range(num_update_steps_per_epoch):
+        for step in range(total_batches_per_epoch):
             # Fetch batches
             try:
                 emb_batch = next(embedding_iter)
