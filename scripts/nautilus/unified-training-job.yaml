@@ -1,6 +1,6 @@
 # Nautilus Kubernetes Job for Unified Agentic Model Training
 # ============================================================
-# OPTIMIZED FOR 2x High-End GPUs (H100, A100, L40S, A40, RTX 4090, etc.)
+# OPTIMIZED FOR 4x L40S-48GB GPUs (Full Training Run with FIXED loop)
 #
 # Follows Nautilus cluster policies exactly:
 # - Uses kind: Job (NOT pod or deployment)
@@ -8,13 +8,6 @@
 # - Resource limits within 20% of requests
 # - Uses initContainer for git clone (reproducibility)
 # - Mounts proper PVCs for data persistence
-#
-# PREREQUISITES:
-# 1. Create PVCs first:
-#    kubectl apply -f pvc-conda.yaml -n svcl-self-improve
-#    kubectl apply -f pvc-data.yaml -n svcl-self-improve
-# 2. Set your namespace:
-#    kubectl config set-context nautilus --namespace=svcl-self-improve
 #
 # SUBMIT:
 #    kubectl apply -f unified-training-job.yaml -n svcl-self-improve
@@ -73,7 +66,7 @@ spec:
 
               echo "=========================================="
               echo "Unified Agentic Model Training on Nautilus"
-              echo "2x GPU Configuration (Distributed Training)"
+              echo "4x L40S-48GB GPU Configuration (Distributed Training)"
               echo "=========================================="
               echo "Start time: $(date)"
               echo "GPU Info:"
@@ -110,24 +103,24 @@ spec:
               # === RUN DISTRIBUTED TRAINING ===
               # Per Technical Report:
               # - Model: Qwen2.5-7B with QLoRA (r=64, alpha=128)
-              # - Combined loss: L_lm + 0.3 × L_contrastive
+              # - Combined loss: L_lm + 0.5 × L_contrastive
               # - Data: 40% embedding, 35% generation, 25% agentic
               # - Temperature: 0.07
               #
-              # With 2x GPUs:
-              # - Batch size 4 per device (8 total)
-              # - Gradient accumulation 8 for effective batch 64
-              # - Embedding batch 32 per GPU, gathered across GPUs = 64 total
+              # With 4x L40S-48GB GPUs:
+              # - Batch size 4 per device (16 total)
+              # - Gradient accumulation 4 for effective batch 64
+              # - Embedding batch 32 per GPU, gathered across GPUs = 128 total
               echo "=========================================="
-              echo "Starting distributed training on 2 GPUs..."
+              echo "Starting distributed training on 4x L40S-48GB GPUs..."
               echo "=========================================="
 
-              # Multi-GPU training with accelerate
+              # Multi-GPU training with accelerate (4x L40S-48GB)
               uv run accelerate launch \
-                  --num_processes 2 \
+                  --num_processes 4 \
                   --mixed_precision no \
                   -m open_instruct.unified_finetune \
-                  --exp_name unified_agentic_7b_2xGPU \
+                  --exp_name unified_agentic_7b_4xL40S \
                   --model_name_or_path Qwen/Qwen2.5-7B \
                   --use_flash_attn false \
                   --use_qlora true \
@@ -137,8 +130,8 @@ spec:
                   --lora_dropout 0.05 \
                   --max_seq_length 1024 \
                   --embedding_max_length 256 \
-                  --per_device_train_batch_size 2 \
-                  --gradient_accumulation_steps 16 \
+                  --per_device_train_batch_size 4 \
+                  --gradient_accumulation_steps 4 \
                   --learning_rate 2e-4 \
                   --lr_scheduler_type cosine \
                   --warmup_ratio 0.03 \
@@ -152,11 +145,11 @@ spec:
                   --embedding_batch_ratio 0.4 \
                   --generation_batch_ratio 0.35 \
                   --agentic_batch_ratio 0.25 \
-                  --embedding_batch_size 16 \
+                  --embedding_batch_size 32 \
                   --gather_embeddings_across_gpus true \
                   --contrastive_weight 0.5 \
                   --temperature 0.07 \
-                  --output_dir /data/unified_model_output/ \
+                  --output_dir /data/unified_model_output_4xL40S/ \
                   --logging_steps 10 \
                   --checkpointing_steps 500 \
                   --keep_last_n_checkpoints 3 \
@@ -167,21 +160,21 @@ spec:
               echo "=========================================="
               echo "Training COMPLETE!"
               echo "End time: $(date)"
-              echo "Output saved to: /data/unified_model_output/"
+              echo "Output saved to: /data/unified_model_output_4xA100/"
               echo "=========================================="
 
           # === RESOURCE REQUESTS/LIMITS ===
           # CRITICAL: Limits must be within 20% of requests (Nautilus policy)
-          # 2x GPUs for distributed training
+          # 4x L40S-48GB GPUs for distributed training
           resources:
             requests:
               memory: "64Gi"
-              cpu: "10"
-              nvidia.com/gpu: "2"
+              cpu: "16"
+              nvidia.com/gpu: "4"
             limits:
               memory: "76Gi"    # ~19% above request
-              cpu: "12"         # 20% above request
-              nvidia.com/gpu: "2"
+              cpu: "19"         # ~19% above request
+              nvidia.com/gpu: "4"
 
           # === VOLUME MOUNTS ===
           volumeMounts:
@@ -214,17 +207,15 @@ spec:
         - name: git-repo-code
           emptyDir: {}  # Temporary volume, cloned fresh each run
         - name: conda-storage
-          persistentVolumeClaim:
-            claimName: unified-model-conda-vol  # RBD storage
+          emptyDir: {}  # Use emptyDir for flexibility
         - name: data-storage
-          persistentVolumeClaim:
-            claimName: unified-model-data-vol   # CephFS storage
+          emptyDir: {}  # Use emptyDir to avoid PVC region constraints
         - name: shm
           emptyDir:
             medium: Memory
-            sizeLimit: "16Gi"  # Shared memory for NCCL
+            sizeLimit: "32Gi"  # Larger shared memory for A100 NCCL
 
-      # === GPU AFFINITY: High-end GPUs with 24GB+ VRAM ===
+      # === GPU AFFINITY: L40S GPUs (48GB VRAM) ===
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -233,27 +224,10 @@ spec:
                   - key: nvidia.com/gpu.product
                     operator: In
                     values:
-                      # Hopper (H100) - Best
-                      - NVIDIA-H100-80GB-HBM3
-                      - NVIDIA-H100-PCIe
-                      # Ampere (A100) - Excellent
-                      - NVIDIA-A100-SXM4-40GB
-                      - NVIDIA-A100-SXM4-80GB
-                      - NVIDIA-A100-PCIE-40GB
-                      - NVIDIA-A100-80GB-PCIe
-                      # Ada Lovelace (L40, L40S) - Great
-                      - NVIDIA-L40
                       - NVIDIA-L40S
-                      # Ampere Pro (A40) - Good
-                      - NVIDIA-A40
-                      # RTX 4090 - Good for training
-                      - NVIDIA-GeForce-RTX-4090
-                      # RTX A6000/A5000 - Good
-                      - NVIDIA-RTX-A6000
-                      - NVIDIA-RTX-A5000
-                      # RTX 3090 - Acceptable
-                      - NVIDIA-GeForce-RTX-3090
-                      - NVIDIA-GeForce-RTX-3090-Ti
-                      # Quadro
-                      - Quadro-RTX-8000
-                      - Quadro-RTX-6000
+
+      # Tolerate GPU nodes
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule
