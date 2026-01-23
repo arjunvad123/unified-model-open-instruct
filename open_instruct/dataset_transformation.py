@@ -957,6 +957,19 @@ REJECTED_LABELS_KEY = "rejected_labels"
 INPUT_IDS_PROMPT_KEY = "input_ids_prompt"
 ATTENTION_MASK_PROMPT_KEY = "attention_mask_prompt"
 
+# Contrastive embedding keys
+QUERY_INPUT_IDS_KEY = "query_input_ids"
+QUERY_ATTENTION_MASK_KEY = "query_attention_mask"
+POS_INPUT_IDS_KEY = "pos_input_ids"
+POS_ATTENTION_MASK_KEY = "pos_attention_mask"
+NEG_INPUT_IDS_KEY = "neg_input_ids"
+NEG_ATTENTION_MASK_KEY = "neg_attention_mask"
+TOKENIZED_CONTRASTIVE_DATASET_KEYS = [
+    QUERY_INPUT_IDS_KEY, QUERY_ATTENTION_MASK_KEY,
+    POS_INPUT_IDS_KEY, POS_ATTENTION_MASK_KEY,
+    NEG_INPUT_IDS_KEY, NEG_ATTENTION_MASK_KEY,
+]
+
 TOKENIZED_PREFERENCE_DATASET_KEYS = [
     CHOSEN_INPUT_IDS_KEY,
     CHOSEN_LABELS_KEY,
@@ -1406,6 +1419,51 @@ def rlvr_max_length_filter_v2(
     return len(row[INPUT_IDS_PROMPT_KEY]) <= max_prompt_token_length
 
 
+def contrastive_tokenize_v1(row: Dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
+    """Tokenize query/positive/negative triplets for contrastive embedding training.
+
+    Input format: {"query": "...", "positive": "...", "negative": "..."}
+    Output: tokenized versions of each field with input_ids and attention_mask.
+
+    The query is prefixed with <ACT:RET> to teach the model to produce
+    embeddings when the retrieval action token is active.
+    """
+    query_text = "<ACT:RET> " + row["query"]
+    pos_text = row["positive"]
+    neg_text = row["negative"]
+
+    query_enc = tokenizer(
+        query_text, truncation=True, max_length=max_seq_length,
+        padding=False, return_tensors=None,
+    )
+    pos_enc = tokenizer(
+        pos_text, truncation=True, max_length=max_seq_length,
+        padding=False, return_tensors=None,
+    )
+    neg_enc = tokenizer(
+        neg_text, truncation=True, max_length=max_seq_length,
+        padding=False, return_tensors=None,
+    )
+
+    return {
+        QUERY_INPUT_IDS_KEY: query_enc["input_ids"],
+        QUERY_ATTENTION_MASK_KEY: query_enc["attention_mask"],
+        POS_INPUT_IDS_KEY: pos_enc["input_ids"],
+        POS_ATTENTION_MASK_KEY: pos_enc["attention_mask"],
+        NEG_INPUT_IDS_KEY: neg_enc["input_ids"],
+        NEG_ATTENTION_MASK_KEY: neg_enc["attention_mask"],
+    }
+
+
+def contrastive_filter_v1(row: Dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
+    """Filter out examples where any field is empty after tokenization."""
+    return (
+        len(row.get(QUERY_INPUT_IDS_KEY, [])) > 0
+        and len(row.get(POS_INPUT_IDS_KEY, [])) > 0
+        and len(row.get(NEG_INPUT_IDS_KEY, [])) > 0
+    )
+
+
 TRANSFORM_FNS = {
     "sft_tokenize_v1": (sft_tokenize_v1, "map"),
     "sft_tokenize_mask_out_prompt_v1": (sft_tokenize_mask_out_prompt_v1, "map"),
@@ -1418,6 +1476,8 @@ TRANSFORM_FNS = {
     "preference_tulu_filter_v1": (preference_tulu_filter_v1, "filter"),
     "rlvr_tokenize_v1": (rlvr_tokenize_v3, "map"),
     "rlvr_max_length_filter_v1": (rlvr_max_length_filter_v2, "filter"),
+    "contrastive_tokenize_v1": (contrastive_tokenize_v1, "map"),
+    "contrastive_filter_v1": (contrastive_filter_v1, "filter"),
 }
 
 
