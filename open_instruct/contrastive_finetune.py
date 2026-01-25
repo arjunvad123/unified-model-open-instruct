@@ -8,18 +8,16 @@
 # via mean pooling over hidden states, trained with InfoNCE contrastive loss.
 #
 # Usage:
-#   accelerate launch open_instruct/contrastive_finetune.py \
+#   uv run accelerate launch open_instruct/contrastive_finetune.py \
 #       --model_name_or_path Qwen/Qwen2.5-3B-Instruct \
+#       --lora_path output/action_token_stage1_large \
 #       --dataset_mixer_list data/contrastive_train.jsonl 1.0 \
 #       --temperature 0.05 \
 #       --per_device_train_batch_size 8 \
 #       --learning_rate 2e-5 \
 #       --num_train_epochs 3 \
 #       --output_dir output/unified_embedding_v1
-#
-# Standalone version - no heavy open_instruct dependencies
 
-import json
 import math
 import os
 import time
@@ -31,26 +29,29 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from datasets import Dataset
-from peft import LoraConfig, get_peft_model, PeftModel
+from peft import PeftModel
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    HfArgumentParser,
     get_scheduler,
 )
 
-logger = get_logger(__name__)
+from open_instruct.dataset_transformation import (
+    QUERY_INPUT_IDS_KEY,
+    QUERY_ATTENTION_MASK_KEY,
+    POS_INPUT_IDS_KEY,
+    POS_ATTENTION_MASK_KEY,
+    NEG_INPUT_IDS_KEY,
+    NEG_ATTENTION_MASK_KEY,
+    TOKENIZED_CONTRASTIVE_DATASET_KEYS,
+    TokenizerConfig,
+    get_cached_dataset_tulu,
+)
+from open_instruct.utils import ArgumentParserPlus
 
-# Dataset keys - defined inline to avoid import dependencies
-QUERY_INPUT_IDS_KEY = "query_input_ids"
-QUERY_ATTENTION_MASK_KEY = "query_attention_mask"
-POS_INPUT_IDS_KEY = "pos_input_ids"
-POS_ATTENTION_MASK_KEY = "pos_attention_mask"
-NEG_INPUT_IDS_KEY = "neg_input_ids"
-NEG_ATTENTION_MASK_KEY = "neg_attention_mask"
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -72,9 +73,13 @@ class ContrastiveFinetuneArguments:
     )
 
     # Dataset
-    dataset_mixer_list: List[str] = field(
+    dataset_mixer_list: list[str] = field(
         default_factory=lambda: ["data/contrastive_train.jsonl", "1.0"],
         metadata={"help": "Dataset path and fraction, e.g. 'data/train.jsonl 1.0'."},
+    )
+    dataset_mixer_list_splits: list[str] = field(
+        default_factory=lambda: ["train"],
+        metadata={"help": "Dataset splits to use."},
     )
     max_seq_length: int = field(
         default=512,
@@ -103,11 +108,6 @@ class ContrastiveFinetuneArguments:
         metadata={"help": "Use other positives in the batch as additional negatives."},
     )
 
-    # LoRA config for training new adapter
-    lora_rank: int = field(default=64)
-    lora_alpha: int = field(default=128)
-    lora_dropout: float = field(default=0.05)
-
     # Output
     output_dir: str = field(default="output/unified_embedding_v1")
     logging_steps: int = field(default=10)
@@ -117,69 +117,6 @@ class ContrastiveFinetuneArguments:
     # Misc
     with_tracking: bool = field(default=False)
     push_to_hub: bool = field(default=False)
-
-
-def load_contrastive_dataset(path: str, tokenizer, max_seq_length: int, seed: int = 42):
-    """
-    Load contrastive dataset from JSONL file with format:
-    {"query": "...", "positive": "...", "negative": "..."}
-
-    Tokenizes query, positive, and negative separately.
-    """
-    print(f"Loading contrastive dataset from {path}...")
-
-    examples = []
-    with open(path, "r") as f:
-        for line in f:
-            if line.strip():
-                examples.append(json.loads(line))
-
-    print(f"  Loaded {len(examples)} triplets")
-
-    # Tokenize
-    def tokenize_example(example):
-        # Add <ACT:RET> prefix to query for retrieval mode
-        query_text = "<ACT:RET> " + example["query"]
-
-        query_enc = tokenizer(
-            query_text,
-            truncation=True,
-            max_length=max_seq_length,
-            padding=False,
-            return_attention_mask=True,
-        )
-        pos_enc = tokenizer(
-            example["positive"],
-            truncation=True,
-            max_length=max_seq_length,
-            padding=False,
-            return_attention_mask=True,
-        )
-        neg_enc = tokenizer(
-            example["negative"],
-            truncation=True,
-            max_length=max_seq_length,
-            padding=False,
-            return_attention_mask=True,
-        )
-
-        return {
-            QUERY_INPUT_IDS_KEY: query_enc["input_ids"],
-            QUERY_ATTENTION_MASK_KEY: query_enc["attention_mask"],
-            POS_INPUT_IDS_KEY: pos_enc["input_ids"],
-            POS_ATTENTION_MASK_KEY: pos_enc["attention_mask"],
-            NEG_INPUT_IDS_KEY: neg_enc["input_ids"],
-            NEG_ATTENTION_MASK_KEY: neg_enc["attention_mask"],
-        }
-
-    print("  Tokenizing...")
-    tokenized = [tokenize_example(ex) for ex in tqdm(examples, desc="Tokenizing")]
-
-    dataset = Dataset.from_list(tokenized)
-    dataset = dataset.shuffle(seed=seed)
-
-    print(f"  Dataset ready: {len(dataset)} examples")
-    return dataset
 
 
 class ContrastiveDataCollator:
@@ -277,8 +214,8 @@ def contrastive_loss(query_emb, pos_emb, neg_emb, temperature, use_in_batch_nega
 
 
 def main():
-    parser = HfArgumentParser((ContrastiveFinetuneArguments,))
-    args = parser.parse_args_into_dataclasses()[0]
+    parser = ArgumentParserPlus((ContrastiveFinetuneArguments,))
+    args = parser.parse()
 
     # Setup accelerator
     accelerator = Accelerator(
@@ -301,18 +238,25 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Parse dataset_mixer_list to get path (assumes format: path fraction)
-    dataset_path = args.dataset_mixer_list[0]
-
     # Load and tokenize dataset
     accelerator.print("Loading dataset...")
+    tc = TokenizerConfig(
+        model_name_or_path=tokenizer_path,
+        trust_remote_code=True,
+    )
+
     with accelerator.main_process_first():
-        train_dataset = load_contrastive_dataset(
-            dataset_path,
-            tokenizer,
-            max_seq_length=args.max_seq_length,
-            seed=args.seed,
+        transform_fn_args = [{"max_seq_length": args.max_seq_length}, {}]
+        train_dataset = get_cached_dataset_tulu(
+            dataset_mixer_list=args.dataset_mixer_list,
+            dataset_mixer_list_splits=args.dataset_mixer_list_splits,
+            tc=tc,
+            dataset_transform_fn=["contrastive_tokenize_v1", "contrastive_filter_v1"],
+            transform_fn_args=transform_fn_args,
+            target_columns=TOKENIZED_CONTRASTIVE_DATASET_KEYS,
+            dataset_skip_cache=True,
         )
+        train_dataset = train_dataset.shuffle(seed=args.seed)
 
     accelerator.print(f"Dataset loaded: {len(train_dataset)} examples")
 
@@ -321,7 +265,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation="eager",
     )
 
@@ -330,23 +274,13 @@ def main():
         model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=8)
         accelerator.print(f"Resized embeddings to {model.get_input_embeddings().weight.shape[0]}")
 
-    # Load Stage 1 LoRA if provided, otherwise create new LoRA adapter
+    # Load Stage 1 LoRA if provided
     if args.lora_path:
         accelerator.print(f"Loading Stage 1 LoRA from {args.lora_path}...")
         model = PeftModel.from_pretrained(model, args.lora_path, is_trainable=True)
+        model.print_trainable_parameters()
     else:
-        accelerator.print("Creating new LoRA adapter for contrastive training...")
-        lora_config = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, lora_config)
-
-    model.print_trainable_parameters()
+        accelerator.print("No LoRA path provided, training base model directly.")
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
