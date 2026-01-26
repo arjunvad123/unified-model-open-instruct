@@ -241,7 +241,7 @@ def main():
     # Load and tokenize dataset
     accelerator.print("Loading dataset...")
     tc = TokenizerConfig(
-        model_name_or_path=tokenizer_path,
+        tokenizer_name_or_path=tokenizer_path,
         trust_remote_code=True,
     )
 
