@@ -246,7 +246,7 @@ def main():
     )
 
     with accelerator.main_process_first():
-        transform_fn_args = [{"max_seq_length": args.max_seq_length}, {}]
+        transform_fn_args = [{"max_seq_length": args.max_seq_length}, {"max_seq_length": args.max_seq_length}]
         train_dataset = get_cached_dataset_tulu(
             dataset_mixer_list=args.dataset_mixer_list,
             dataset_mixer_list_splits=args.dataset_mixer_list_splits,
