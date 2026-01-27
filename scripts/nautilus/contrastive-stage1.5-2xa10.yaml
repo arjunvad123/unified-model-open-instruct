@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: contrastive-stage1-5-v13
+  name: contrastive-stage1-5-v14
   namespace: svcl-self-improve
 spec:
   backoffLimit: 0
@@ -81,6 +81,7 @@ spec:
           pip install rich beaker-py ray vllm python-dateutil deepspeed requests numpy
 
           # Clone repo and setup PYTHONPATH
+          rm -rf unified-model-open-instruct
           git clone https://github.com/arjunvad123/unified-model-open-instruct.git
           cd unified-model-open-instruct
           export PYTHONPATH="/workspace/unified-model-open-instruct:$PYTHONPATH"
@@ -172,7 +173,7 @@ spec:
           echo "Training complete!"
           ls -la /workspace/output/unified_embedding_stage1_5/
           echo "Pod staying alive for 3 hours for model copy..."
-          echo "Run: kubectl cp svcl-self-improve/\$(kubectl get pods -n svcl-self-improve -l job-name=contrastive-stage1-5-v13 -o jsonpath='{.items[0].metadata.name}'):/workspace/output/unified_embedding_stage1_5 ./models/stage1_5"
+          echo "Run: kubectl cp svcl-self-improve/\$(kubectl get pods -n svcl-self-improve -l job-name=contrastive-stage1-5-v14 -o jsonpath='{.items[0].metadata.name}'):/workspace/output/unified_embedding_stage1_5 ./models/stage1_5"
           sleep 10800
 
         volumeMounts:
