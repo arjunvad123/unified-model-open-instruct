@@ -1,0 +1,191 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: contrastive-stage1-5-v13
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+
+      # Target A100 GPUs only (need 40GB+ for 3B model)
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-L40S
+                - NVIDIA-L40
+
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "PreferNoSchedule"
+
+      containers:
+      - name: training
+        image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+        imagePullPolicy: IfNotPresent
+
+        resources:
+          requests:
+            memory: "32Gi"
+            cpu: "4"
+            nvidia.com/gpu: "1"
+          limits:
+            memory: "40Gi"
+            cpu: "6"
+            nvidia.com/gpu: "1"
+
+        env:
+        - name: WANDB_MODE
+          value: "disabled"
+        - name: HF_HOME
+          value: "/workspace/.cache/huggingface"
+        - name: TRANSFORMERS_CACHE
+          value: "/workspace/.cache/huggingface"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: TOKENIZERS_PARALLELISM
+          value: "false"
+        - name: NCCL_DEBUG
+          value: "INFO"
+
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -ex
+
+          echo "=============================================="
+          echo "Stage 1.5 - Contrastive Embedding Training"
+          echo "2x A10 GPUs"
+          echo "=============================================="
+          date
+          nvidia-smi
+
+          cd /workspace
+
+          # Install dependencies
+          apt-get update && apt-get install -y git
+          pip install --upgrade pip
+          pip install torch==2.1.0 --index-url https://download.pytorch.org/whl/cu121
+          pip install datasets transformers accelerate peft bitsandbytes trl tqdm huggingface_hub
+          pip install rich beaker-py ray vllm python-dateutil deepspeed requests numpy
+
+          # Clone repo and setup PYTHONPATH
+          git clone https://github.com/arjunvad123/unified-model-open-instruct.git
+          cd unified-model-open-instruct
+          export PYTHONPATH="/workspace/unified-model-open-instruct:$PYTHONPATH"
+
+          # Generate dataset
+          echo "Generating contrastive dataset (80K triplets)..."
+          mkdir -p data
+          python -u scripts/data/create_contrastive_dataset.py \
+              --samples_per_dataset 20000 \
+              --output data/contrastive_train.jsonl \
+              --seed 42
+
+          echo "Dataset created:"
+          wc -l data/contrastive_train.jsonl
+
+          # Setup accelerate for 1 GPU
+          mkdir -p ~/.cache/huggingface/accelerate
+          cat > ~/.cache/huggingface/accelerate/default_config.yaml << 'EOF'
+          compute_environment: LOCAL_MACHINE
+          distributed_type: 'NO'
+          downcast_bf16: 'no'
+          machine_rank: 0
+          main_training_function: main
+          mixed_precision: bf16
+          num_machines: 1
+          num_processes: 1
+          use_cpu: false
+          EOF
+
+          # Run training
+          echo "Starting training on 1 GPU..."
+          python -u open_instruct/contrastive_finetune.py \
+              --model_name_or_path Qwen/Qwen2.5-3B-Instruct \
+              --dataset_mixer_list data/contrastive_train.jsonl 1.0 \
+              --max_seq_length 512 \
+              --temperature 0.05 \
+              --use_in_batch_negatives true \
+              --per_device_train_batch_size 4 \
+              --gradient_accumulation_steps 8 \
+              --learning_rate 2e-5 \
+              --num_train_epochs 3 \
+              --lr_scheduler_type cosine \
+              --warmup_ratio 0.05 \
+              --gradient_checkpointing true \
+              --logging_steps 20 \
+              --checkpointing_steps 2000 \
+              --output_dir /workspace/output/unified_embedding_stage1_5 \
+              --seed 42
+
+          # Test embedding quality
+          echo "Testing embedding quality..."
+          python -u << 'TEST_EOF'
+          import torch
+          import torch.nn.functional as F
+          from transformers import AutoModelForCausalLM, AutoTokenizer
+
+          OUTPUT_DIR = "/workspace/output/unified_embedding_stage1_5"
+          tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR, trust_remote_code=True)
+          model = AutoModelForCausalLM.from_pretrained(
+              OUTPUT_DIR, torch_dtype=torch.bfloat16,
+              device_map="auto", trust_remote_code=True)
+          model.eval()
+
+          def get_embedding(text):
+              inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+              inputs = {k: v.to(model.device) for k, v in inputs.items()}
+              with torch.no_grad():
+                  outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"],
+                                  output_hidden_states=True, use_cache=False)
+              hidden = outputs.hidden_states[-1].float()
+              mask = inputs["attention_mask"].unsqueeze(-1).float()
+              emb = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+              return F.normalize(emb, p=2, dim=1)
+
+          tests = [
+              ("<ACT:RET> What is the capital of France?", "Paris is the capital of France.", "Tokyo is the capital of Japan."),
+              ("<ACT:RET> How does photosynthesis work?", "Photosynthesis converts sunlight into energy.", "Machine learning is AI."),
+              ("<ACT:RET> Who wrote Romeo and Juliet?", "Shakespeare wrote Romeo and Juliet.", "Newton discovered gravity."),
+          ]
+          correct = 0
+          for q, p, n in tests:
+              pos_sim = (get_embedding(q) @ get_embedding(p).T).item()
+              neg_sim = (get_embedding(q) @ get_embedding(n).T).item()
+              correct += int(pos_sim > neg_sim)
+              print(f"Q: {q[:40]}... | Pos: {pos_sim:.4f} | Neg: {neg_sim:.4f} | {'OK' if pos_sim > neg_sim else 'FAIL'}")
+          print(f"\nResult: {correct}/{len(tests)} correct")
+          TEST_EOF
+
+          echo "Training complete!"
+          ls -la /workspace/output/unified_embedding_stage1_5/
+          echo "Pod staying alive for 3 hours for model copy..."
+          echo "Run: kubectl cp svcl-self-improve/\$(kubectl get pods -n svcl-self-improve -l job-name=contrastive-stage1-5-v13 -o jsonpath='{.items[0].metadata.name}'):/workspace/output/unified_embedding_stage1_5 ./models/stage1_5"
+          sleep 10800
+
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: shm
+          mountPath: /dev/shm
+
+      volumes:
+      - name: workspace
+        persistentVolumeClaim:
+          claimName: unified-model-data-vol
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Gi

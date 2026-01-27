@@ -1,0 +1,296 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: contrastive-stage1-5-4xa10
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+
+      # Target A10 GPUs specifically
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A10
+
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "PreferNoSchedule"
+
+      containers:
+      - name: training
+        image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+        imagePullPolicy: IfNotPresent
+
+        resources:
+          requests:
+            memory: "96Gi"
+            cpu: "16"
+            nvidia.com/gpu: "4"
+          limits:
+            memory: "112Gi"
+            cpu: "20"
+            nvidia.com/gpu: "4"
+
+        env:
+        - name: WANDB_MODE
+          value: "disabled"
+        - name: HF_HOME
+          value: "/workspace/.cache/huggingface"
+        - name: TRANSFORMERS_CACHE
+          value: "/workspace/.cache/huggingface"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: TOKENIZERS_PARALLELISM
+          value: "false"
+        - name: NCCL_DEBUG
+          value: "INFO"
+
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -ex
+
+          echo "=============================================="
+          echo "Stage 1.5 - Contrastive Embedding Training"
+          echo "4x A10 GPUs - Multi-GPU Training"
+          echo "=============================================="
+          date
+          nvidia-smi
+
+          cd /workspace
+
+          # ================================================================
+          # STEP 1: Install dependencies
+          # ================================================================
+          echo ""
+          echo "[STEP 1/6] Installing dependencies..."
+          echo ""
+
+          apt-get update && apt-get install -y git
+
+          pip install --upgrade pip
+          pip install torch==2.1.0 --index-url https://download.pytorch.org/whl/cu121
+          pip install datasets transformers accelerate peft bitsandbytes trl tqdm huggingface_hub
+
+          # ================================================================
+          # STEP 2: Clone the repo
+          # ================================================================
+          echo ""
+          echo "[STEP 2/6] Cloning unified-model-open-instruct..."
+          echo ""
+
+          git clone https://github.com/arjunvad123/unified-model-open-instruct.git
+          cd unified-model-open-instruct
+
+          # ================================================================
+          # STEP 3: Generate contrastive dataset (80K triplets)
+          # ================================================================
+          echo ""
+          echo "[STEP 3/6] Generating contrastive dataset from 4 RAG sources..."
+          echo "  - MS MARCO (20K)"
+          echo "  - Natural Questions (20K)"
+          echo "  - HotpotQA (20K)"
+          echo "  - SQuAD (20K)"
+          echo ""
+
+          mkdir -p data
+          python -u scripts/data/create_contrastive_dataset.py \
+              --samples_per_dataset 20000 \
+              --output data/contrastive_train.jsonl \
+              --seed 42
+
+          echo ""
+          echo "Dataset created. Sample:"
+          head -3 data/contrastive_train.jsonl
+          echo ""
+          wc -l data/contrastive_train.jsonl
+
+          # ================================================================
+          # STEP 4: Setup accelerate config for 4 GPUs
+          # ================================================================
+          echo ""
+          echo "[STEP 4/6] Setting up multi-GPU training configuration..."
+          echo ""
+
+          mkdir -p ~/.cache/huggingface/accelerate
+          cat > ~/.cache/huggingface/accelerate/default_config.yaml << 'ACCEL_EOF'
+          compute_environment: LOCAL_MACHINE
+          distributed_type: MULTI_GPU
+          downcast_bf16: 'no'
+          machine_rank: 0
+          main_training_function: main
+          mixed_precision: bf16
+          num_machines: 1
+          num_processes: 4
+          use_cpu: false
+          ACCEL_EOF
+
+          # ================================================================
+          # STEP 5: Run contrastive training with 4 GPUs
+          # ================================================================
+          echo ""
+          echo "[STEP 5/6] Starting contrastive embedding training on 4x A10..."
+          echo ""
+
+          accelerate launch --num_processes 4 open_instruct/contrastive_finetune.py \
+              --model_name_or_path Qwen/Qwen2.5-3B-Instruct \
+              --dataset_mixer_list data/contrastive_train.jsonl 1.0 \
+              --max_seq_length 512 \
+              --temperature 0.05 \
+              --use_in_batch_negatives true \
+              --per_device_train_batch_size 8 \
+              --gradient_accumulation_steps 2 \
+              --learning_rate 2e-5 \
+              --weight_decay 0.01 \
+              --num_train_epochs 3 \
+              --lr_scheduler_type cosine \
+              --warmup_ratio 0.05 \
+              --gradient_checkpointing true \
+              --logging_steps 20 \
+              --checkpointing_steps 2000 \
+              --output_dir /workspace/output/unified_embedding_stage1_5 \
+              --seed 42
+
+          # ================================================================
+          # STEP 6: Test embedding quality
+          # ================================================================
+          echo ""
+          echo "[STEP 6/6] Testing embedding quality..."
+          echo ""
+
+          python -u << 'TEST_EOF'
+          import torch
+          import torch.nn.functional as F
+          from transformers import AutoModelForCausalLM, AutoTokenizer
+          from peft import PeftModel
+
+          OUTPUT_DIR = "/workspace/output/unified_embedding_stage1_5"
+
+          print("Loading trained model...")
+          tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR, trust_remote_code=True)
+
+          base_model = AutoModelForCausalLM.from_pretrained(
+              "Qwen/Qwen2.5-3B-Instruct",
+              torch_dtype=torch.bfloat16,
+              device_map="auto",
+              trust_remote_code=True,
+          )
+          base_model.resize_token_embeddings(len(tokenizer))
+
+          model = PeftModel.from_pretrained(base_model, OUTPUT_DIR)
+          model.eval()
+
+          def get_embedding(text):
+              """Get embedding via mean pooling."""
+              inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+              inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+              with torch.no_grad():
+                  outputs = model(
+                      input_ids=inputs["input_ids"],
+                      attention_mask=inputs["attention_mask"],
+                      output_hidden_states=True,
+                      use_cache=False,
+                  )
+
+              hidden_states = outputs.hidden_states[-1].float()
+              mask = inputs["attention_mask"].unsqueeze(-1).float()
+              summed = (hidden_states * mask).sum(dim=1)
+              counts = mask.sum(dim=1).clamp(min=1e-9)
+              embedding = summed / counts
+              return F.normalize(embedding, p=2, dim=1)
+
+          # Test retrieval pairs
+          test_cases = [
+              {
+                  "query": "<ACT:RET> What is the capital of France?",
+                  "positive": "Paris is the capital and largest city of France.",
+                  "negative": "Tokyo is the capital of Japan.",
+              },
+              {
+                  "query": "<ACT:RET> How does photosynthesis work?",
+                  "positive": "Photosynthesis is the process by which plants convert sunlight into energy.",
+                  "negative": "Machine learning is a type of artificial intelligence.",
+              },
+              {
+                  "query": "<ACT:RET> Who wrote Romeo and Juliet?",
+                  "positive": "William Shakespeare wrote the play Romeo and Juliet.",
+                  "negative": "Isaac Newton discovered the laws of motion.",
+              },
+              {
+                  "query": "<ACT:RET> What year did World War II end?",
+                  "positive": "World War II ended in 1945 with the surrender of Japan.",
+                  "negative": "The French Revolution began in 1789.",
+              },
+              {
+                  "query": "<ACT:RET> What is the speed of light?",
+                  "positive": "The speed of light in a vacuum is approximately 299,792 kilometers per second.",
+                  "negative": "Water boils at 100 degrees Celsius at sea level.",
+              },
+          ]
+
+          print("\n" + "=" * 60)
+          print("Embedding Quality Test Results")
+          print("=" * 60)
+
+          correct = 0
+          for i, test in enumerate(test_cases):
+              q_emb = get_embedding(test["query"])
+              p_emb = get_embedding(test["positive"])
+              n_emb = get_embedding(test["negative"])
+
+              pos_sim = (q_emb @ p_emb.T).item()
+              neg_sim = (q_emb @ n_emb.T).item()
+
+              is_correct = pos_sim > neg_sim
+              correct += int(is_correct)
+
+              print(f"\nTest {i+1}:")
+              print(f"  Query: {test['query'][:50]}...")
+              print(f"  Pos sim: {pos_sim:.4f}")
+              print(f"  Neg sim: {neg_sim:.4f}")
+              print(f"  Correct: {'YES' if is_correct else 'NO'}")
+
+          print("\n" + "=" * 60)
+          print(f"Overall: {correct}/{len(test_cases)} correct ({100*correct/len(test_cases):.1f}%)")
+          print("=" * 60)
+          TEST_EOF
+
+          echo ""
+          echo "=============================================="
+          echo "Stage 1.5 Training Complete!"
+          echo "=============================================="
+          echo "Model saved to: /workspace/output/unified_embedding_stage1_5"
+          echo ""
+          ls -la /workspace/output/unified_embedding_stage1_5/
+          echo "=============================================="
+          date
+
+          # Keep pod alive for inspection
+          echo ""
+          echo "Training complete! Pod staying alive for 60 minutes..."
+          sleep 3600
+
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: shm
+          mountPath: /dev/shm
+
+      volumes:
+      - name: workspace
+        emptyDir:
+          sizeLimit: 200Gi
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 64Gi
