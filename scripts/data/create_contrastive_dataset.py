@@ -48,7 +48,21 @@ def process_ms_marco(num_samples: int) -> List[Dict[str, str]]:
     print(f"{'='*60}")
 
     data = []
-    dataset = load_dataset("ms_marco", "v1.1", split="train", streaming=True)
+    # Try multiple sources for MS MARCO (original was removed from HF)
+    dataset = None
+    for dataset_name in ["microsoft/ms_marco", "ms_marco", "BeIR/msmarco"]:
+        try:
+            print(f"  Trying {dataset_name}...")
+            dataset = load_dataset(dataset_name, "v1.1", split="train", streaming=True, trust_remote_code=True)
+            print(f"  Successfully loaded {dataset_name}")
+            break
+        except Exception as e:
+            print(f"  Failed: {e}")
+            continue
+
+    if dataset is None:
+        print("  MS MARCO not available from any source, skipping...")
+        return []
 
     for item in tqdm(dataset, total=num_samples * 2, desc="MS MARCO"):
         query = item.get("query", "")
