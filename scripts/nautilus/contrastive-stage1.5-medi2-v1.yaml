@@ -1,0 +1,216 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: contrastive-stage1-5-medi2-v1
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+
+      # Prefer A100-80GB for batch_size=16 with 3B model
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-L40S
+                - NVIDIA-L40
+
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "PreferNoSchedule"
+
+      containers:
+      - name: training
+        image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+        imagePullPolicy: IfNotPresent
+
+        resources:
+          requests:
+            memory: "64Gi"
+            cpu: "8"
+            nvidia.com/gpu: "1"
+          limits:
+            memory: "80Gi"
+            cpu: "12"
+            nvidia.com/gpu: "1"
+
+        env:
+        - name: WANDB_MODE
+          value: "disabled"
+        - name: HF_HOME
+          value: "/workspace/.cache/huggingface"
+        - name: TRANSFORMERS_CACHE
+          value: "/workspace/.cache/huggingface"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: TOKENIZERS_PARALLELISM
+          value: "false"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+              optional: true
+
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -ex
+
+          echo "=============================================="
+          echo "Stage 1.5 v2 - MEDI2 Contrastive Training"
+          echo "Hard negatives, temp=0.02, LoRA on Stage 1"
+          echo "=============================================="
+          date
+          nvidia-smi
+
+          cd /workspace
+
+          # ================================================================
+          # STEP 1: Install dependencies
+          # ================================================================
+          echo ""
+          echo "[STEP 1/6] Installing dependencies..."
+          echo ""
+
+          apt-get update && apt-get install -y git
+          pip install --upgrade pip
+          pip install torch==2.1.0 --index-url https://download.pytorch.org/whl/cu121
+          pip install datasets transformers accelerate peft bitsandbytes trl tqdm huggingface_hub
+
+          # ================================================================
+          # STEP 2: Clone repo
+          # ================================================================
+          echo ""
+          echo "[STEP 2/6] Cloning unified-model-open-instruct..."
+          echo ""
+
+          git clone https://github.com/arjunvad123/unified-model-open-instruct.git
+          cd unified-model-open-instruct
+
+          # ================================================================
+          # STEP 3: Download and convert MEDI2 dataset (500K hard negatives)
+          # ================================================================
+          echo ""
+          echo "[STEP 3/6] Downloading GritLM/MEDI2 and converting..."
+          echo "  Source: 1.23M examples with hard negatives"
+          echo "  Target: 500K triplets in our format"
+          echo ""
+
+          mkdir -p data
+          python -u scripts/data/create_medi2_contrastive_dataset.py \
+              --max_samples 500000 \
+              --output data/medi2_contrastive_train.jsonl \
+              --seed 42
+
+          echo ""
+          echo "Dataset ready:"
+          wc -l data/medi2_contrastive_train.jsonl
+          head -2 data/medi2_contrastive_train.jsonl
+
+          # ================================================================
+          # STEP 4: Setup accelerate config
+          # ================================================================
+          echo ""
+          echo "[STEP 4/6] Setting up training configuration..."
+          echo ""
+
+          mkdir -p ~/.cache/huggingface/accelerate
+          cat > ~/.cache/huggingface/accelerate/default_config.yaml << 'ACCEL_EOF'
+          compute_environment: LOCAL_MACHINE
+          distributed_type: 'NO'
+          downcast_bf16: 'no'
+          machine_rank: 0
+          main_training_function: main
+          mixed_precision: bf16
+          num_machines: 1
+          num_processes: 1
+          use_cpu: false
+          ACCEL_EOF
+
+          # ================================================================
+          # STEP 5: Run contrastive training from Stage 1 model
+          # ================================================================
+          echo ""
+          echo "[STEP 5/6] Starting MEDI2 contrastive training..."
+          echo "  Base model: Arjunvad/unified-model-stage1-action-tokens-v2"
+          echo "  LoRA: rank=32, alpha=64"
+          echo "  Temperature: 0.02"
+          echo "  Batch: 16 x 4 grad_accum = 64 effective"
+          echo "  Data: 500K MEDI2 hard negatives"
+          echo "  Epochs: 1"
+          echo ""
+
+          python -u open_instruct/contrastive_finetune.py \
+              --model_name_or_path Arjunvad/unified-model-stage1-action-tokens-v2 \
+              --use_lora true \
+              --lora_rank 32 \
+              --lora_alpha 64 \
+              --dataset_mixer_list data/medi2_contrastive_train.jsonl 1.0 \
+              --max_seq_length 512 \
+              --temperature 0.02 \
+              --use_in_batch_negatives true \
+              --per_device_train_batch_size 16 \
+              --gradient_accumulation_steps 4 \
+              --learning_rate 1e-5 \
+              --weight_decay 0.01 \
+              --num_train_epochs 1 \
+              --lr_scheduler_type cosine \
+              --warmup_ratio 0.03 \
+              --gradient_checkpointing true \
+              --logging_steps 50 \
+              --checkpointing_steps 2000 \
+              --clip_grad_norm 1.0 \
+              --output_dir /workspace/output/unified_embedding_medi2_v1 \
+              --push_to_hub true \
+              --hub_model_id Arjunvad/unified-model-stage1.5-embedding-v2 \
+              --seed 42
+
+          # ================================================================
+          # STEP 6: Verify and report
+          # ================================================================
+          echo ""
+          echo "[STEP 6/6] Training complete! Verifying output..."
+          echo ""
+
+          echo "Output files:"
+          ls -la /workspace/output/unified_embedding_medi2_v1/
+
+          echo ""
+          echo "=============================================="
+          echo "Stage 1.5 v2 Training Complete!"
+          echo "=============================================="
+          echo "Model saved to: /workspace/output/unified_embedding_medi2_v1"
+          echo "Pushed to: Arjunvad/unified-model-stage1.5-embedding-v2"
+          date
+
+          # Keep pod alive for 30 minutes for log inspection
+          echo ""
+          echo "Pod staying alive for 30 minutes for log inspection..."
+          sleep 1800
+
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: shm
+          mountPath: /dev/shm
+
+      volumes:
+      - name: workspace
+        emptyDir:
+          sizeLimit: 300Gi
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Gi

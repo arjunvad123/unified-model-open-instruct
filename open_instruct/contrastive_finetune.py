@@ -100,7 +100,7 @@ class ContrastiveFinetuneArguments:
 
     # Contrastive loss
     temperature: float = field(
-        default=0.05,
+        default=0.02,
         metadata={"help": "Temperature for InfoNCE contrastive loss."},
     )
     use_in_batch_negatives: bool = field(
@@ -114,9 +114,22 @@ class ContrastiveFinetuneArguments:
     checkpointing_steps: Optional[int] = field(default=500)
     clip_grad_norm: float = field(default=1.0)
 
+    # LoRA (create new LoRA on a full model, e.g. Stage 1 model)
+    use_lora: bool = field(
+        default=False,
+        metadata={"help": "Create a new LoRA adapter on the base model for training."},
+    )
+    lora_rank: int = field(default=32)
+    lora_alpha: int = field(default=64)
+    lora_dropout: float = field(default=0.05)
+
     # Misc
     with_tracking: bool = field(default=False)
     push_to_hub: bool = field(default=False)
+    hub_model_id: Optional[str] = field(
+        default=None,
+        metadata={"help": "HuggingFace repo ID to push model (e.g. Arjunvad/unified-model-stage1.5-embedding-v2)."},
+    )
 
 
 class ContrastiveDataCollator:
@@ -279,6 +292,22 @@ def main():
         accelerator.print(f"Loading Stage 1 LoRA from {args.lora_path}...")
         model = PeftModel.from_pretrained(model, args.lora_path, is_trainable=True)
         model.print_trainable_parameters()
+    elif args.use_lora:
+        # Create a new LoRA adapter on the full model (e.g. Stage 1 model loaded as base)
+        from peft import LoraConfig, get_peft_model
+        accelerator.print(f"Creating new LoRA adapter (r={args.lora_rank}, alpha={args.lora_alpha})...")
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+        # Keep embedding layer trainable for action tokens
+        for param in model.get_input_embeddings().parameters():
+            param.requires_grad = True
+        model.print_trainable_parameters()
     else:
         accelerator.print("No LoRA path provided, training base model directly.")
 
@@ -423,6 +452,22 @@ def main():
         else:
             unwrapped_model.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
+
+    # Push to HuggingFace Hub
+    if args.push_to_hub and accelerator.is_main_process:
+        try:
+            from huggingface_hub import HfApi, login
+            hf_token = os.environ.get("HF_TOKEN")
+            if hf_token:
+                login(token=hf_token)
+            repo_id = args.hub_model_id or "Arjunvad/unified-model-stage1.5-embedding-v2"
+            accelerator.print(f"Pushing model to {repo_id}...")
+            api = HfApi()
+            api.create_repo(repo_id=repo_id, private=True, exist_ok=True)
+            api.upload_folder(folder_path=args.output_dir, repo_id=repo_id)
+            accelerator.print(f"Pushed to https://huggingface.co/{repo_id}")
+        except Exception as e:
+            accelerator.print(f"Failed to push to hub: {e}")
 
     # Quick validation
     if accelerator.is_main_process:

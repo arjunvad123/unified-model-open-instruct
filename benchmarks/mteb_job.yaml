@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mteb-benchmark
+  namespace: svcl  # Update with your namespace
+spec:
+  template:
+    spec:
+      containers:
+      - name: mteb-benchmark
+        image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            pip install transformers accelerate mteb sentence-transformers torch numpy
+            cd /workspace
+            git clone https://github.com/YOUR_REPO/unified-model-open-instruct-new.git || true
+            cd unified-model-open-instruct-new
+
+            echo "Running MTEB Benchmarks..."
+            python benchmarks/run_mteb_comparison.py \
+              --model all \
+              --tasks full \
+              --output-dir results/mteb
+
+            echo "Benchmark complete!"
+            cat results/mteb/comparison_summary.json
+        resources:
+          limits:
+            memory: "32Gi"
+            cpu: "4"
+            nvidia.com/gpu: "1"
+          requests:
+            memory: "16Gi"
+            cpu: "2"
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+      volumes:
+      - name: hf-cache
+        persistentVolumeClaim:
+          claimName: hf-cache-pvc  # Create a PVC for caching models
+      restartPolicy: Never
+  backoffLimit: 1

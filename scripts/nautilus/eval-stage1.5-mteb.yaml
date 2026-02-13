@@ -1,0 +1,293 @@
+# Nautilus Job: MTEB Evaluation for Stage 1.5 Embedding Model
+# Compares Stage 1.5 (MEDI2-trained) vs Stage 1 baseline
+#
+# Deploy: kubectl apply -f eval-stage1.5-mteb.yaml -n svcl-self-improve
+# Check: kubectl logs job/eval-stage1-5-mteb -n svcl-self-improve -f
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eval-stage1-5-mteb
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+
+      containers:
+        - name: mteb-eval
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "==========================================="
+              echo "MTEB Benchmark: Stage 1.5 Embedding Model"
+              echo "Comparing Stage 1.5 vs Stage 1 baseline"
+              echo "==========================================="
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              # Install dependencies
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              source /opt/venv/bin/activate
+
+              pip install --upgrade pip
+              pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+              pip install "transformers>=4.51.0" accelerate peft mteb numpy tqdm
+
+              python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+
+              mkdir -p /workspace/results
+              cd /workspace
+
+              cat > run_stage1_5_eval.py << 'PYTHON_SCRIPT'
+              #!/usr/bin/env python3
+              """
+              MTEB Evaluation: Stage 1.5 (MEDI2-trained) vs Stage 1 baseline
+              Evaluates on 5 retrieval tasks (skips TRECCOVID for speed)
+              """
+              import json
+              import os
+              import gc
+              from datetime import datetime
+              import numpy as np
+              import torch
+              import torch.nn.functional as F
+              from transformers import AutoTokenizer, AutoModelForCausalLM
+              from peft import PeftModel
+              from tqdm import tqdm
+              import warnings
+              warnings.filterwarnings("ignore")
+
+              MODELS = {
+                  "stage1_5_medi2": {
+                      "base_model": "Arjunvad/unified-model-stage1-action-tokens-v2",
+                      "lora_path": "Arjunvad/unified-model-stage1.5-embedding-v2",
+                      "description": "Stage 1.5 - MEDI2 hard negatives, temp=0.02",
+                  },
+                  "stage1_baseline": {
+                      "base_model": "Arjunvad/unified-model-stage1-action-tokens-v2",
+                      "lora_path": None,
+                      "description": "Stage 1 baseline (action tokens only)",
+                  },
+              }
+
+              # Skip TRECCOVID (171K docs, too slow on small GPUs)
+              TASKS = ["NFCorpus", "SciFact", "ArguAna", "SCIDOCS", "FiQA2018"]
+
+              class EmbeddingModel:
+                  def __init__(self, base_model_path, lora_path=None, device=None):
+                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+                      print(f"Loading {base_model_path}...")
+
+                      self.tokenizer = AutoTokenizer.from_pretrained(
+                          lora_path or base_model_path, trust_remote_code=True
+                      )
+                      # Load as AutoModel (not CausalLM) for embedding
+                      from transformers import AutoModel
+                      self.model = AutoModel.from_pretrained(
+                          base_model_path,
+                          trust_remote_code=True,
+                          torch_dtype=torch.bfloat16
+                      )
+
+                      if lora_path:
+                          print(f"  Loading LoRA from {lora_path}...")
+                          self.model = PeftModel.from_pretrained(self.model, lora_path)
+                          self.model = self.model.merge_and_unload()
+                          print("  LoRA merged.")
+
+                      self.model.to(self.device)
+                      self.model.eval()
+
+                      if not self.tokenizer.pad_token:
+                          self.tokenizer.pad_token = self.tokenizer.eos_token
+
+                  def encode(self, sentences, batch_size=32, **kwargs):
+                      all_embeddings = []
+                      for i in tqdm(range(0, len(sentences), batch_size), desc="Encoding", disable=len(sentences)<100):
+                          batch = sentences[i:i + batch_size]
+                          inputs = self.tokenizer(
+                              batch, padding=True, truncation=True,
+                              max_length=512, return_tensors="pt"
+                          ).to(self.device)
+
+                          with torch.no_grad():
+                              outputs = self.model(**inputs)
+                              hidden = outputs.last_hidden_state.float()
+                              mask = inputs["attention_mask"].unsqueeze(-1).float()
+                              emb = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+                              emb = F.normalize(emb, p=2, dim=1)
+                              all_embeddings.append(emb.cpu())
+
+                      return torch.cat(all_embeddings, dim=0).numpy()
+
+              def evaluate_task(model, task_name):
+                  import mteb
+                  try:
+                      task = mteb.get_task(task_name)
+                      task.load_data()
+                      subset = list(task.dataset.keys())[0]
+                      split = "test" if "test" in task.dataset[subset] else list(task.dataset[subset].keys())[0]
+                      data = task.dataset[subset][split]
+
+                      corpus = {r["id"]: {"title": r.get("title", ""), "text": r.get("text", "")} for r in data["corpus"]}
+                      queries = {r["id"]: r["text"] for r in data["queries"]}
+                      qrels = data["relevant_docs"]
+
+                      corpus_ids = list(corpus.keys())
+                      corpus_texts = [f"{corpus[c].get('title', '')} {corpus[c].get('text', '')}".strip() for c in corpus_ids]
+                      corpus_emb = model.encode(corpus_texts, batch_size=32)
+
+                      query_ids = list(queries.keys())
+                      query_texts = [queries[q] for q in query_ids]
+                      query_emb = model.encode(query_texts, batch_size=32)
+
+                      scores = np.dot(query_emb, corpus_emb.T)
+
+                      h1, h5, h10, mrr, ndcg = 0, 0, 0, 0, 0
+                      n = 0
+                      for i, qid in enumerate(query_ids):
+                          if qid not in qrels: continue
+                          n += 1
+                          rel = set(qrels[qid].keys())
+                          ranked = np.argsort(scores[i])[::-1]
+                          top10 = [corpus_ids[idx] for idx in ranked[:10]]
+                          if any(d in rel for d in top10[:1]): h1 += 1
+                          if any(d in rel for d in top10[:5]): h5 += 1
+                          if any(d in rel for d in top10[:10]): h10 += 1
+                          for rank, idx in enumerate(ranked):
+                              if corpus_ids[idx] in rel:
+                                  mrr += 1 / (rank + 1)
+                                  break
+                          dcg = sum(1/np.log2(r+2) for r, idx in enumerate(ranked[:10]) if corpus_ids[idx] in rel)
+                          idcg = sum(1/np.log2(i+2) for i in range(min(len(rel), 10)))
+                          if idcg > 0: ndcg += dcg / idcg
+
+                      return {
+                          "hits@1": h1/n if n > 0 else 0,
+                          "hits@10": h10/n if n > 0 else 0,
+                          "ndcg@10": ndcg/n if n > 0 else 0,
+                          "mrr": mrr/n if n > 0 else 0,
+                      }
+                  except Exception as e:
+                      print(f"  Error: {e}")
+                      import traceback; traceback.print_exc()
+                      return {"error": str(e)}
+
+              def main():
+                  all_results = {}
+
+                  for model_name, config in MODELS.items():
+                      print("\n" + "="*70)
+                      print(f"EVALUATING: {model_name}")
+                      print(f"  {config['description']}")
+                      print("="*70)
+
+                      try:
+                          model = EmbeddingModel(
+                              config["base_model"],
+                              lora_path=config["lora_path"],
+                          )
+
+                          model_results = {}
+                          for task in TASKS:
+                              print(f"\n  {task}...")
+                              result = evaluate_task(model, task)
+                              model_results[task] = result
+                              if "error" not in result:
+                                  print(f"    Hits@1: {result['hits@1']:.4f}, NDCG@10: {result['ndcg@10']:.4f}, MRR: {result['mrr']:.4f}")
+
+                          all_results[model_name] = model_results
+                          del model
+                          torch.cuda.empty_cache()
+                          gc.collect()
+
+                      except Exception as e:
+                          print(f"  Failed: {e}")
+                          import traceback; traceback.print_exc()
+                          all_results[model_name] = {"error": str(e)}
+
+                  # Save results
+                  with open("results/stage1_5_comparison.json", "w") as f:
+                      json.dump({
+                          "timestamp": datetime.now().isoformat(),
+                          "tasks": TASKS,
+                          "models": list(MODELS.keys()),
+                          "results": all_results,
+                      }, f, indent=2)
+
+                  # Print comparison
+                  print("\n" + "="*80)
+                  print("COMPARISON: Stage 1.5 (MEDI2) vs Stage 1 (Baseline)")
+                  print("="*80)
+
+                  for metric in ["hits@1", "ndcg@10", "mrr"]:
+                      print(f"\n--- {metric.upper()} ---")
+                      header = f"{'Task':<20}" + "".join(f"{m:<25}" for m in MODELS.keys())
+                      print(header)
+                      print("-" * len(header))
+
+                      for task in TASKS:
+                          row = f"{task:<20}"
+                          for model_name in MODELS.keys():
+                              if model_name in all_results and task in all_results[model_name]:
+                                  score = all_results[model_name][task].get(metric, 0)
+                                  row += f"{score:<25.4f}"
+                              else:
+                                  row += f"{'N/A':<25}"
+                          print(row)
+
+                      # Averages
+                      print("-" * len(header))
+                      row = f"{'AVERAGE':<20}"
+                      for model_name in MODELS.keys():
+                          if model_name in all_results:
+                              scores = [all_results[model_name][t].get(metric, 0)
+                                       for t in TASKS
+                                       if t in all_results[model_name] and "error" not in all_results[model_name][t]]
+                              avg = sum(scores) / len(scores) if scores else 0
+                              row += f"{avg:<25.4f}"
+                          else:
+                              row += f"{'N/A':<25}"
+                      print(row)
+
+                  print(f"\nResults saved to: results/stage1_5_comparison.json")
+                  print("="*80)
+
+              if __name__ == "__main__":
+                  main()
+              PYTHON_SCRIPT
+
+              echo "Running Stage 1.5 vs baseline comparison..."
+              python run_stage1_5_eval.py
+
+          resources:
+            requests:
+              memory: "32Gi"
+              cpu: "4"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "48Gi"
+              cpu: "8"
+              nvidia.com/gpu: "1"
+
+          env:
+            - name: HF_HOME
+              value: "/tmp/hf_cache"
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/hf_cache"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule

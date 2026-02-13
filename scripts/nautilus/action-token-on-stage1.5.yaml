@@ -1,0 +1,773 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: action-on-stage1-5-pvc
+  namespace: svcl-self-improve
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: rook-ceph-block
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: action-token-on-stage1-5-v1
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+
+      # REQUIRE L40 or A100 GPUs only
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-L40S
+                - NVIDIA-L40
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-GeForce-RTX-4090
+                - NVIDIA-RTX-A6000
+
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "PreferNoSchedule"
+
+      containers:
+      - name: training
+        image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+        imagePullPolicy: IfNotPresent
+
+        resources:
+          requests:
+            memory: "40Gi"
+            cpu: "6"
+            nvidia.com/gpu: "1"
+          limits:
+            memory: "48Gi"
+            cpu: "8"
+            nvidia.com/gpu: "1"
+
+        env:
+        - name: WANDB_MODE
+          value: "disabled"
+        - name: HF_HOME
+          value: "/workspace/.cache/huggingface"
+        - name: TRANSFORMERS_CACHE
+          value: "/workspace/.cache/huggingface"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        - name: HF_TOKEN
+          value: "REDACTED"
+
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -ex
+
+          echo "=============================================="
+          echo "Action Token Training on Stage 1.5 Model"
+          echo "Combining embedding quality with action tokens"
+          echo "=============================================="
+          date
+          nvidia-smi
+
+          cd /workspace
+
+          # ================================================================
+          # STEP 1: Install dependencies
+          # ================================================================
+          echo ""
+          echo "[STEP 1/7] Installing dependencies..."
+          echo ""
+
+          apt-get update && apt-get install -y git
+          pip install --upgrade pip
+          pip install torch==2.1.0 --index-url https://download.pytorch.org/whl/cu121
+          pip install datasets transformers accelerate peft bitsandbytes trl tqdm huggingface_hub rich safetensors
+
+          # ================================================================
+          # STEP 2: Download Stage 1.5 model from HuggingFace
+          # ================================================================
+          echo ""
+          echo "[STEP 2/7] Downloading Stage 1.5 model from HuggingFace..."
+          echo ""
+
+          python -u << 'DOWNLOAD_EOF'
+          from huggingface_hub import snapshot_download, login
+          import os
+
+          HF_TOKEN = os.environ.get("HF_TOKEN")
+          login(token=HF_TOKEN)
+
+          print("Downloading Arjunvad/unified-model-stage1-5...")
+          local_dir = snapshot_download(
+              repo_id="Arjunvad/unified-model-stage1-5",
+              local_dir="/workspace/stage1_5_model",
+              token=HF_TOKEN
+          )
+          print(f"Model downloaded to: {local_dir}")
+
+          import os
+          for f in os.listdir(local_dir):
+              fpath = os.path.join(local_dir, f)
+              size = os.path.getsize(fpath) if os.path.isfile(fpath) else 0
+              print(f"  {f}: {size / 1e6:.1f} MB")
+          DOWNLOAD_EOF
+
+          # ================================================================
+          # STEP 3: Create action token dataset (10K examples)
+          # ================================================================
+          echo ""
+          echo "[STEP 3/7] Creating action token dataset..."
+          echo ""
+
+          python -u << 'DATASET_EOF'
+          import os
+          import random
+          from datasets import Dataset
+
+          OUTPUT_DIR = "/workspace/data/action_token_sft"
+          NUM_EXAMPLES_PER_ACTION = 2500  # 2500 * 4 = 10,000 total
+          SEED = 42
+
+          # Action tokens matching the test script
+          ACTION_TOKENS = {
+              "GEN": "<ACT:GEN>",
+              "RET": "<ACT:RET>",
+              "TOOL": "<ACT:TOOL>",
+              "CODE": "<ACT:CODE>",
+          }
+
+          TOPICS = [
+              # Science & Technology
+              "quantum computing", "machine learning", "artificial intelligence",
+              "neural networks", "deep learning", "computer vision", "NLP",
+              "robotics", "nanotechnology", "biotechnology", "genetic engineering",
+              "climate change", "renewable energy", "solar power", "nuclear fusion",
+              "space exploration", "black holes", "dark matter", "quantum mechanics",
+
+              # Math & Logic
+              "calculus", "linear algebra", "probability theory", "statistics",
+              "graph theory", "cryptography", "algorithms", "data structures",
+
+              # History & Culture
+              "Renaissance art", "ancient history", "World War II", "Cold War",
+              "Industrial Revolution", "ancient Rome", "ancient Greece",
+
+              # Social Sciences
+              "economics", "psychology", "sociology", "philosophy", "ethics",
+
+              # Biology & Medicine
+              "DNA", "evolution", "photosynthesis", "cell biology", "neuroscience",
+              "immunology", "cancer research", "protein folding", "ecosystems",
+
+              # Modern Topics
+              "cryptocurrency", "blockchain", "metaverse", "cybersecurity",
+              "cloud computing", "big data", "data science", "web development",
+          ]
+
+          random.seed(SEED)
+          data = []
+
+          # =========================================================================
+          # GEN examples - generation/creative tasks
+          # =========================================================================
+          gen_templates = [
+              ("What is {}?", "Here's an explanation of {}:"),
+              ("Explain {} to me", "Let me explain {}:"),
+              ("Tell me about {}", "Here's what you should know about {}:"),
+              ("Describe {}", "Here's a description of {}:"),
+              ("What are the key concepts in {}?", "The key concepts in {} are:"),
+              ("Give me an overview of {}", "Here's an overview:"),
+              ("Summarize {}", "Here's a summary:"),
+              ("What do you know about {}?", "I can tell you about {}:"),
+              ("Help me understand {}", "Let me help you understand {}:"),
+              ("Can you explain {}?", "Of course, here's an explanation:"),
+          ]
+
+          for _ in range(NUM_EXAMPLES_PER_ACTION):
+              template_q, template_a = random.choice(gen_templates)
+              topic = random.choice(TOPICS)
+              data.append({
+                  "messages": [
+                      {"role": "user", "content": template_q.format(topic)},
+                      {"role": "assistant", "content": f"{ACTION_TOKENS['GEN']} {template_a.format(topic)}"}
+                  ]
+              })
+
+          # =========================================================================
+          # RET examples - retrieval/search tasks
+          # =========================================================================
+          ret_templates = [
+              ("Find information on {}", "Let me search for information about {}."),
+              ("Search for documents about {}", "Searching for relevant documents on {}."),
+              ("Look up {}", "Looking up information on {}."),
+              ("Find me resources on {}", "Finding resources about {}."),
+              ("Search for recent papers on {}", "Searching for papers on {}."),
+              ("Find articles about {}", "Finding relevant articles about {}."),
+              ("Look for data on {}", "Looking for data related to {}."),
+              ("Search the database for {}", "Searching the database for {}."),
+              ("Find references about {}", "Finding references on {}."),
+              ("Retrieve documents on {}", "Retrieving documents about {}."),
+          ]
+
+          for _ in range(NUM_EXAMPLES_PER_ACTION):
+              template_q, template_a = random.choice(ret_templates)
+              topic = random.choice(TOPICS)
+              data.append({
+                  "messages": [
+                      {"role": "user", "content": template_q.format(topic)},
+                      {"role": "assistant", "content": f"{ACTION_TOKENS['RET']} {template_a.format(topic)}"}
+                  ]
+              })
+
+          # =========================================================================
+          # TOOL examples - tool use/API calls
+          # =========================================================================
+          tool_templates = [
+              ("What's the current weather in Tokyo?", "Let me check the weather API."),
+              ("What time is it in London?", "Let me look up the current time."),
+              ("Calculate 2847 * 3921", "Let me use the calculator."),
+              ("What's the stock price of Apple?", "Let me check the stock API."),
+              ("Convert 100 USD to EUR", "Let me use the currency converter."),
+              ("What's the latest news about {}?", "Let me fetch the latest news."),
+              ("Check the flight status for AA123", "Let me check the flight API."),
+              ("What's the current Bitcoin price?", "Let me query the crypto API."),
+              ("Look up the definition of '{}'", "Let me search the dictionary."),
+              ("Translate 'hello' to Spanish", "Let me use the translation API."),
+              ("What day of the week is January 15, 2025?", "Let me calculate that date."),
+              ("How many days until Christmas?", "Let me calculate the days."),
+              ("What's the population of France?", "Let me look up that data."),
+              ("Check if example.com is up", "Let me ping the website."),
+              ("What's the distance from New York to LA?", "Let me calculate the distance."),
+          ]
+
+          for _ in range(NUM_EXAMPLES_PER_ACTION):
+              template_q, template_a = random.choice(tool_templates)
+              topic = random.choice(TOPICS) if "{}" in template_q else ""
+              question = template_q.format(topic) if topic else template_q
+              data.append({
+                  "messages": [
+                      {"role": "user", "content": question},
+                      {"role": "assistant", "content": f"{ACTION_TOKENS['TOOL']} {template_a}"}
+                  ]
+              })
+
+          # =========================================================================
+          # CODE examples - code generation tasks
+          # =========================================================================
+          code_templates = [
+              ("Write a Python function to sort a list", "Here's a Python function:"),
+              ("Create a function to calculate factorial", "Here's the implementation:"),
+              ("Write code to reverse a string", "Here's the code:"),
+              ("Implement binary search in Python", "Here's the binary search implementation:"),
+              ("Write a class for a linked list", "Here's a linked list class:"),
+              ("Create a function to check if a number is prime", "Here's the prime checker:"),
+              ("Write code to merge two sorted lists", "Here's the merge function:"),
+              ("Implement a stack data structure", "Here's the stack implementation:"),
+              ("Write a function to find duplicates in a list", "Here's the function:"),
+              ("Create a recursive fibonacci function", "Here's the fibonacci implementation:"),
+              ("Write code to read a JSON file", "Here's how to read JSON:"),
+              ("Implement a basic HTTP server", "Here's a basic server:"),
+              ("Write a function to validate email addresses", "Here's the validator:"),
+              ("Create a decorator for timing functions", "Here's the timing decorator:"),
+              ("Write code to parse CSV data", "Here's the CSV parser:"),
+              ("Implement a simple cache decorator", "Here's the cache implementation:"),
+              ("Write a function to flatten nested lists", "Here's the flatten function:"),
+              ("Create a context manager for file handling", "Here's the context manager:"),
+              ("Write code for {} algorithm", "Here's the algorithm implementation:"),
+              ("Implement a {} data structure", "Here's the data structure:"),
+          ]
+
+          for _ in range(NUM_EXAMPLES_PER_ACTION):
+              template_q, template_a = random.choice(code_templates)
+              topic = random.choice(TOPICS) if "{}" in template_q else ""
+              question = template_q.format(topic) if topic else template_q
+              answer = template_a.format(topic) if "{}" in template_a and topic else template_a
+              data.append({
+                  "messages": [
+                      {"role": "user", "content": question},
+                      {"role": "assistant", "content": f"{ACTION_TOKENS['CODE']} {answer}"}
+                  ]
+              })
+
+          random.shuffle(data)
+          dataset = Dataset.from_list(data)
+
+          os.makedirs(OUTPUT_DIR, exist_ok=True)
+          dataset.save_to_disk(OUTPUT_DIR)
+          print(f"Created {len(dataset)} examples at {OUTPUT_DIR}")
+          print(f"  - {NUM_EXAMPLES_PER_ACTION} GEN examples")
+          print(f"  - {NUM_EXAMPLES_PER_ACTION} RET examples")
+          print(f"  - {NUM_EXAMPLES_PER_ACTION} TOOL examples")
+          print(f"  - {NUM_EXAMPLES_PER_ACTION} CODE examples")
+
+          # Show samples
+          print("\nSample examples:")
+          for i, item in enumerate(dataset[:4]):
+              print(f"\n{i+1}. {item['messages'][0]['content'][:50]}...")
+              print(f"   -> {item['messages'][1]['content'][:60]}...")
+          DATASET_EOF
+
+          # ================================================================
+          # STEP 4: Prepare tokenizer with action tokens
+          # ================================================================
+          echo ""
+          echo "[STEP 4/7] Preparing tokenizer with action tokens..."
+          echo ""
+
+          python -u << 'TOKENIZER_EOF'
+          from transformers import AutoTokenizer
+
+          STAGE1_5_PATH = "/workspace/stage1_5_model"
+          TOKENIZER_DIR = "/workspace/tokenizer_with_actions"
+
+          ACTION_TOKENS = [
+              "<ACT:GEN>",
+              "<ACT:RET>",
+              "<ACT:TOOL>",
+              "<ACT:CODE>",
+          ]
+
+          print(f"Loading tokenizer from Stage 1.5 model...")
+          tokenizer = AutoTokenizer.from_pretrained(STAGE1_5_PATH, trust_remote_code=True)
+
+          print(f"Original vocab size: {len(tokenizer)}")
+
+          # Add action tokens
+          num_added = tokenizer.add_special_tokens({
+              "additional_special_tokens": ACTION_TOKENS
+          })
+          print(f"Added {num_added} action tokens")
+          print(f"New vocab size: {len(tokenizer)}")
+
+          print("\nAction token IDs:")
+          for tok in ACTION_TOKENS:
+              tok_id = tokenizer.encode(tok, add_special_tokens=False)
+              print(f"  {tok}: {tok_id}")
+
+          import os
+          os.makedirs(TOKENIZER_DIR, exist_ok=True)
+          tokenizer.save_pretrained(TOKENIZER_DIR)
+          print(f"\nSaved tokenizer to {TOKENIZER_DIR}")
+          TOKENIZER_EOF
+
+          # ================================================================
+          # STEP 5: Setup accelerate config
+          # ================================================================
+          echo ""
+          echo "[STEP 5/7] Setting up training configuration..."
+          echo ""
+
+          mkdir -p ~/.cache/huggingface/accelerate
+          cat > ~/.cache/huggingface/accelerate/default_config.yaml << 'ACCEL_EOF'
+          compute_environment: LOCAL_MACHINE
+          distributed_type: 'NO'
+          downcast_bf16: 'no'
+          machine_rank: 0
+          main_training_function: main
+          mixed_precision: bf16
+          num_machines: 1
+          num_processes: 1
+          use_cpu: false
+          ACCEL_EOF
+
+          # ================================================================
+          # STEP 6: Run action token training on Stage 1.5 model
+          # ================================================================
+          echo ""
+          echo "[STEP 6/7] Training action tokens on Stage 1.5 model..."
+          echo ""
+
+          python -u << 'TRAIN_EOF'
+          import os
+          import torch
+          from datasets import load_from_disk
+          from transformers import (
+              AutoModelForCausalLM,
+              AutoTokenizer,
+              TrainingArguments,
+              Trainer,
+              DataCollatorForSeq2Seq,
+          )
+          from peft import LoraConfig, get_peft_model
+
+          # Configuration
+          STAGE1_5_PATH = "/workspace/stage1_5_model"
+          TOKENIZER_DIR = "/workspace/tokenizer_with_actions"
+          DATASET_DIR = "/workspace/data/action_token_sft"
+          OUTPUT_DIR = "/persistent/output/unified_stage1_with_embeddings"
+
+          print("=" * 60)
+          print("Action Token Training on Stage 1.5 Model")
+          print("=" * 60)
+
+          print("Loading tokenizer with action tokens...")
+          tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR, trust_remote_code=True)
+          if tokenizer.pad_token is None:
+              tokenizer.pad_token = tokenizer.eos_token
+
+          print(f"Loading Stage 1.5 model from {STAGE1_5_PATH}...")
+          model = AutoModelForCausalLM.from_pretrained(
+              STAGE1_5_PATH,
+              torch_dtype=torch.bfloat16,
+              device_map=None,
+              trust_remote_code=True,
+          )
+
+          # Resize embeddings for new action tokens
+          original_size = model.get_input_embeddings().weight.shape[0]
+          model.resize_token_embeddings(len(tokenizer))
+          print(f"Resized embeddings: {original_size} -> {len(tokenizer)}")
+
+          # LoRA configuration - train embeddings for new action tokens
+          print("Applying LoRA...")
+          lora_config = LoraConfig(
+              r=64,
+              lora_alpha=128,
+              target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+              modules_to_save=["embed_tokens", "lm_head"],  # Train embeddings for new action tokens!
+              lora_dropout=0.05,
+              bias="none",
+              task_type="CAUSAL_LM",
+          )
+          model = get_peft_model(model, lora_config)
+          model.print_trainable_parameters()
+
+          # Enable gradient checkpointing
+          model.enable_input_require_grads()
+          if hasattr(model, "gradient_checkpointing_enable"):
+              model.gradient_checkpointing_enable()
+
+          print("Loading dataset...")
+          dataset = load_from_disk(DATASET_DIR)
+          print(f"Loaded {len(dataset)} examples")
+
+          # Split into train/eval
+          split = dataset.train_test_split(test_size=0.05, seed=42)
+          train_dataset = split["train"]
+          eval_dataset = split["test"]
+          print(f"Train: {len(train_dataset)}, Eval: {len(eval_dataset)}")
+
+          # Tokenize function
+          def tokenize_function(example):
+              text = tokenizer.apply_chat_template(
+                  example["messages"],
+                  tokenize=False,
+                  add_generation_prompt=False
+              )
+
+              encodings = tokenizer(
+                  text,
+                  truncation=True,
+                  max_length=1024,
+                  padding=False,
+                  return_tensors=None,
+              )
+
+              encodings["labels"] = encodings["input_ids"].copy()
+
+              # Find assistant response start to mask user portion
+              assistant_marker = "<|im_start|>assistant\n"
+              text_before_assistant = text.split(assistant_marker)[0] + assistant_marker
+              assistant_start = len(tokenizer.encode(text_before_assistant, add_special_tokens=False))
+
+              # Mask everything before assistant response with -100
+              for i in range(min(assistant_start, len(encodings["labels"]))):
+                  encodings["labels"][i] = -100
+
+              return encodings
+
+          print("Tokenizing dataset...")
+          tokenized_train = train_dataset.map(
+              tokenize_function,
+              remove_columns=train_dataset.column_names,
+              num_proc=4,
+          )
+          tokenized_eval = eval_dataset.map(
+              tokenize_function,
+              remove_columns=eval_dataset.column_names,
+              num_proc=4,
+          )
+          print(f"Tokenized train: {len(tokenized_train)}, eval: {len(tokenized_eval)}")
+
+          # Data collator
+          data_collator = DataCollatorForSeq2Seq(
+              tokenizer=tokenizer,
+              model=model,
+              padding="longest",
+              label_pad_token_id=-100,
+          )
+
+          # Training arguments
+          training_args = TrainingArguments(
+              output_dir=OUTPUT_DIR,
+              num_train_epochs=5,
+              per_device_train_batch_size=4,
+              per_device_eval_batch_size=4,
+              gradient_accumulation_steps=8,  # Effective batch size: 4*8 = 32
+              learning_rate=5e-5,
+              lr_scheduler_type="cosine",
+              warmup_ratio=0.05,
+              weight_decay=0.01,
+              logging_steps=20,
+              save_steps=500,
+              eval_strategy="steps",
+              eval_steps=500,
+              bf16=True,
+              gradient_checkpointing=True,
+              optim="adamw_torch",
+              seed=42,
+              report_to="none",
+              save_total_limit=3,
+              load_best_model_at_end=True,
+              metric_for_best_model="eval_loss",
+              greater_is_better=False,
+          )
+
+          # Create trainer
+          trainer = Trainer(
+              model=model,
+              args=training_args,
+              train_dataset=tokenized_train,
+              eval_dataset=tokenized_eval,
+              data_collator=data_collator,
+          )
+
+          print("=" * 60)
+          print("Starting training...")
+          print(f"Total examples: {len(tokenized_train)}")
+          print(f"Epochs: {training_args.num_train_epochs}")
+          print(f"Per-device batch size: {training_args.per_device_train_batch_size}")
+          print(f"Gradient accumulation: {training_args.gradient_accumulation_steps}")
+          print(f"Effective batch size: {training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps}")
+          print("=" * 60)
+
+          trainer.train()
+
+          print("Saving LoRA model...")
+          trainer.save_model(OUTPUT_DIR)
+          tokenizer.save_pretrained(OUTPUT_DIR)
+
+          # Merge and save full model
+          print("Merging LoRA adapters into base model...")
+          merged_model = model.merge_and_unload()
+          merged_output_dir = OUTPUT_DIR + "_merged"
+          merged_model.save_pretrained(merged_output_dir, safe_serialization=True)
+          tokenizer.save_pretrained(merged_output_dir)
+
+          print("=" * 60)
+          print(f"Training complete!")
+          print(f"LoRA model saved to: {OUTPUT_DIR}")
+          print(f"Merged model saved to: {merged_output_dir}")
+          print("=" * 60)
+          TRAIN_EOF
+
+          # ================================================================
+          # STEP 7: Test and upload to HuggingFace
+          # ================================================================
+          echo ""
+          echo "[STEP 7/7] Testing and uploading to HuggingFace..."
+          echo ""
+
+          python -u << 'TEST_AND_UPLOAD_EOF'
+          import os
+          import torch
+          from transformers import AutoModelForCausalLM, AutoTokenizer
+          from huggingface_hub import HfApi, login
+
+          OUTPUT_DIR = "/persistent/output/unified_stage1_with_embeddings_merged"
+          ACTION_TOKENS = ["<ACT:GEN>", "<ACT:RET>", "<ACT:TOOL>", "<ACT:CODE>"]
+          HF_TOKEN = os.environ.get("HF_TOKEN")
+
+          print("Loading trained model for testing...")
+          tokenizer = AutoTokenizer.from_pretrained(OUTPUT_DIR, trust_remote_code=True)
+          model = AutoModelForCausalLM.from_pretrained(
+              OUTPUT_DIR,
+              torch_dtype=torch.bfloat16,
+              device_map="auto",
+              trust_remote_code=True,
+          )
+
+          test_prompts = [
+              ("What is quantum computing?", "GEN"),
+              ("Find information on machine learning", "RET"),
+              ("What's the current weather in Tokyo?", "TOOL"),
+              ("Write a Python function to sort a list", "CODE"),
+              ("Explain neural networks to me", "GEN"),
+              ("Search for documents about climate change", "RET"),
+              ("Calculate 2847 * 3921", "TOOL"),
+              ("Implement binary search in Python", "CODE"),
+          ]
+
+          print("\n" + "=" * 60)
+          print("Testing trained model:")
+          print("=" * 60)
+
+          model.eval()
+          results = {"correct": 0, "total": len(test_prompts)}
+
+          for prompt, expected in test_prompts:
+              messages = [{"role": "user", "content": prompt}]
+              text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+              inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+              with torch.no_grad():
+                  outputs = model.generate(
+                      **inputs,
+                      max_new_tokens=50,
+                      do_sample=False,
+                      pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                  )
+
+              response = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=False)
+
+              # Check which action token was used
+              action_used = None
+              for tok in ACTION_TOKENS:
+                  if tok in response:
+                      action_used = tok.replace("<ACT:", "").replace(">", "")
+                      break
+
+              is_correct = action_used == expected
+              status = "OK" if is_correct else "WRONG"
+
+              print(f"\nQ: {prompt[:50]}...")
+              print(f"  Expected: {expected}, Got: {action_used or 'None'} [{status}]")
+              print(f"  Response: {response[:80]}...")
+
+              if is_correct:
+                  results["correct"] += 1
+
+          print("\n" + "=" * 60)
+          print(f"Action Token Results: {results['correct']}/{results['total']} ({100 * results['correct'] / results['total']:.1f}%)")
+          print("=" * 60)
+
+          # Test embedding quality too
+          print("\n" + "=" * 60)
+          print("Testing embedding quality...")
+          print("=" * 60)
+
+          import torch.nn.functional as F
+
+          def get_embedding(text):
+              inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+              inputs = {k: v.to(model.device) for k, v in inputs.items()}
+              with torch.no_grad():
+                  outputs = model(
+                      input_ids=inputs["input_ids"],
+                      attention_mask=inputs["attention_mask"],
+                      output_hidden_states=True,
+                      use_cache=False,
+                  )
+              hidden = outputs.hidden_states[-1].float()
+              mask = inputs["attention_mask"].unsqueeze(-1).float()
+              emb = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+              return F.normalize(emb, p=2, dim=1)
+
+          emb_tests = [
+              ("<ACT:RET> What is the capital of France?", "Paris is the capital of France.", "Tokyo is the capital of Japan."),
+              ("<ACT:RET> How does photosynthesis work?", "Photosynthesis converts sunlight into energy.", "Machine learning is a type of AI."),
+              ("<ACT:RET> Who wrote Romeo and Juliet?", "Shakespeare wrote Romeo and Juliet.", "Newton discovered gravity."),
+          ]
+
+          emb_correct = 0
+          for q, p, n in emb_tests:
+              pos_sim = (get_embedding(q) @ get_embedding(p).T).item()
+              neg_sim = (get_embedding(q) @ get_embedding(n).T).item()
+              is_ok = pos_sim > neg_sim
+              emb_correct += int(is_ok)
+              print(f"Q: {q[:40]}... | Pos: {pos_sim:.4f} | Neg: {neg_sim:.4f} | {'OK' if is_ok else 'FAIL'}")
+
+          print(f"\nEmbedding Results: {emb_correct}/{len(emb_tests)} correct")
+
+          # Upload to HuggingFace
+          print("\n" + "=" * 60)
+          print("Uploading to HuggingFace...")
+          print("=" * 60)
+
+          login(token=HF_TOKEN)
+          api = HfApi()
+
+          # Get username
+          user_info = api.whoami(token=HF_TOKEN)
+          username = user_info["name"]
+          print(f"Logged in as: {username}")
+
+          # Create repo and upload
+          repo_id = f"{username}/unified-model-stage1-action-tokens"
+
+          try:
+              api.create_repo(repo_id=repo_id, private=True, exist_ok=True)
+              print(f"Created/verified repo: {repo_id}")
+          except Exception as e:
+              print(f"Repo creation note: {e}")
+
+          print(f"Uploading model to {repo_id}...")
+          api.upload_folder(
+              folder_path=OUTPUT_DIR,
+              repo_id=repo_id,
+              token=HF_TOKEN,
+          )
+          print(f"Model uploaded to: https://huggingface.co/{repo_id}")
+
+          # Save test results
+          with open("/persistent/output/test_results.txt", "w") as f:
+              f.write(f"Action Token Results: {results['correct']}/{results['total']} ({100 * results['correct'] / results['total']:.1f}%)\n")
+              f.write(f"Embedding Results: {emb_correct}/{len(emb_tests)} correct\n")
+              f.write(f"Model uploaded to: https://huggingface.co/{repo_id}\n")
+
+          print("\n" + "=" * 60)
+          print("All done!")
+          print(f"Model: https://huggingface.co/{repo_id}")
+          print("=" * 60)
+          TEST_AND_UPLOAD_EOF
+
+          echo ""
+          echo "=============================================="
+          echo "Training Complete!"
+          echo "=============================================="
+          echo "Local models:"
+          echo "  - LoRA: /persistent/output/unified_stage1_with_embeddings"
+          echo "  - Merged: /persistent/output/unified_stage1_with_embeddings_merged"
+          echo ""
+          echo "HuggingFace: https://huggingface.co/Arjunvad/unified-model-stage1-action-tokens"
+          echo "=============================================="
+          date
+
+          # Keep pod alive for log collection
+          echo "Pod staying alive for 30 minutes..."
+          sleep 1800
+
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: persistent
+          mountPath: /persistent
+        - name: shm
+          mountPath: /dev/shm
+
+      volumes:
+      - name: workspace
+        emptyDir:
+          sizeLimit: 150Gi
+      - name: persistent
+        persistentVolumeClaim:
+          claimName: action-on-stage1-5-pvc
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi

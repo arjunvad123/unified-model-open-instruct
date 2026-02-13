@@ -1,0 +1,177 @@
+# Nautilus Kubernetes Job for MTEB Retrieval Benchmark
+# =====================================================
+# Compares Unified Agentic Model vs Qwen Embedding Models
+#
+# SUBMIT:
+#    kubectl apply -f mteb-benchmark-job.yaml -n svcl-self-improve
+#
+# MONITOR:
+#    kubectl get jobs -n svcl-self-improve
+#    kubectl logs -f <pod-name> -n svcl-self-improve
+#
+# DELETE WHEN DONE:
+#    kubectl delete job mteb-benchmark -n svcl-self-improve
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mteb-benchmark
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+
+      # === INIT CONTAINER: Git clone the repo ===
+      initContainers:
+        - name: init-clone-repo
+          image: alpine/git
+          args:
+            - clone
+            - --single-branch
+            - --branch
+            - main
+            - https://github.com/arjunvad123/unified-model-open-instruct.git
+            - /opt/repo/unified-model-open-instruct
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "300Mi"
+              cpu: "120m"
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /opt/repo
+
+      # === MAIN CONTAINER: MTEB Benchmark ===
+      containers:
+        - name: mteb-benchmark
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "=========================================="
+              echo "MTEB Retrieval Benchmark on Nautilus"
+              echo "Comparing: Unified Model vs Qwen Embeddings"
+              echo "=========================================="
+              echo "Start time: $(date)"
+              echo "GPU Info:"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              # === INSTALL DEPENDENCIES ===
+              echo "Installing system dependencies..."
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              # === CREATE PYTHON ENVIRONMENT ===
+              echo "Setting up Python environment..."
+              python3 -m venv /opt/venv
+              source /opt/venv/bin/activate
+
+              # === INSTALL PACKAGES ===
+              echo "Installing Python packages..."
+              pip install --upgrade pip
+              pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+              pip install transformers accelerate mteb sentence-transformers numpy
+
+              # === VERIFY SETUP ===
+              echo "PyTorch version:"
+              python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.device_count()}')"
+
+              # === NAVIGATE TO CODE ===
+              cd /code/unified-model-open-instruct
+
+              # === COPY BENCHMARK SCRIPT ===
+              echo "Setting up benchmark..."
+              mkdir -p results/mteb
+
+              # === RUN MTEB BENCHMARKS ===
+              echo "=========================================="
+              echo "Running MTEB Retrieval Benchmarks..."
+              echo "Models: unified_model, base_qwen_3b, gte_qwen2_1.5b"
+              echo "Tasks: NFCorpus, SciFact, ArguAna, SCIDOCS, FiQA2018, TRECCOVID"
+              echo "=========================================="
+
+              python benchmarks/run_mteb_comparison.py \
+                  --model all \
+                  --tasks full \
+                  --output-dir results/mteb
+
+              echo "=========================================="
+              echo "MTEB Benchmark COMPLETE!"
+              echo "End time: $(date)"
+              echo "=========================================="
+
+              # === PRINT RESULTS ===
+              echo "Results:"
+              cat results/mteb/comparison_summary.json
+
+              # Keep results accessible
+              echo "Copying results to /data/mteb_results..."
+              cp -r results/mteb /data/mteb_results_$(date +%Y%m%d_%H%M%S)
+
+          # === RESOURCE REQUESTS/LIMITS ===
+          # Single GPU sufficient for embedding inference
+          resources:
+            requests:
+              memory: "32Gi"
+              cpu: "8"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "38Gi"
+              cpu: "9"
+              nvidia.com/gpu: "1"
+
+          # === VOLUME MOUNTS ===
+          volumeMounts:
+            - name: git-repo-code
+              mountPath: /code
+            - name: data-storage
+              mountPath: /data
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
+
+          # === ENVIRONMENT VARIABLES ===
+          env:
+            - name: HF_HOME
+              value: "/root/.cache/huggingface"
+            - name: TRANSFORMERS_CACHE
+              value: "/root/.cache/huggingface"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+
+      # === VOLUMES ===
+      volumes:
+        - name: git-repo-code
+          emptyDir: {}
+        - name: data-storage
+          emptyDir:
+            sizeLimit: "50Gi"
+        - name: hf-cache
+          emptyDir:
+            sizeLimit: "50Gi"
+
+      # === GPU AFFINITY ===
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - Tesla-V100-SXM2-32GB
+                      - NVIDIA-A100-SXM4-40GB
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-L40S
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule
