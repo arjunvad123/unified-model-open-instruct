@@ -1,23 +1,24 @@
 # !/usr/bin/env python
 # Stage 1.5: Contrastive Embedding Training for Action Token Model
 #
-# This script adds SOTA embedding capability to the action token model,
-# following the GritLM approach of unified generation + embedding.
+# Self-contained script — no dependency on open_instruct.dataset_transformation
+# or open_instruct.utils, so it can run in any environment with torch/transformers.
 #
 # When the model outputs <ACT:RET>, it should produce high-quality embeddings
 # via mean pooling over hidden states, trained with InfoNCE contrastive loss.
 #
 # Usage:
-#   uv run accelerate launch open_instruct/contrastive_finetune.py \
-#       --model_name_or_path Qwen/Qwen2.5-3B-Instruct \
-#       --lora_path output/action_token_stage1_large \
-#       --dataset_mixer_list data/contrastive_train.jsonl 1.0 \
-#       --temperature 0.05 \
-#       --per_device_train_batch_size 8 \
-#       --learning_rate 2e-5 \
-#       --num_train_epochs 3 \
+#   python open_instruct/contrastive_finetune.py \
+#       --model_name_or_path Arjunvad/unified-model-stage1-action-tokens-v2 \
+#       --use_lora true \
+#       --dataset_mixer_list data/medi2_contrastive_train.jsonl 1.0 \
+#       --temperature 0.02 \
+#       --per_device_train_batch_size 16 \
+#       --learning_rate 1e-5 \
+#       --num_train_epochs 1 \
 #       --output_dir output/unified_embedding_v1
 
+import json
 import math
 import os
 import time
@@ -29,29 +30,26 @@ import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
+from datasets import Dataset
 from peft import PeftModel
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    HfArgumentParser,
     get_scheduler,
 )
 
-from open_instruct.dataset_transformation import (
-    QUERY_INPUT_IDS_KEY,
-    QUERY_ATTENTION_MASK_KEY,
-    POS_INPUT_IDS_KEY,
-    POS_ATTENTION_MASK_KEY,
-    NEG_INPUT_IDS_KEY,
-    NEG_ATTENTION_MASK_KEY,
-    TOKENIZED_CONTRASTIVE_DATASET_KEYS,
-    TokenizerConfig,
-    get_cached_dataset_tulu,
-)
-from open_instruct.utils import ArgumentParserPlus
-
 logger = get_logger(__name__)
+
+# Dataset column keys
+QUERY_INPUT_IDS_KEY = "query_input_ids"
+QUERY_ATTENTION_MASK_KEY = "query_attention_mask"
+POS_INPUT_IDS_KEY = "pos_input_ids"
+POS_ATTENTION_MASK_KEY = "pos_attention_mask"
+NEG_INPUT_IDS_KEY = "neg_input_ids"
+NEG_ATTENTION_MASK_KEY = "neg_attention_mask"
 
 
 @dataclass
@@ -130,6 +128,63 @@ class ContrastiveFinetuneArguments:
         default=None,
         metadata={"help": "HuggingFace repo ID to push model (e.g. Arjunvad/unified-model-stage1.5-embedding-v2)."},
     )
+
+
+def load_contrastive_dataset(data_path: str, fraction: float, tokenizer, max_seq_length: int, seed: int):
+    """Load JSONL triplet dataset and tokenize for contrastive training.
+
+    Input format: {"query": "...", "positive": "...", "negative": "..."}
+    Query is prefixed with <ACT:RET> to teach embedding mode.
+    """
+    print(f"Loading dataset from {data_path} (fraction={fraction})...")
+    records = []
+    with open(data_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+
+    # Apply fraction
+    n = int(len(records) * fraction)
+    records = records[:n]
+    print(f"  Loaded {len(records)} examples")
+
+    # Tokenize
+    tokenized = {
+        QUERY_INPUT_IDS_KEY: [],
+        QUERY_ATTENTION_MASK_KEY: [],
+        POS_INPUT_IDS_KEY: [],
+        POS_ATTENTION_MASK_KEY: [],
+        NEG_INPUT_IDS_KEY: [],
+        NEG_ATTENTION_MASK_KEY: [],
+    }
+
+    skipped = 0
+    for row in tqdm(records, desc="Tokenizing"):
+        query_text = "<ACT:RET> " + row["query"]
+        pos_text = row["positive"]
+        neg_text = row["negative"]
+
+        query_enc = tokenizer(query_text, truncation=True, max_length=max_seq_length, padding=False)
+        pos_enc = tokenizer(pos_text, truncation=True, max_length=max_seq_length, padding=False)
+        neg_enc = tokenizer(neg_text, truncation=True, max_length=max_seq_length, padding=False)
+
+        # Filter empty
+        if not query_enc["input_ids"] or not pos_enc["input_ids"] or not neg_enc["input_ids"]:
+            skipped += 1
+            continue
+
+        tokenized[QUERY_INPUT_IDS_KEY].append(query_enc["input_ids"])
+        tokenized[QUERY_ATTENTION_MASK_KEY].append(query_enc["attention_mask"])
+        tokenized[POS_INPUT_IDS_KEY].append(pos_enc["input_ids"])
+        tokenized[POS_ATTENTION_MASK_KEY].append(pos_enc["attention_mask"])
+        tokenized[NEG_INPUT_IDS_KEY].append(neg_enc["input_ids"])
+        tokenized[NEG_ATTENTION_MASK_KEY].append(neg_enc["attention_mask"])
+
+    print(f"  Tokenized: {len(tokenized[QUERY_INPUT_IDS_KEY])} examples (skipped {skipped})")
+    dataset = Dataset.from_dict(tokenized)
+    dataset = dataset.shuffle(seed=seed)
+    return dataset
 
 
 class ContrastiveDataCollator:
@@ -227,8 +282,8 @@ def contrastive_loss(query_emb, pos_emb, neg_emb, temperature, use_in_batch_nega
 
 
 def main():
-    parser = ArgumentParserPlus((ContrastiveFinetuneArguments,))
-    args = parser.parse()
+    parser = HfArgumentParser((ContrastiveFinetuneArguments,))
+    (args,) = parser.parse_args_into_dataclasses()
 
     # Setup accelerator
     accelerator = Accelerator(
@@ -253,23 +308,14 @@ def main():
 
     # Load and tokenize dataset
     accelerator.print("Loading dataset...")
-    tc = TokenizerConfig(
-        tokenizer_name_or_path=tokenizer_path,
-        trust_remote_code=True,
-    )
+    # Parse dataset_mixer_list: [path, fraction, path2, fraction2, ...]
+    data_path = args.dataset_mixer_list[0]
+    fraction = float(args.dataset_mixer_list[1]) if len(args.dataset_mixer_list) > 1 else 1.0
 
     with accelerator.main_process_first():
-        transform_fn_args = [{"max_seq_length": args.max_seq_length}, {"max_seq_length": args.max_seq_length}]
-        train_dataset = get_cached_dataset_tulu(
-            dataset_mixer_list=args.dataset_mixer_list,
-            dataset_mixer_list_splits=args.dataset_mixer_list_splits,
-            tc=tc,
-            dataset_transform_fn=["contrastive_tokenize_v1", "contrastive_filter_v1"],
-            transform_fn_args=transform_fn_args,
-            target_columns=TOKENIZED_CONTRASTIVE_DATASET_KEYS,
-            dataset_skip_cache=True,
+        train_dataset = load_contrastive_dataset(
+            data_path, fraction, tokenizer, args.max_seq_length, args.seed
         )
-        train_dataset = train_dataset.shuffle(seed=args.seed)
 
     accelerator.print(f"Dataset loaded: {len(train_dataset)} examples")
 
