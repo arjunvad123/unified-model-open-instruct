@@ -32,7 +32,7 @@ spec:
 
       containers:
       - name: training
-        image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+        image: pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel
         imagePullPolicy: IfNotPresent
 
         resources:
@@ -83,9 +83,8 @@ spec:
           echo "[STEP 1/6] Installing dependencies..."
           echo ""
 
-          apt-get update && apt-get install -y git
+          apt-get update && apt-get install -y git || (sleep 5 && apt-get update && apt-get install -y git)
           pip install --upgrade pip
-          pip install torch==2.1.0 --index-url https://download.pytorch.org/whl/cu121
           pip install --upgrade filelock huggingface_hub datasets
           pip install transformers accelerate peft bitsandbytes trl tqdm
 
