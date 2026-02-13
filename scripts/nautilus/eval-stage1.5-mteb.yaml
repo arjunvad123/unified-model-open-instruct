@@ -68,9 +68,9 @@ spec:
 
               MODELS = {
                   "stage1_5_medi2": {
-                      "base_model": "Arjunvad/unified-model-stage1-action-tokens-v2",
-                      "lora_path": "Arjunvad/unified-model-stage1.5-embedding-v2",
-                      "description": "Stage 1.5 - MEDI2 hard negatives, temp=0.02",
+                      "base_model": "Arjunvad/unified-model-stage1.5-embedding-v2",
+                      "lora_path": None,
+                      "description": "Stage 1.5 - MEDI2 hard negatives, temp=0.02 (merged full model)",
                   },
                   "stage1_baseline": {
                       "base_model": "Arjunvad/unified-model-stage1-action-tokens-v2",
@@ -88,11 +88,10 @@ spec:
                       print(f"Loading {base_model_path}...")
 
                       self.tokenizer = AutoTokenizer.from_pretrained(
-                          lora_path or base_model_path, trust_remote_code=True
+                          base_model_path, trust_remote_code=True
                       )
-                      # Load as AutoModel (not CausalLM) for embedding
-                      from transformers import AutoModel
-                      self.model = AutoModel.from_pretrained(
+                      # Use AutoModelForCausalLM (matches training) with output_hidden_states
+                      self.model = AutoModelForCausalLM.from_pretrained(
                           base_model_path,
                           trust_remote_code=True,
                           torch_dtype=torch.bfloat16
@@ -120,8 +119,9 @@ spec:
                           ).to(self.device)
 
                           with torch.no_grad():
-                              outputs = self.model(**inputs)
-                              hidden = outputs.last_hidden_state.float()
+                              outputs = self.model(**inputs, output_hidden_states=True, use_cache=False)
+                              # Use last hidden state from hidden_states (matches training)
+                              hidden = outputs.hidden_states[-1].float()
                               mask = inputs["attention_mask"].unsqueeze(-1).float()
                               emb = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
                               emb = F.normalize(emb, p=2, dim=1)
@@ -286,6 +286,11 @@ spec:
               value: "/tmp/hf_cache"
             - name: PYTHONUNBUFFERED
               value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
 
       tolerations:
         - key: nvidia.com/gpu

@@ -411,6 +411,9 @@ def main():
                     accelerator.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
+
+            # Only step LR scheduler on actual optimizer steps (not every micro-batch)
+            if accelerator.sync_gradients:
                 lr_scheduler.step()
 
             # Logging
@@ -448,9 +451,13 @@ def main():
     if accelerator.is_main_process:
         unwrapped_model = accelerator.unwrap_model(model)
         if isinstance(unwrapped_model, PeftModel):
-            unwrapped_model.save_pretrained(args.output_dir)
-        else:
-            unwrapped_model.save_pretrained(args.output_dir)
+            # Merge LoRA into base model so we save a complete model
+            # (PeftModel.save_pretrained only saves adapter weights,
+            #  which would lose trained embedding weights for action tokens)
+            accelerator.print("Merging LoRA weights into base model...")
+            unwrapped_model = unwrapped_model.merge_and_unload()
+            accelerator.print("LoRA merged. Saving full model...")
+        unwrapped_model.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
 
     # Push to HuggingFace Hub

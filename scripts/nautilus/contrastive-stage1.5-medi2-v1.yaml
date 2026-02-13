@@ -61,7 +61,6 @@ spec:
             secretKeyRef:
               name: hf-token
               key: token
-              optional: true
 
         command: ["/bin/bash", "-c"]
         args:
@@ -87,7 +86,8 @@ spec:
           apt-get update && apt-get install -y git
           pip install --upgrade pip
           pip install torch==2.1.0 --index-url https://download.pytorch.org/whl/cu121
-          pip install datasets transformers accelerate peft bitsandbytes trl tqdm huggingface_hub
+          pip install --upgrade filelock huggingface_hub datasets
+          pip install transformers accelerate peft bitsandbytes trl tqdm
 
           # ================================================================
           # STEP 2: Clone repo

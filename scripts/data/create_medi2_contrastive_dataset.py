@@ -25,6 +25,8 @@ from tqdm import tqdm
 def extract_text(item):
     """Extract text from MEDI2 format (handles both string and [instruction, text] format)."""
     if isinstance(item, list):
+        if len(item) == 0:
+            return ""
         # Instruction-prefixed format: [instruction, text]
         return item[-1] if len(item) > 1 else item[0]
     return item
@@ -61,15 +63,12 @@ def main():
     data = []
     skipped = 0
 
-    # Shuffle indices for random sampling if max_samples < dataset size
-    indices = list(range(len(dataset)))
-    random.shuffle(indices)
+    # Shuffle dataset for random sampling (much faster than random index access)
+    dataset = dataset.shuffle(seed=args.seed)
 
-    for idx in tqdm(indices, desc="Processing"):
+    for item in tqdm(dataset, desc="Processing", total=len(dataset)):
         if len(data) >= args.max_samples:
             break
-
-        item = dataset[idx]
 
         # Extract query text
         query_raw = item["query"]
