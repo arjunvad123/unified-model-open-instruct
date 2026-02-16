@@ -175,7 +175,7 @@ spec:
               --clip_grad_norm 1.0 \
               --output_dir /workspace/output/unified_embedding_medi2_v1 \
               --push_to_hub true \
-              --hub_model_id Arjunvad/unified-model-stage1.5-embedding-v2 \
+              --hub_model_id Arjunvad/unified-model-stage1-5-embedding-v2 \
               --seed 42
 
           # ================================================================
@@ -193,7 +193,7 @@ spec:
           echo "Stage 1.5 v2 Training Complete!"
           echo "=============================================="
           echo "Model saved to: /workspace/output/unified_embedding_medi2_v1"
-          echo "Pushed to: Arjunvad/unified-model-stage1.5-embedding-v2"
+          echo "Pushed to: Arjunvad/unified-model-stage1-5-embedding-v2"
           date
 
           # Keep pod alive for 30 minutes for log inspection

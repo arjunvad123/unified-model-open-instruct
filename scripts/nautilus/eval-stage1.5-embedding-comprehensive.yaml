@@ -171,7 +171,7 @@ spec:
 
               def main():
                   MODELS = [
-                      ("Stage 1.5 (Ours, 3B)", "stage1_5", lambda: CausalLMEmbedding("Arjunvad/unified-model-stage1.5-embedding-v2"), False),
+                      ("Stage 1.5 (Ours, 3B)", "stage1_5", lambda: CausalLMEmbedding("Arjunvad/unified-model-stage1-5-embedding-v2"), False),
                       ("Qwen3-Embedding-4B", "qwen3_emb_4b", lambda: Qwen3Embedding(), True),
                   ]
 

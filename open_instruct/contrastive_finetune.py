@@ -409,15 +409,20 @@ def main():
     if args.push_to_hub and accelerator.is_main_process:
         try:
             from huggingface_hub import HfApi, login
+            import traceback
             hf_token = os.environ.get("HF_TOKEN")
             if hf_token:
                 login(token=hf_token)
-            hub_repo_id = args.hub_model_id or "Arjunvad/unified-model-stage1.5-embedding-v2"
-            hf_api = HfApi()
-            hf_api.create_repo(repo_id=hub_repo_id, private=True, exist_ok=True)
+                accelerator.print(f"HF login successful (token length={len(hf_token)})")
+            else:
+                accelerator.print("Warning: HF_TOKEN not set, push may fail")
+            hub_repo_id = args.hub_model_id or "Arjunvad/unified-model-stage1-5-embedding-v2"
+            hf_api = HfApi(token=hf_token)
+            hf_api.create_repo(repo_id=hub_repo_id, private=False, exist_ok=True, repo_type="model")
             accelerator.print(f"HuggingFace Hub ready: {hub_repo_id}")
         except Exception as e:
             accelerator.print(f"Warning: Could not setup HF Hub: {e}")
+            traceback.print_exc()
             hf_api = None
 
     # Training info

@@ -55,7 +55,7 @@ spec:
               from datetime import datetime
 
               MODELS = [
-                  ("Stage 1.5 (Ours, 3B)", "Arjunvad/unified-model-stage1.5-embedding-v2", "stage1_5"),
+                  ("Stage 1.5 (Ours, 3B)", "Arjunvad/unified-model-stage1-5-embedding-v2", "stage1_5"),
                   ("Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-3B-Instruct", "qwen25_3b"),
                   ("SmolLM3-3B", "HuggingFaceTB/SmolLM3-3B", "smollm3_3b"),
               ]
