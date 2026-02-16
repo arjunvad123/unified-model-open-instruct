@@ -171,7 +171,7 @@ spec:
               --warmup_ratio 0.03 \
               --gradient_checkpointing true \
               --logging_steps 50 \
-              --checkpointing_steps 2000 \
+              --checkpointing_steps 500 \
               --clip_grad_norm 1.0 \
               --output_dir /workspace/output/unified_embedding_medi2_v1 \
               --push_to_hub true \

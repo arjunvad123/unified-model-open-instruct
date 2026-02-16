@@ -403,6 +403,23 @@ def main():
         model, optimizer, train_dataloader, lr_scheduler
     )
 
+    # Setup HuggingFace Hub for checkpoint saving
+    hf_api = None
+    hub_repo_id = None
+    if args.push_to_hub and accelerator.is_main_process:
+        try:
+            from huggingface_hub import HfApi, login
+            hf_token = os.environ.get("HF_TOKEN")
+            if hf_token:
+                login(token=hf_token)
+            hub_repo_id = args.hub_model_id or "Arjunvad/unified-model-stage1.5-embedding-v2"
+            hf_api = HfApi()
+            hf_api.create_repo(repo_id=hub_repo_id, private=True, exist_ok=True)
+            accelerator.print(f"HuggingFace Hub ready: {hub_repo_id}")
+        except Exception as e:
+            accelerator.print(f"Warning: Could not setup HF Hub: {e}")
+            hf_api = None
+
     # Training info
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     accelerator.print("=" * 70)
@@ -478,11 +495,32 @@ def main():
                         f"Speed: {steps_per_sec:.2f} steps/s"
                     )
 
-                # Checkpointing
+                # Checkpointing — save locally and push to HuggingFace
                 if args.checkpointing_steps and completed_steps % args.checkpointing_steps == 0:
-                    checkpoint_dir = os.path.join(args.output_dir, f"step_{completed_steps}")
-                    accelerator.save_state(checkpoint_dir)
-                    accelerator.print(f"  Saved checkpoint to {checkpoint_dir}")
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        checkpoint_dir = os.path.join(args.output_dir, f"checkpoint")
+                        os.makedirs(checkpoint_dir, exist_ok=True)
+                        unwrapped = accelerator.unwrap_model(model)
+                        # Save LoRA adapters (doesn't modify model, safe for continued training)
+                        unwrapped.save_pretrained(checkpoint_dir)
+                        # Also save embedding weights separately (includes action tokens)
+                        emb_path = os.path.join(checkpoint_dir, "embedding_weights.pt")
+                        torch.save(unwrapped.get_input_embeddings().state_dict(), emb_path)
+                        tokenizer.save_pretrained(checkpoint_dir)
+                        accelerator.print(f"  Saved checkpoint at step {completed_steps}")
+
+                        # Push checkpoint to HuggingFace
+                        if hf_api and hub_repo_id:
+                            try:
+                                hf_api.upload_folder(
+                                    folder_path=checkpoint_dir,
+                                    repo_id=hub_repo_id,
+                                    commit_message=f"Checkpoint at step {completed_steps}",
+                                )
+                                accelerator.print(f"  Pushed checkpoint to {hub_repo_id}")
+                            except Exception as e:
+                                accelerator.print(f"  Warning: Failed to push checkpoint: {e}")
 
                 if completed_steps >= args.max_train_steps:
                     break
@@ -506,19 +544,16 @@ def main():
         unwrapped_model.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
 
-    # Push to HuggingFace Hub
-    if args.push_to_hub and accelerator.is_main_process:
+    # Push final model to HuggingFace Hub
+    if args.push_to_hub and accelerator.is_main_process and hf_api and hub_repo_id:
         try:
-            from huggingface_hub import HfApi, login
-            hf_token = os.environ.get("HF_TOKEN")
-            if hf_token:
-                login(token=hf_token)
-            repo_id = args.hub_model_id or "Arjunvad/unified-model-stage1.5-embedding-v2"
-            accelerator.print(f"Pushing model to {repo_id}...")
-            api = HfApi()
-            api.create_repo(repo_id=repo_id, private=True, exist_ok=True)
-            api.upload_folder(folder_path=args.output_dir, repo_id=repo_id)
-            accelerator.print(f"Pushed to https://huggingface.co/{repo_id}")
+            accelerator.print(f"Pushing final model to {hub_repo_id}...")
+            hf_api.upload_folder(
+                folder_path=args.output_dir,
+                repo_id=hub_repo_id,
+                commit_message="Final merged model",
+            )
+            accelerator.print(f"Pushed to https://huggingface.co/{hub_repo_id}")
         except Exception as e:
             accelerator.print(f"Failed to push to hub: {e}")
 
