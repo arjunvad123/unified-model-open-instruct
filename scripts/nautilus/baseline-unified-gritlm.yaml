@@ -1,0 +1,408 @@
+# Baseline Unified Benchmark: Our Model (3B) vs Top Unified/Embedding Models
+# Framework: GritLM-style eval (Embedding + Generation where applicable)
+#
+# Models:
+#   1. Ours: Arjunvad/unified-model-stage1-action-tokens-v2 (3B, CausalLM)
+#   2. GritLM/GritLM-7B (7B, truly unified)
+#   3. Qwen/Qwen3-Embedding-8B (8B, embedding-only)
+#   4. nvidia/NV-Embed-v2 (8B, embedding-only)
+#   5. jinaai/jina-embeddings-v4 (4B, embedding-only)
+#
+# NOTE: GritLM-8x7B (47B MoE) excluded — too large for single GPU
+#
+# Deploy: kubectl apply -f baseline-unified-gritlm.yaml -n svcl-self-improve
+# Logs:   kubectl logs job/baseline-unified -n svcl-self-improve -f
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: baseline-unified
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-L40S
+                - NVIDIA-L40
+
+      containers:
+        - name: eval
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "==========================================================="
+              echo "Baseline Unified Benchmark (GritLM-style)"
+              echo "Our Model (3B) vs Unified/Embedding Models"
+              echo "==========================================================="
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              source /opt/venv/bin/activate
+
+              pip install --upgrade pip
+              pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+              pip install "transformers>=4.51.0" "sentence-transformers>=2.7.0" accelerate mteb lm-eval numpy tqdm
+
+              python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+
+              mkdir -p /workspace/results
+              cd /workspace
+
+              cat > run_baseline_unified.py << 'PYTHON_SCRIPT'
+              import json, os, gc, sys, subprocess
+              from datetime import datetime
+              import numpy as np
+              import torch
+              import torch.nn.functional as F
+              from tqdm import tqdm
+              import warnings
+              warnings.filterwarnings("ignore")
+
+              EMB_TASKS = ["NFCorpus", "SciFact", "ArguAna"]
+              GEN_TASKS = "arc_easy,arc_challenge,hellaswag,winogrande"
+
+              # ============================================================
+              # Our model: CausalLM mean pooling
+              # ============================================================
+              class CausalLMEmbedding:
+                  def __init__(self, model_path, device=None):
+                      from transformers import AutoTokenizer, AutoModelForCausalLM
+                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+                      print(f"  Loading CausalLM: {model_path}")
+                      self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                      self.model = AutoModelForCausalLM.from_pretrained(
+                          model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
+                      ).to(self.device).eval()
+                      if not self.tokenizer.pad_token:
+                          self.tokenizer.pad_token = self.tokenizer.eos_token
+                      self.model_path = model_path
+                      print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e9:.1f}B")
+
+                  def encode(self, sentences, batch_size=32, **kwargs):
+                      all_emb = []
+                      for i in tqdm(range(0, len(sentences), batch_size), desc="Encoding", disable=len(sentences)<100):
+                          batch = sentences[i:i+batch_size]
+                          inputs = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(self.device)
+                          with torch.no_grad():
+                              out = self.model(**inputs, output_hidden_states=True, use_cache=False)
+                              h = out.hidden_states[-1].float()
+                              m = inputs["attention_mask"].unsqueeze(-1).float()
+                              emb = F.normalize((h * m).sum(1) / m.sum(1).clamp(min=1e-9), p=2, dim=1)
+                              all_emb.append(emb.cpu())
+                      return torch.cat(all_emb, dim=0).numpy()
+
+              # ============================================================
+              # GritLM: uses gritlm library if available, fallback to ST
+              # ============================================================
+              class GritLMWrapper:
+                  def __init__(self, model_name, device=None):
+                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+                      self.model_name = model_name
+                      print(f"  Loading GritLM: {model_name}")
+                      try:
+                          from gritlm import GritLM
+                          self.model = GritLM(model_name, torch_dtype=torch.bfloat16, device=self.device)
+                          self.use_gritlm = True
+                          print("  Using GritLM library")
+                      except Exception:
+                          from sentence_transformers import SentenceTransformer
+                          self.model = SentenceTransformer(model_name, device=self.device, trust_remote_code=True)
+                          self.use_gritlm = False
+                          print("  Fallback to SentenceTransformer")
+                      print(f"  Params: {sum(p.numel() for p in self.model.parameters() if hasattr(self.model, 'parameters'))/1e9:.1f}B")
+
+                  def encode(self, sentences, batch_size=32, **kwargs):
+                      if self.use_gritlm:
+                          return self.model.encode(sentences, batch_size=batch_size)
+                      return self.model.encode(sentences, batch_size=batch_size, show_progress_bar=len(sentences)>100, normalize_embeddings=True)
+
+              # ============================================================
+              # Qwen3-Embedding: AutoModel + last-token pooling
+              # ============================================================
+              class Qwen3EmbWrapper:
+                  def __init__(self, model_name="Qwen/Qwen3-Embedding-8B", device=None):
+                      from transformers import AutoTokenizer, AutoModel
+                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+                      print(f"  Loading: {model_name}")
+                      self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side='left')
+                      self.model = AutoModel.from_pretrained(
+                          model_name, trust_remote_code=True, torch_dtype=torch.bfloat16
+                      ).to(self.device).eval()
+                      self.instruction = "Given a web search query, retrieve relevant passages that answer the query"
+                      print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e9:.1f}B")
+
+                  def encode(self, sentences, batch_size=8, prompt_name=None, **kwargs):
+                      all_emb = []
+                      for i in tqdm(range(0, len(sentences), batch_size), desc="Encoding", disable=len(sentences)<100):
+                          batch = sentences[i:i+batch_size]
+                          if prompt_name == "query":
+                              batch = [f"Instruct: {self.instruction}\nQuery:{s}" for s in batch]
+                          inputs = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
+                          inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                          with torch.no_grad():
+                              out = self.model(**inputs)
+                              seq_lens = inputs["attention_mask"].sum(dim=1) - 1
+                              emb = out.last_hidden_state[torch.arange(len(batch), device=self.device), seq_lens].float()
+                              emb = F.normalize(emb, p=2, dim=1)
+                              all_emb.append(emb.cpu())
+                      return torch.cat(all_emb, dim=0).numpy()
+
+              # ============================================================
+              # SentenceTransformer wrapper (NV-Embed, Jina)
+              # ============================================================
+              class STWrapper:
+                  def __init__(self, model_name, device=None):
+                      from sentence_transformers import SentenceTransformer
+                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+                      print(f"  Loading ST: {model_name}")
+                      self.model = SentenceTransformer(model_name, device=self.device, trust_remote_code=True)
+                      print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e6:.0f}M")
+
+                  def encode(self, sentences, batch_size=32, **kwargs):
+                      return self.model.encode(sentences, batch_size=batch_size, show_progress_bar=len(sentences)>100, normalize_embeddings=True)
+
+              # ============================================================
+              # Evaluation (same as other scripts)
+              # ============================================================
+              def evaluate_emb_task(model, task_name, use_query_prompt=False):
+                  import mteb
+                  try:
+                      task = mteb.get_task(task_name)
+                      task.load_data()
+                      subset = list(task.dataset.keys())[0]
+                      split = "test" if "test" in task.dataset[subset] else list(task.dataset[subset].keys())[0]
+                      data = task.dataset[subset][split]
+
+                      corpus = {r["id"]: {"title": r.get("title",""), "text": r.get("text","")} for r in data["corpus"]}
+                      queries = {r["id"]: r["text"] for r in data["queries"]}
+                      qrels = data["relevant_docs"]
+                      print(f"    Corpus: {len(corpus)}, Queries: {len(queries)}")
+
+                      corpus_ids = list(corpus.keys())
+                      corpus_texts = [f"{corpus[c].get('title','')} {corpus[c].get('text','')}".strip() for c in corpus_ids]
+                      corpus_emb = model.encode(corpus_texts, batch_size=32)
+
+                      query_ids = list(queries.keys())
+                      query_texts = [queries[q] for q in query_ids]
+                      query_emb = model.encode(query_texts, batch_size=32, prompt_name="query" if use_query_prompt else None)
+
+                      scores = np.dot(query_emb, corpus_emb.T)
+
+                      ndcg, mrr, n = 0, 0, 0
+                      for i, qid in enumerate(query_ids):
+                          if qid not in qrels: continue
+                          n += 1
+                          rel = set(qrels[qid].keys())
+                          ranked = np.argsort(scores[i])[::-1]
+                          for rank, idx in enumerate(ranked):
+                              if corpus_ids[idx] in rel:
+                                  mrr += 1/(rank+1)
+                                  break
+                          dcg = sum(1/np.log2(r+2) for r, idx in enumerate(ranked[:10]) if corpus_ids[idx] in rel)
+                          idcg = sum(1/np.log2(j+2) for j in range(min(len(rel), 10)))
+                          if idcg > 0: ndcg += dcg/idcg
+
+                      return {"ndcg@10": ndcg/n, "mrr": mrr/n}
+                  except Exception as e:
+                      print(f"    Error: {e}")
+                      import traceback; traceback.print_exc()
+                      return {"error": str(e)}
+
+              def evaluate_gen(model_id, output_dir):
+                  """Run lm-eval-harness for generation tasks."""
+                  os.makedirs(output_dir, exist_ok=True)
+                  cmd = [
+                      sys.executable, "-m", "lm_eval",
+                      "--model", "hf",
+                      "--model_args", f"pretrained={model_id},trust_remote_code=True,dtype=bfloat16",
+                      "--tasks", GEN_TASKS,
+                      "--batch_size", "auto",
+                      "--output_path", output_dir,
+                  ]
+                  subprocess.run(cmd, capture_output=False, text=True)
+                  results = {}
+                  for root, dirs, files in os.walk(output_dir):
+                      for fname in files:
+                          if fname == "results.json":
+                              with open(os.path.join(root, fname)) as f:
+                                  data = json.load(f)
+                              if "results" in data:
+                                  results.update(data["results"])
+                  return results
+
+              def main():
+                  # Models: (name, key, emb_loader, use_query_prompt, gen_model_id_or_None)
+                  MODELS = [
+                      ("Ours (3B)", "ours",
+                       lambda: CausalLMEmbedding("Arjunvad/unified-model-stage1-action-tokens-v2"),
+                       False, "Arjunvad/unified-model-stage1-action-tokens-v2"),
+                      ("GritLM-7B", "gritlm7b",
+                       lambda: GritLMWrapper("GritLM/GritLM-7B"),
+                       False, "GritLM/GritLM-7B"),
+                      ("Qwen3-Emb-8B", "qwen3emb",
+                       lambda: Qwen3EmbWrapper("Qwen/Qwen3-Embedding-8B"),
+                       True, None),
+                      ("NV-Embed-v2", "nvembed",
+                       lambda: STWrapper("nvidia/NV-Embed-v2"),
+                       False, None),
+                      ("Jina-v4", "jinav4",
+                       lambda: STWrapper("jinaai/jina-embeddings-v4"),
+                       False, None),
+                  ]
+
+                  all_emb_results = {}
+                  all_gen_results = {}
+
+                  for display_name, key, emb_loader, use_prompt, gen_model_id in MODELS:
+                      print("\n" + "=" * 70)
+                      print(f"EVALUATING: {display_name}")
+                      print("=" * 70)
+
+                      # Embedding eval
+                      print(f"\n  --- Embedding Tasks ---")
+                      try:
+                          model = emb_loader()
+                          emb_results = {}
+                          for task in EMB_TASKS:
+                              print(f"\n  {task}...")
+                              r = evaluate_emb_task(model, task, use_prompt)
+                              emb_results[task] = r
+                              if "error" not in r:
+                                  print(f"    NDCG@10={r['ndcg@10']:.4f}  MRR={r['mrr']:.4f}")
+                          all_emb_results[key] = emb_results
+                          del model; torch.cuda.empty_cache(); gc.collect()
+                      except Exception as e:
+                          print(f"  EMB FAILED: {e}")
+                          import traceback; traceback.print_exc()
+                          all_emb_results[key] = {"error": str(e)}
+
+                      # Generation eval (only for unified models)
+                      if gen_model_id:
+                          print(f"\n  --- Generation Tasks ---")
+                          try:
+                              gen_results = evaluate_gen(gen_model_id, f"/workspace/results/{key}_gen")
+                              all_gen_results[key] = gen_results
+                              print(f"  Gen results: {len(gen_results)} tasks")
+                          except Exception as e:
+                              print(f"  GEN FAILED: {e}")
+                              all_gen_results[key] = {"error": str(e)}
+
+                  # ============================================================
+                  # Print results
+                  # ============================================================
+                  keys = ["ours", "gritlm7b", "qwen3emb", "nvembed", "jinav4"]
+                  names = {"ours": "Ours(3B)", "gritlm7b": "GritLM-7B", "qwen3emb": "Qwen3E-8B", "nvembed": "NVEmb-v2", "jinav4": "Jina-v4"}
+
+                  print("\n" + "=" * 100)
+                  print("UNIFIED BASELINE: EMBEDDING RESULTS (NDCG@10)")
+                  print("=" * 100)
+                  header = f"{'Task':<15}" + "".join(f"{names[k]:<16}" for k in keys)
+                  print(header); print("-" * len(header))
+                  avgs = {k: [] for k in keys}
+                  for task in EMB_TASKS:
+                      row = f"{task:<15}"
+                      for k in keys:
+                          if k in all_emb_results and task in all_emb_results.get(k,{}) and "error" not in all_emb_results[k].get(task,{}):
+                              val = all_emb_results[k][task]["ndcg@10"]
+                              row += f"{val:<16.4f}"
+                              avgs[k].append(val)
+                          else:
+                              row += f"{'N/A':<16}"
+                      print(row)
+                  print("-" * len(header))
+                  row = f"{'AVERAGE':<15}"
+                  for k in keys:
+                      if avgs[k]:
+                          row += f"{sum(avgs[k])/len(avgs[k]):<16.4f}"
+                      else:
+                          row += f"{'N/A':<16}"
+                  print(row)
+
+                  # Generation results for unified models
+                  gen_keys = [k for k in keys if k in all_gen_results]
+                  if gen_keys:
+                      print(f"\n{'=' * 60}")
+                      print("UNIFIED BASELINE: GENERATION RESULTS (acc_norm)")
+                      print("=" * 60)
+                      gen_names = {k: names[k] for k in gen_keys}
+                      header = f"{'Task':<18}" + "".join(f"{gen_names[k]:<16}" for k in gen_keys)
+                      print(header); print("-" * len(header))
+                      for task_key, metric, label in [("arc_easy","acc_norm","ARC-Easy"),("arc_challenge","acc_norm","ARC-Chall"),("hellaswag","acc_norm","HellaSwag"),("winogrande","acc","Winogrande")]:
+                          row = f"{label:<18}"
+                          for k in gen_keys:
+                              found = False
+                              for tname, tdata in all_gen_results.get(k,{}).items():
+                                  if isinstance(tdata, dict) and task_key in tname.lower():
+                                      val = tdata.get(metric, tdata.get("acc", None))
+                                      if val is not None:
+                                          row += f"{val:<16.4f}"
+                                          found = True
+                                          break
+                              if not found:
+                                  row += f"{'N/A':<16}"
+                          print(row)
+
+                  with open("/workspace/results/baseline_unified.json", "w") as f:
+                      json.dump({"timestamp": datetime.now().isoformat(), "embedding": all_emb_results, "generation": all_gen_results}, f, indent=2, default=str)
+                  print(f"\nSaved to /workspace/results/baseline_unified.json")
+                  print("=" * 100)
+
+              if __name__ == "__main__":
+                  main()
+              PYTHON_SCRIPT
+
+              # Install gritlm library
+              pip install gritlm || echo "gritlm not installable, will fallback to sentence-transformers"
+
+              python run_baseline_unified.py
+
+              echo "Done. Pod alive 30min for log inspection..."
+              sleep 1800
+
+          resources:
+            requests:
+              memory: "48Gi"
+              cpu: "4"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "64Gi"
+              cpu: "8"
+              nvidia.com/gpu: "1"
+
+          env:
+            - name: HF_HOME
+              value: "/tmp/hf_cache"
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/hf_cache"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule
