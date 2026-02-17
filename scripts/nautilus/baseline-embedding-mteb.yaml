@@ -97,7 +97,7 @@ spec:
                           self.tokenizer.pad_token = self.tokenizer.eos_token
                       print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e9:.1f}B")
 
-                  def encode(self, sentences, batch_size=32, **kwargs):
+                  def encode(self, sentences, batch_size=8, **kwargs):
                       all_emb = []
                       for i in tqdm(range(0, len(sentences), batch_size), desc="Encoding", disable=len(sentences)<100):
                           batch = sentences[i:i+batch_size]
@@ -108,6 +108,7 @@ spec:
                               m = inputs["attention_mask"].unsqueeze(-1).float()
                               emb = F.normalize((h * m).sum(1) / m.sum(1).clamp(min=1e-9), p=2, dim=1)
                               all_emb.append(emb.cpu())
+                          del inputs, out, h, m, emb; torch.cuda.empty_cache()
                       return torch.cat(all_emb, dim=0).numpy()
 
               # ============================================================
@@ -177,7 +178,7 @@ spec:
 
                       corpus_ids = list(corpus.keys())
                       corpus_texts = [f"{corpus[c].get('title','')} {corpus[c].get('text','')}".strip() for c in corpus_ids]
-                      corpus_emb = model.encode(corpus_texts, batch_size=64)
+                      corpus_emb = model.encode(corpus_texts, batch_size=32)
 
                       query_ids = list(queries.keys())
                       query_texts = [queries[q] for q in query_ids]
@@ -309,6 +310,8 @@ spec:
               value: "/tmp/hf_cache"
             - name: PYTHONUNBUFFERED
               value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:

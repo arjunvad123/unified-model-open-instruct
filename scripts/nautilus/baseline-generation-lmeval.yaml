@@ -80,7 +80,7 @@ spec:
                   ("Gemma-2-2B",          "google/gemma-2-2b",                              "gemma2"),
                   ("Qwen2.5-7B",          "Qwen/Qwen2.5-7B",                               "qwen25"),
                   ("Mistral-7B-v0.1",     "mistralai/Mistral-7B-v0.1",                      "mistral7b"),
-                  ("Llama-3.1-8B",        "meta-llama/Llama-3.1-8B",                        "llama31"),
+                  ("Phi-2 (2.7B)",        "microsoft/phi-2",                                "phi2"),
               ]
 
               CORE_TASKS = "arc_easy,arc_challenge,hellaswag,winogrande"
@@ -125,12 +125,13 @@ spec:
                   if result.returncode != 0:
                       print(f"  WARNING: MMLU failed for {display_name}")
 
-                  # Parse results
+                  # Parse results (lm-eval saves as results_TIMESTAMP.json)
                   model_results = {}
                   for root, dirs, files in os.walk(model_dir):
-                      for fname in files:
-                          if fname == "results.json":
+                      for fname in sorted(files):
+                          if fname.startswith("results") and fname.endswith(".json"):
                               fpath = os.path.join(root, fname)
+                              print(f"  Found results file: {fpath}")
                               try:
                                   with open(fpath) as f:
                                       data = json.load(f)
@@ -157,8 +158,8 @@ spec:
                   ("winogrande", "acc", "Winogrande"),
               ]
 
-              keys = ["ours", "smollm2", "gemma2", "qwen25", "mistral7b", "llama31"]
-              names = {"ours": "Ours(3B)", "smollm2": "SmolLM2", "gemma2": "Gemma2", "qwen25": "Qwen2.5", "mistral7b": "Mistral", "llama31": "Llama3.1"}
+              keys = ["ours", "smollm2", "gemma2", "qwen25", "mistral7b", "phi2"]
+              names = {"ours": "Ours(3B)", "smollm2": "SmolLM2", "gemma2": "Gemma2", "qwen25": "Qwen2.5", "mistral7b": "Mistral", "phi2": "Phi-2"}
 
               header = f"{'Task':<18}" + "".join(f"{names[k]:<14}" for k in keys)
               print(f"\n{header}")
@@ -241,6 +242,8 @@ spec:
               value: "/tmp/hf_cache"
             - name: PYTHONUNBUFFERED
               value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
