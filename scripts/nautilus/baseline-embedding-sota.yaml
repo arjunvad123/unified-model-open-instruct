@@ -1,0 +1,348 @@
+# Baseline Embedding Benchmark: Our Model (3B) vs SOTA Embedding Models
+# Framework: MTEB Retrieval (NFCorpus, SciFact, ArguAna, SCIDOCS, FiQA2018)
+#
+# Models:
+#   1. Ours: Arjunvad/unified-model-stage1-action-tokens-v2 (3B, CausalLM, mean pooling)
+#   2. Qwen/Qwen3-Embedding-0.6B (0.6B, last-token pooling)
+#   3. Qwen/Qwen3-Embedding-4B (4B, last-token pooling)
+#   4. Alibaba-NLP/gte-Qwen2-1.5B-instruct (1.5B, last-token pooling)
+#   5. intfloat/e5-mistral-7b-instruct (7B, last-token pooling)
+#   6. Alibaba-NLP/gte-Qwen2-7B-instruct (7B, last-token pooling)
+#
+# Deploy: kubectl apply -f baseline-embedding-sota.yaml -n svcl-self-improve
+# Logs:   kubectl logs job/baseline-emb-sota -n svcl-self-improve -f
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: baseline-emb-sota
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+
+      containers:
+        - name: eval
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "==========================================================="
+              echo "SOTA Embedding Baseline Benchmark (MTEB Retrieval)"
+              echo "Our Model (3B) vs Top 5 SOTA Embedding Models"
+              echo "==========================================================="
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              source /opt/venv/bin/activate
+
+              pip install --upgrade pip
+              pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+              pip install "transformers>=4.51.0" accelerate mteb numpy tqdm
+
+              python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+
+              mkdir -p /workspace/results
+              cd /workspace
+
+              cat > run_sota_emb.py << 'PYTHON_SCRIPT'
+              import json, os, gc, sys
+              from datetime import datetime
+              import numpy as np
+              import torch
+              import torch.nn.functional as F
+              from tqdm import tqdm
+              import warnings
+              warnings.filterwarnings("ignore")
+
+              TASKS = ["NFCorpus", "SciFact", "ArguAna", "SCIDOCS", "FiQA2018"]
+
+              # ============================================================
+              # Last-token pooling helper (handles both left and right padding)
+              # ============================================================
+              def last_token_pool(hidden_states, attention_mask):
+                  left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
+                  if left_padding:
+                      return hidden_states[:, -1]
+                  else:
+                      seq_lens = attention_mask.sum(dim=1) - 1
+                      batch_size = hidden_states.shape[0]
+                      return hidden_states[torch.arange(batch_size, device=hidden_states.device), seq_lens]
+
+              # ============================================================
+              # Model wrapper: CausalLM (our model) — mean pooling
+              # ============================================================
+              class CausalLMEmbedding:
+                  def __init__(self, model_path, device=None):
+                      from transformers import AutoTokenizer, AutoModelForCausalLM
+                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+                      print(f"  Loading CausalLM: {model_path}")
+                      self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                      self.model = AutoModelForCausalLM.from_pretrained(
+                          model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
+                      ).to(self.device).eval()
+                      if not self.tokenizer.pad_token:
+                          self.tokenizer.pad_token = self.tokenizer.eos_token
+                      print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e9:.1f}B")
+
+                  def encode(self, sentences, batch_size=8, **kwargs):
+                      all_emb = []
+                      for i in tqdm(range(0, len(sentences), batch_size), desc="Encoding", disable=len(sentences)<100):
+                          batch = sentences[i:i+batch_size]
+                          inputs = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(self.device)
+                          with torch.no_grad():
+                              out = self.model(**inputs, output_hidden_states=True, use_cache=False)
+                              h = out.hidden_states[-1].float()
+                              m = inputs["attention_mask"].unsqueeze(-1).float()
+                              emb = F.normalize((h * m).sum(1) / m.sum(1).clamp(min=1e-9), p=2, dim=1)
+                              all_emb.append(emb.cpu())
+                          del inputs, out, h, m, emb; torch.cuda.empty_cache()
+                      return torch.cat(all_emb, dim=0).numpy()
+
+              # ============================================================
+              # Model wrapper: Last-token pooling (SOTA embedding models)
+              # For Qwen3-Embedding, gte-Qwen2, e5-mistral
+              # ============================================================
+              class LastTokenEmbedding:
+                  def __init__(self, model_name, query_instruction=None, device=None):
+                      from transformers import AutoTokenizer, AutoModel
+                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+                      self.query_instruction = query_instruction
+                      print(f"  Loading: {model_name}")
+                      self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+                      self.model = AutoModel.from_pretrained(
+                          model_name, trust_remote_code=True, torch_dtype=torch.bfloat16
+                      ).to(self.device).eval()
+                      if not self.tokenizer.pad_token:
+                          self.tokenizer.pad_token = self.tokenizer.eos_token
+                      self.tokenizer.padding_side = "left"
+                      params = sum(p.numel() for p in self.model.parameters())
+                      if params > 1e9:
+                          print(f"  Params: {params/1e9:.1f}B")
+                      else:
+                          print(f"  Params: {params/1e6:.0f}M")
+
+                  def encode(self, sentences, batch_size=8, prompt_name=None, **kwargs):
+                      if prompt_name == "query" and self.query_instruction:
+                          sentences = [self.query_instruction + s for s in sentences]
+                      all_emb = []
+                      for i in tqdm(range(0, len(sentences), batch_size), desc="Encoding", disable=len(sentences)<100):
+                          batch = sentences[i:i+batch_size]
+                          inputs = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(self.device)
+                          with torch.no_grad():
+                              out = self.model(**inputs)
+                              h = out.last_hidden_state.float()
+                              emb = last_token_pool(h, inputs["attention_mask"])
+                              emb = F.normalize(emb, p=2, dim=1)
+                              all_emb.append(emb.cpu())
+                          del inputs, out, h, emb; torch.cuda.empty_cache()
+                      return torch.cat(all_emb, dim=0).numpy()
+
+              # ============================================================
+              # Evaluation
+              # ============================================================
+              def evaluate_task(model, task_name, use_query_prompt=False):
+                  import mteb
+                  try:
+                      task = mteb.get_task(task_name)
+                      task.load_data()
+                      subset = list(task.dataset.keys())[0]
+                      split = "test" if "test" in task.dataset[subset] else list(task.dataset[subset].keys())[0]
+                      data = task.dataset[subset][split]
+
+                      corpus = {r["id"]: {"title": r.get("title",""), "text": r.get("text","")} for r in data["corpus"]}
+                      queries = {r["id"]: r["text"] for r in data["queries"]}
+                      qrels = data["relevant_docs"]
+                      print(f"    Corpus: {len(corpus)}, Queries: {len(queries)}")
+
+                      corpus_ids = list(corpus.keys())
+                      corpus_texts = [f"{corpus[c].get('title','')} {corpus[c].get('text','')}".strip() for c in corpus_ids]
+                      corpus_emb = model.encode(corpus_texts, batch_size=8)
+
+                      query_ids = list(queries.keys())
+                      query_texts = [queries[q] for q in query_ids]
+                      query_emb = model.encode(query_texts, batch_size=16, prompt_name="query" if use_query_prompt else None)
+
+                      scores = np.dot(query_emb, corpus_emb.T)
+
+                      h1, h10, mrr, ndcg, n = 0, 0, 0, 0, 0
+                      for i, qid in enumerate(query_ids):
+                          if qid not in qrels: continue
+                          n += 1
+                          rel = set(qrels[qid].keys())
+                          ranked = np.argsort(scores[i])[::-1]
+                          top10 = [corpus_ids[idx] for idx in ranked[:10]]
+                          if any(d in rel for d in top10[:1]): h1 += 1
+                          if any(d in rel for d in top10[:10]): h10 += 1
+                          for rank, idx in enumerate(ranked):
+                              if corpus_ids[idx] in rel:
+                                  mrr += 1/(rank+1)
+                                  break
+                          dcg = sum(1/np.log2(r+2) for r, idx in enumerate(ranked[:10]) if corpus_ids[idx] in rel)
+                          idcg = sum(1/np.log2(j+2) for j in range(min(len(rel), 10)))
+                          if idcg > 0: ndcg += dcg/idcg
+
+                      return {"hits@1": h1/n, "hits@10": h10/n, "ndcg@10": ndcg/n, "mrr": mrr/n}
+                  except Exception as e:
+                      print(f"    Error: {e}")
+                      import traceback; traceback.print_exc()
+                      return {"error": str(e)}
+
+              def main():
+                  RETRIEVAL_INSTRUCTION = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+
+                  MODELS = [
+                      ("Ours (3B)",
+                       "ours",
+                       lambda: CausalLMEmbedding("Arjunvad/unified-model-stage1-action-tokens-v2"),
+                       False),
+
+                      ("Qwen3-Emb-0.6B",
+                       "qwen3_06",
+                       lambda: LastTokenEmbedding("Qwen/Qwen3-Embedding-0.6B", query_instruction=RETRIEVAL_INSTRUCTION),
+                       True),
+
+                      ("Qwen3-Emb-4B",
+                       "qwen3_4b",
+                       lambda: LastTokenEmbedding("Qwen/Qwen3-Embedding-4B", query_instruction=RETRIEVAL_INSTRUCTION),
+                       True),
+
+                      ("gte-Qwen2-1.5B",
+                       "gte_15",
+                       lambda: LastTokenEmbedding("Alibaba-NLP/gte-Qwen2-1.5B-instruct", query_instruction=RETRIEVAL_INSTRUCTION),
+                       True),
+
+                      ("e5-mistral-7B",
+                       "e5_m7b",
+                       lambda: LastTokenEmbedding("intfloat/e5-mistral-7b-instruct", query_instruction=RETRIEVAL_INSTRUCTION),
+                       True),
+
+                      ("gte-Qwen2-7B",
+                       "gte_7b",
+                       lambda: LastTokenEmbedding("Alibaba-NLP/gte-Qwen2-7B-instruct", query_instruction=RETRIEVAL_INSTRUCTION),
+                       True),
+                  ]
+
+                  all_results = {}
+                  for display_name, key, loader, use_prompt in MODELS:
+                      print("\n" + "=" * 70)
+                      print(f"EVALUATING: {display_name}")
+                      print("=" * 70)
+                      try:
+                          model = loader()
+                          results = {}
+                          for task in TASKS:
+                              print(f"\n  {task}...")
+                              r = evaluate_task(model, task, use_prompt)
+                              results[task] = r
+                              if "error" not in r:
+                                  print(f"    Hits@1={r['hits@1']:.4f}  NDCG@10={r['ndcg@10']:.4f}  MRR={r['mrr']:.4f}")
+                          all_results[key] = results
+                          del model; torch.cuda.empty_cache(); gc.collect()
+                      except Exception as e:
+                          print(f"  FAILED: {e}")
+                          import traceback; traceback.print_exc()
+                          all_results[key] = {"error": str(e)}
+
+                  # Print comparison table
+                  keys = ["ours", "qwen3_06", "qwen3_4b", "gte_15", "e5_m7b", "gte_7b"]
+                  names = {
+                      "ours":     "Ours(3B)",
+                      "qwen3_06": "Qwen3-0.6B",
+                      "qwen3_4b": "Qwen3-4B",
+                      "gte_15":   "GTE-1.5B",
+                      "e5_m7b":   "E5-Mis-7B",
+                      "gte_7b":   "GTE-7B",
+                  }
+
+                  print("\n" + "=" * 120)
+                  print("SOTA EMBEDDING BASELINE BENCHMARK RESULTS")
+                  print("=" * 120)
+
+                  for metric in ["ndcg@10", "hits@1", "hits@10", "mrr"]:
+                      print(f"\n--- {metric.upper()} ---")
+                      header = f"{'Task':<15}" + "".join(f"{names[k]:<16}" for k in keys)
+                      print(header); print("-" * len(header))
+                      avgs = {k: [] for k in keys}
+                      for task in TASKS:
+                          row = f"{task:<15}"
+                          for k in keys:
+                              if k in all_results and task in all_results.get(k,{}) and "error" not in all_results[k].get(task,{}):
+                                  val = all_results[k][task].get(metric, 0)
+                                  row += f"{val:<16.4f}"
+                                  avgs[k].append(val)
+                              else:
+                                  row += f"{'N/A':<16}"
+                          print(row)
+                      print("-" * len(header))
+                      row = f"{'AVERAGE':<15}"
+                      for k in keys:
+                          if avgs[k]:
+                              row += f"{sum(avgs[k])/len(avgs[k]):<16.4f}"
+                          else:
+                              row += f"{'N/A':<16}"
+                      print(row)
+
+                  with open("results/baseline_embedding_sota.json", "w") as f:
+                      json.dump({"timestamp": datetime.now().isoformat(), "tasks": TASKS, "results": all_results}, f, indent=2)
+                  print(f"\nSaved to results/baseline_embedding_sota.json")
+                  print("=" * 120)
+
+              if __name__ == "__main__":
+                  main()
+              PYTHON_SCRIPT
+
+              python run_sota_emb.py
+
+              echo "Done. Pod alive 30min for log inspection..."
+              sleep 1800
+
+          resources:
+            requests:
+              memory: "48Gi"
+              cpu: "4"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "64Gi"
+              cpu: "8"
+              nvidia.com/gpu: "1"
+
+          env:
+            - name: HF_HOME
+              value: "/tmp/hf_cache"
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/hf_cache"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule
