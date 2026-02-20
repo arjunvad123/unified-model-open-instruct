@@ -33,6 +33,10 @@ spec:
                 values:
                 - NVIDIA-A100-SXM4-80GB
                 - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-L40S
+                - NVIDIA-L40
 
       containers:
         - name: eval
