@@ -1,195 +1,87 @@
-# Unified Agentic Model Benchmarks
+# Unified Agentic Model - Benchmarking Suite
 
-This directory contains evaluation scripts for benchmarking the unified agentic model across multiple dimensions.
+Benchmarking code for evaluating the Unified Agentic Model (3B) against SOTA baselines on both generation and embedding tasks.
+
+## Folder Structure
+
+```
+Unified-Model-Benchmarks/
+├── README.md                          # This file
+├── BENCHMARK_REPORT.md                # Complete results report with all tables
+├── python-scripts/                    # Standalone Python evaluation scripts
+│   ├── baseline_generation_sota.py    # SOTA generation baseline (6 models)
+│   ├── baseline_embedding_sota.py     # SOTA embedding baseline (6 models)
+│   ├── eval_stage1_5_generation.py    # Stage 1.5 generation eval
+│   └── eval_stage1_5_embedding.py     # Stage 1.5 embedding eval
+├── kubernetes-jobs/                   # Nautilus K8s job YAMLs (ready to deploy)
+│   ├── baseline-generation-sota.yaml  # SOTA gen baseline job
+│   ├── baseline-embedding-sota.yaml   # SOTA emb baseline job
+│   ├── baseline-generation-lmeval.yaml    # Earlier gen baseline (larger models)
+│   ├── baseline-embedding-mteb.yaml       # Earlier emb baseline (small encoders)
+│   ├── baseline-unified-gritlm.yaml       # Unified model baseline (GritLM etc)
+│   ├── eval-stage1.5-generation-comprehensive.yaml  # Stage 1.5 gen eval
+│   ├── eval-stage1.5-embedding-comprehensive.yaml   # Stage 1.5 emb eval
+│   └── eval-stage1.5-mteb.yaml            # Stage 1.5 vs Stage 1 comparison
+└── results/                           # (empty, populated at runtime)
+```
 
 ## Quick Start
 
+### Run locally (requires GPU)
+
 ```bash
 # Install dependencies
-python benchmarks/setup_benchmarks.py --install
+pip install torch transformers accelerate lm-eval mteb numpy tqdm
 
-# Check installations
-python benchmarks/setup_benchmarks.py --check
+# Generation baseline (SOTA ~3B models)
+python python-scripts/baseline_generation_sota.py
 
-# Show usage guide
-python benchmarks/setup_benchmarks.py --guide
+# Embedding baseline (SOTA embedding models)
+python python-scripts/baseline_embedding_sota.py
+
+# Stage 1.5 evaluation
+python python-scripts/eval_stage1_5_generation.py
+python python-scripts/eval_stage1_5_embedding.py
 ```
 
-## Benchmarks Overview
-
-| Benchmark | Purpose | Metrics |
-|-----------|---------|---------|
-| **MTEB** | Embedding/Retrieval quality | Retrieval@k, Classification acc, etc. |
-| **LM-Eval** | LLM capabilities | MMLU, GSM8K, HumanEval, etc. |
-| **RAGAS** | RAG pipeline quality | Faithfulness, Relevancy, Precision |
-
----
-
-## 1. MTEB (Embedding Evaluation)
-
-**Purpose**: Evaluate the quality of embeddings from our unified model.
-
-### Quick Test
-```bash
-python benchmarks/run_mteb.py --tasks Banking77Classification
-```
-
-### Retrieval Tasks Only
-```bash
-python benchmarks/run_mteb.py --task_types Retrieval
-```
-
-### Compare with Base Qwen
-```bash
-python benchmarks/run_mteb.py --tasks NFCorpus --compare_base
-```
-
-### Full Benchmark
-```bash
-python benchmarks/run_mteb.py --benchmark "MTEB(eng, v2)"
-```
-
-### Key MTEB Tasks for Retrieval
-
-| Task | Description | Size |
-|------|-------------|------|
-| NFCorpus | Medical/nutrition retrieval | Small |
-| SciFact | Scientific claim verification | Small |
-| FiQA | Financial QA retrieval | Medium |
-| MSMARCO | Web search | Large |
-| NQ | Natural Questions | Large |
-| HotpotQA | Multi-hop QA | Large |
-
----
-
-## 2. LM-Eval (LLM Benchmarks)
-
-**Purpose**: Evaluate generation quality on standard LLM benchmarks.
-
-### Standard Qwen Evaluation Setup
-
-| Benchmark | Few-shot | Description |
-|-----------|----------|-------------|
-| MMLU | 5-shot | Knowledge/reasoning |
-| GSM8K | 4-shot | Grade school math |
-| HumanEval | 0-shot | Code generation |
-| HellaSwag | 10-shot | Commonsense |
-| ARC | 25-shot | Science reasoning |
-
-### Quick Test
-```bash
-python benchmarks/run_lm_eval.py --tasks hellaswag --limit 100
-```
-
-### Full MMLU
-```bash
-python benchmarks/run_lm_eval.py --tasks mmlu
-```
-
-### All Benchmarks
-```bash
-python benchmarks/run_lm_eval.py --all
-```
-
-### CLI Alternative
-```bash
-lm_eval --model hf \
-    --model_args pretrained=Arjunvad/unified-model-stage1-action-tokens-v2 \
-    --tasks mmlu \
-    --num_fewshot 5 \
-    --batch_size 4
-```
-
----
-
-## 3. RAGAS (RAG Evaluation)
-
-**Purpose**: Evaluate end-to-end RAG pipeline quality.
-
-### Metrics
-
-| Metric | Description |
-|--------|-------------|
-| Context Precision | Is retrieved context relevant? |
-| Context Recall | Does context cover ground truth? |
-| Faithfulness | Is answer faithful to context? |
-| Answer Relevancy | Is answer relevant to question? |
-
-### Run Evaluation
-```bash
-python benchmarks/run_ragas.py
-```
-
-### With Custom Samples
-```bash
-python benchmarks/run_ragas.py --num_samples 10
-```
-
-**Note**: Full RAGAS evaluation requires an OpenAI API key (for LLM-as-judge). Without it, a manual evaluation fallback is used.
-
----
-
-## Results Directory Structure
-
-```
-results/
-├── mteb/
-│   ├── unified_model/
-│   │   ├── Banking77Classification/
-│   │   ├── NFCorpus/
-│   │   └── summary.json
-│   └── base_qwen/
-│       └── ...
-├── lm_eval/
-│   ├── mmlu_20260204_143022/
-│   └── gsm8k_20260204_150033/
-└── ragas/
-    ├── ragas_results.json
-    └── manual_eval_results.json
-```
-
----
-
-## Expected Results
-
-### Embedding Quality (MTEB)
-
-For our unified model trained with contrastive learning, we expect:
-- **Improvement over base Qwen**: Since base Qwen isn't trained for embeddings
-- **Competitive with E5/BGE**: If our contrastive training is effective
-
-### Generation Quality (LM-Eval)
-
-Since we only did selective training (embeddings + last 2 layers):
-- **Preserved base capabilities**: Should match base Qwen on most tasks
-- **Slight variations**: Due to embedding layer changes
-
-### RAG Quality (RAGAS)
-
-- **Context Precision**: Should be high if retrieval works
-- **Faithfulness**: Depends on generation quality
-
----
-
-## Visualization
-
-After running benchmarks, create visualizations:
+### Deploy on Nautilus (Kubernetes)
 
 ```bash
-python benchmarks/visualize_results.py
+# SOTA baselines
+kubectl apply -f kubernetes-jobs/baseline-generation-sota.yaml -n svcl-self-improve
+kubectl apply -f kubernetes-jobs/baseline-embedding-sota.yaml -n svcl-self-improve
+
+# Stage 1.5 evaluation
+kubectl apply -f kubernetes-jobs/eval-stage1.5-generation-comprehensive.yaml -n svcl-self-improve
+kubectl apply -f kubernetes-jobs/eval-stage1.5-embedding-comprehensive.yaml -n svcl-self-improve
+
+# Check logs
+kubectl logs job/baseline-gen-sota -n svcl-self-improve -f
+kubectl logs job/baseline-emb-sota -n svcl-self-improve -f
 ```
 
-This generates:
-- Bar charts comparing models
-- Radar plots for multi-dimensional comparison
-- Training progress plots
+## Models
 
----
+| Model | Params | HuggingFace ID |
+|-------|--------|----------------|
+| Ours (Stage 1) | 3B | `Arjunvad/unified-model-stage1-action-tokens-v2` |
+| Ours (Stage 1.5) | 3B | `Arjunvad/unified-model-stage1-5-embedding-v2` |
 
-## References
+## Benchmarks
 
-- [MTEB GitHub](https://github.com/embeddings-benchmark/mteb)
-- [MTEB Leaderboard](https://huggingface.co/spaces/mteb/leaderboard)
-- [LM-Evaluation-Harness](https://github.com/EleutherAI/lm-evaluation-harness)
-- [RAGAS Documentation](https://docs.ragas.io/)
-- [OpenCompass](https://github.com/open-compass/opencompass)
+**Generation** (lm-evaluation-harness):
+- ARC-Easy, ARC-Challenge (0-shot, acc_norm)
+- HellaSwag (0-shot, acc_norm)
+- Winogrande (0-shot, acc)
+- MMLU (5-shot, acc)
+
+**Embedding** (MTEB Retrieval):
+- NFCorpus, SciFact, ArguAna, SCIDOCS, FiQA2018
+- Metrics: NDCG@10, Hits@1, Hits@10, MRR
+
+## Key Technical Notes
+
+- **Embedding method for our model**: Mean pooling over `output_hidden_states[-1]`, L2 normalized
+- **Embedding method for SOTA models**: Last-token pooling with instruction prefix
+- **lm-eval v0.4+ quirk**: Metric keys are `"acc_norm,none"` not `"acc_norm"` — scripts handle this automatically
+- **lm-eval v0.4+ filenames**: Results saved as `results_TIMESTAMP.json` not `results.json`
