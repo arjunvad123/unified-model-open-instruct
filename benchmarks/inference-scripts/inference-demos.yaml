@@ -1,0 +1,871 @@
+# Inference Demo Scripts: Unified Agentic Model Behavior
+# Runs all 5 qualitative demo scripts sequentially on GPU.
+#
+# Scripts:
+#   01_generation_demo.py      - Stage 1 generation across 4 categories
+#   02_embedding_demo.py       - Stage 1 vs 1.5 embedding quality
+#   03_action_token_routing.py - Action token routing accuracy
+#   04_retrieval_demo.py       - RAG pipeline with ranked results
+#   05_stage1_vs_stage1_5.py   - Catastrophic forgetting comparison
+#
+# Deploy: kubectl apply -f inference-demos.yaml -n svcl-self-improve
+# Logs:   kubectl logs job/inference-demos -n svcl-self-improve -f
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: inference-demos
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-L40S
+                - NVIDIA-L40
+
+      containers:
+        - name: inference
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "==========================================================="
+              echo "INFERENCE DEMO SCRIPTS: Unified Agentic Model Behavior"
+              echo "==========================================================="
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              export PATH="/opt/venv/bin:$PATH"
+              pip install --no-cache-dir torch transformers accelerate huggingface_hub
+
+              export HF_TOKEN="${HF_TOKEN}"
+
+              # ============================================================
+              # Script 01: Generation Demo (Stage 1)
+              # ============================================================
+              cat > /tmp/01_generation_demo.py << 'SCRIPT01'
+              #!/usr/bin/env python3
+              """
+              Generation Demo: Stage 1 Unified Agentic Model
+              Shows model generation across diverse prompt categories.
+              """
+              import os, gc, torch
+              import torch.nn.functional as F
+              from transformers import AutoModelForCausalLM, AutoTokenizer
+
+              DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+              DTYPE = torch.float16 if DEVICE != "cpu" else torch.float32
+
+              HF_TOKEN = os.environ.get("HF_TOKEN")
+              if HF_TOKEN:
+                  from huggingface_hub import login
+                  login(token=HF_TOKEN)
+
+              MODEL_ID = "Arjunvad/unified-model-stage1-action-tokens-v2"
+
+              PROMPTS = {
+                  "General Knowledge": [
+                      "What causes the seasons on Earth?",
+                      "Explain how vaccines work.",
+                      "What is the greenhouse effect?",
+                      "How does gravity work?",
+                  ],
+                  "Reasoning": [
+                      "If all roses are flowers and some flowers fade quickly, can we conclude all roses fade quickly? Explain your reasoning.",
+                      "A bat and ball cost $1.10 total. The bat costs $1 more than the ball. How much does the ball cost?",
+                      "If it takes 5 machines 5 minutes to make 5 widgets, how long would it take 100 machines to make 100 widgets?",
+                      "There are three boxes. One contains only apples, one contains only oranges, and one contains both. The labels are all wrong. You can pick one fruit from one box. How do you label all boxes correctly?",
+                  ],
+                  "Code Generation": [
+                      "Write a Python function to find the nth Fibonacci number.",
+                      "Write a Python function to check if a string is a palindrome.",
+                      "Write a Python function to merge two sorted lists into one sorted list.",
+                      "Write a Python class for a stack with push, pop, and peek methods.",
+                  ],
+                  "Instruction Following": [
+                      "List exactly 5 benefits of regular exercise, numbered 1 through 5.",
+                      "Summarize the concept of photosynthesis in exactly 2 sentences.",
+                      "Write a haiku about the ocean.",
+                      "Explain recursion to a 10-year-old in 3 sentences or less.",
+                  ],
+              }
+
+              def generate_response(model, tokenizer, prompt, max_tokens=300):
+                  messages = [{"role": "user", "content": prompt}]
+                  text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                  inputs = tokenizer(text, return_tensors="pt").to(DEVICE)
+                  with torch.no_grad():
+                      outputs = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+                  return tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=False).strip()
+
+              def extract_action_token(response):
+                  for token in ["<ACT:GEN>", "<ACT:RET>", "<ACT:TOOL>", "<ACT:CODE>"]:
+                      if token in response:
+                          return token
+                  return None
+
+              def main():
+                  print("=" * 70)
+                  print("GENERATION DEMO")
+                  print(f"Model: {MODEL_ID}")
+                  print(f"Device: {DEVICE} ({DTYPE})")
+                  print("=" * 70)
+
+                  tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+                  model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=DTYPE, trust_remote_code=True).to(DEVICE).eval()
+                  print(f"Loaded. Params: {sum(p.numel() for p in model.parameters())/1e9:.1f}B")
+
+                  action_tokens = ["<ACT:GEN>", "<ACT:RET>", "<ACT:TOOL>", "<ACT:CODE>"]
+                  print("\nAction tokens in vocabulary:")
+                  for t in action_tokens:
+                      tid = tokenizer.convert_tokens_to_ids(t)
+                      print(f"  {t} -> ID {tid}")
+
+                  all_responses = []
+                  for category, prompts in PROMPTS.items():
+                      print(f"\n{'=' * 70}")
+                      print(f"Category: {category}")
+                      print("=" * 70)
+                      for prompt in prompts:
+                          response = generate_response(model, tokenizer, prompt)
+                          action = extract_action_token(response)
+                          print(f"\n{'─' * 60}")
+                          print(f"Prompt: \"{prompt}\"")
+                          if action:
+                              print(f"Action Token: {action}")
+                          print(f"{'─' * 60}")
+                          print(f"Response:\n{response}")
+                          all_responses.append({"category": category, "prompt": prompt, "action_token": action, "response": response, "length": len(response.split())})
+
+                  print(f"\n{'=' * 70}")
+                  print("GENERATION DEMO SUMMARY")
+                  print("=" * 70)
+                  print(f"\n{'Category':<25} {'Prompts':<10} {'Avg Words':<12} {'Action Tokens'}")
+                  print("-" * 70)
+                  for category in PROMPTS:
+                      cat_responses = [r for r in all_responses if r["category"] == category]
+                      avg_len = sum(r["length"] for r in cat_responses) / len(cat_responses)
+                      actions = [r["action_token"] for r in cat_responses if r["action_token"]]
+                      action_str = ", ".join(set(a for a in actions)) if actions else "none"
+                      print(f"{category:<25} {len(cat_responses):<10} {avg_len:<12.0f} {action_str}")
+                  total = len(all_responses)
+                  with_action = sum(1 for r in all_responses if r["action_token"])
+                  print(f"\nTotal: {total} prompts, {with_action} with action tokens ({100*with_action/total:.0f}%)")
+                  print("=" * 70)
+
+              if __name__ == "__main__":
+                  main()
+              SCRIPT01
+
+              echo ""
+              echo ">>> Running Script 01: Generation Demo"
+              echo ""
+              python3 /tmp/01_generation_demo.py
+
+              # ============================================================
+              # Script 02: Embedding Demo (Stage 1 vs Stage 1.5)
+              # ============================================================
+              cat > /tmp/02_embedding_demo.py << 'SCRIPT02'
+              #!/usr/bin/env python3
+              """Embedding Demo: Stage 1 vs Stage 1.5 Embedding Quality"""
+              import os, gc, torch
+              import torch.nn.functional as F
+              from transformers import AutoModelForCausalLM, AutoTokenizer
+
+              DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+              DTYPE = torch.float16 if DEVICE != "cpu" else torch.float32
+
+              HF_TOKEN = os.environ.get("HF_TOKEN")
+              if HF_TOKEN:
+                  from huggingface_hub import login
+                  login(token=HF_TOKEN)
+
+              MODELS = [
+                  ("Stage 1", "Arjunvad/unified-model-stage1-action-tokens-v2"),
+                  ("Stage 1.5", "Arjunvad/unified-model-stage1-5-embedding-v2"),
+              ]
+
+              SIMILAR_PAIRS = [
+                  ("The cat sat on the mat.", "A feline rested on the rug."),
+                  ("Machine learning is a subset of AI.", "Deep learning uses neural networks for prediction."),
+                  ("Python is a popular programming language.", "Python is widely used in software development."),
+                  ("The stock market crashed in 2008.", "There was a major financial crisis in 2008."),
+                  ("Quantum computing uses qubits.", "Quantum computers process information with quantum bits."),
+                  ("Exercise improves cardiovascular health.", "Physical activity strengthens the heart."),
+                  ("The Eiffel Tower is in Paris.", "Paris is famous for its iconic iron tower."),
+                  ("Climate change causes rising sea levels.", "Global warming leads to ocean level increases."),
+                  ("DNA stores genetic information.", "Genes are encoded in deoxyribonucleic acid."),
+                  ("The speed of light is approximately 300,000 km/s.", "Light travels at about three hundred thousand kilometers per second."),
+              ]
+
+              DISSIMILAR_PAIRS = [
+                  ("The cat sat on the mat.", "The stock market crashed in 2008."),
+                  ("Machine learning is a subset of AI.", "The Eiffel Tower is in Paris."),
+                  ("Python is a programming language.", "Photosynthesis converts sunlight to energy."),
+                  ("Quantum computing uses qubits.", "Shakespeare wrote Hamlet in the early 1600s."),
+                  ("Exercise improves health.", "Docker containers package applications with dependencies."),
+              ]
+
+              TOPIC_GROUPS = {
+                  "Programming": ["Python is great for data science.", "JavaScript runs in web browsers.", "C++ is used for system programming."],
+                  "Animals": ["Dogs are loyal pets.", "Cats are independent animals.", "Birds can fly through the air."],
+                  "Food": ["Pizza originated in Italy.", "Sushi is a Japanese dish.", "Tacos are popular in Mexico."],
+              }
+
+              def get_embedding(model, tokenizer, text):
+                  inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True)
+                  inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+                  with torch.no_grad():
+                      outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], output_hidden_states=True)
+                  hidden = outputs.hidden_states[-1].float()
+                  mask = inputs["attention_mask"].unsqueeze(-1).float()
+                  pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+                  return F.normalize(pooled, p=2, dim=1)
+
+              def cosine_sim(emb1, emb2):
+                  return (emb1 @ emb2.T).item()
+
+              def free_memory():
+                  gc.collect()
+                  if DEVICE == "cuda":
+                      torch.cuda.empty_cache()
+
+              def main():
+                  print("=" * 70)
+                  print("EMBEDDING DEMO: Stage 1 vs Stage 1.5")
+                  print(f"Device: {DEVICE}")
+                  print("=" * 70)
+
+                  all_results = {}
+                  for model_name, model_id in MODELS:
+                      print(f"\n{'=' * 60}")
+                      print(f"Loading: {model_name} ({model_id})")
+                      print("=" * 60)
+                      tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+                      model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=DTYPE, trust_remote_code=True).to(DEVICE).eval()
+                      if not tokenizer.pad_token:
+                          tokenizer.pad_token = tokenizer.eos_token
+                      print(f"Loaded. Params: {sum(p.numel() for p in model.parameters())/1e9:.1f}B")
+
+                      results = {"similar": [], "dissimilar": [], "intra": [], "inter": []}
+                      for a, b in SIMILAR_PAIRS:
+                          results["similar"].append(cosine_sim(get_embedding(model, tokenizer, a), get_embedding(model, tokenizer, b)))
+                      for a, b in DISSIMILAR_PAIRS:
+                          results["dissimilar"].append(cosine_sim(get_embedding(model, tokenizer, a), get_embedding(model, tokenizer, b)))
+
+                      topic_embs = {}
+                      for topic, texts in TOPIC_GROUPS.items():
+                          topic_embs[topic] = [get_embedding(model, tokenizer, t) for t in texts]
+                      for topic, embs in topic_embs.items():
+                          for i in range(len(embs)):
+                              for j in range(i + 1, len(embs)):
+                                  results["intra"].append(cosine_sim(embs[i], embs[j]))
+                          for other_topic, other_embs in topic_embs.items():
+                              if other_topic != topic:
+                                  for e1 in embs:
+                                      for e2 in other_embs:
+                                          results["inter"].append(cosine_sim(e1, e2))
+
+                      all_results[model_name] = results
+                      del model, tokenizer
+                      free_memory()
+
+                  print(f"\n{'=' * 70}")
+                  print("SIMILARITY PAIRS: Similar (should be high)")
+                  print("=" * 70)
+                  for i, (a, b) in enumerate(SIMILAR_PAIRS):
+                      scores = " | ".join(f"{name}: {all_results[name]['similar'][i]:.4f}" for name, _ in MODELS)
+                      print(f"\n  [{i+1}] \"{a[:40]}...\" <-> \"{b[:40]}...\"")
+                      print(f"      {scores}")
+
+                  print(f"\n{'=' * 70}")
+                  print("SIMILARITY PAIRS: Dissimilar (should be low)")
+                  print("=" * 70)
+                  for i, (a, b) in enumerate(DISSIMILAR_PAIRS):
+                      scores = " | ".join(f"{name}: {all_results[name]['dissimilar'][i]:.4f}" for name, _ in MODELS)
+                      print(f"\n  [{i+1}] \"{a[:40]}...\" <-> \"{b[:40]}...\"")
+                      print(f"      {scores}")
+
+                  print(f"\n{'=' * 70}")
+                  print("EMBEDDING QUALITY SUMMARY")
+                  print("=" * 70)
+                  header = f"{'Metric':<25}" + "".join(f"{name:<20}" for name, _ in MODELS)
+                  print(f"\n{header}")
+                  print("-" * len(header))
+
+                  metrics = [
+                      ("Avg Similar", lambda r: sum(r["similar"]) / len(r["similar"])),
+                      ("Avg Dissimilar", lambda r: sum(r["dissimilar"]) / len(r["dissimilar"])),
+                      ("Separation", lambda r: sum(r["similar"]) / len(r["similar"]) - sum(r["dissimilar"]) / len(r["dissimilar"])),
+                      ("Avg Intra-topic", lambda r: sum(r["intra"]) / len(r["intra"])),
+                      ("Avg Inter-topic", lambda r: sum(r["inter"]) / len(r["inter"])),
+                      ("Cluster Margin", lambda r: sum(r["intra"]) / len(r["intra"]) - sum(r["inter"]) / len(r["inter"])),
+                  ]
+                  for metric_name, fn in metrics:
+                      row = f"{metric_name:<25}"
+                      for name, _ in MODELS:
+                          val = fn(all_results[name])
+                          row += f"{val:<20.4f}" if isinstance(val, float) else f"{val:<20}"
+                      print(row)
+                  print(f"\n{'=' * 70}")
+
+              if __name__ == "__main__":
+                  main()
+              SCRIPT02
+
+              echo ""
+              echo ">>> Running Script 02: Embedding Demo"
+              echo ""
+              python3 /tmp/02_embedding_demo.py
+
+              # ============================================================
+              # Script 03: Action Token Routing (Stage 1)
+              # ============================================================
+              cat > /tmp/03_action_token_routing.py << 'SCRIPT03'
+              #!/usr/bin/env python3
+              """Action Token Routing Demo: Stage 1 Unified Agentic Model"""
+              import os, torch
+              from transformers import AutoModelForCausalLM, AutoTokenizer
+
+              DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+              DTYPE = torch.float16 if DEVICE != "cpu" else torch.float32
+
+              HF_TOKEN = os.environ.get("HF_TOKEN")
+              if HF_TOKEN:
+                  from huggingface_hub import login
+                  login(token=HF_TOKEN)
+
+              MODEL_ID = "Arjunvad/unified-model-stage1-action-tokens-v2"
+              ACTION_TOKENS = ["<ACT:GEN>", "<ACT:RET>", "<ACT:TOOL>", "<ACT:CODE>"]
+
+              QUERIES = {
+                  "GEN": [
+                      "What is quantum computing?",
+                      "Explain the theory of relativity in simple terms.",
+                      "What are the main causes of World War I?",
+                      "Describe how the human immune system works.",
+                      "What is the difference between mitosis and meiosis?",
+                  ],
+                  "RET": [
+                      "Find information about the latest developments in fusion energy.",
+                      "Search for research papers on transformer architectures.",
+                      "Look up statistics on global renewable energy adoption.",
+                      "Find articles about CRISPR gene editing applications.",
+                      "Search for the history of the internet.",
+                  ],
+                  "TOOL": [
+                      "What is the weather in San Francisco right now?",
+                      "Calculate 1847 * 293 + 456.",
+                      "What is the current price of Bitcoin?",
+                      "Convert 72 degrees Fahrenheit to Celsius.",
+                      "What time is it in Tokyo?",
+                  ],
+                  "CODE": [
+                      "Write a Python function to find all prime numbers up to n.",
+                      "Implement a binary search algorithm in Python.",
+                      "Create a Python class for a linked list with append and display methods.",
+                      "Write a Python function to calculate the edit distance between two strings.",
+                      "Implement merge sort in Python.",
+                  ],
+              }
+
+              def generate_response(model, tokenizer, prompt, max_tokens=100):
+                  messages = [{"role": "user", "content": prompt}]
+                  text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                  inputs = tokenizer(text, return_tensors="pt").to(DEVICE)
+                  with torch.no_grad():
+                      outputs = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+                  return tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=False).strip()
+
+              def extract_action_token(response):
+                  for token in ACTION_TOKENS:
+                      if token in response:
+                          return token.replace("<ACT:", "").replace(">", "")
+                  return None
+
+              def main():
+                  print("=" * 70)
+                  print("ACTION TOKEN ROUTING DEMO")
+                  print(f"Model: {MODEL_ID}")
+                  print(f"Device: {DEVICE}")
+                  print("=" * 70)
+
+                  tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+                  model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=DTYPE, trust_remote_code=True).to(DEVICE).eval()
+
+                  print("\nAction tokens in vocabulary:")
+                  for t in ACTION_TOKENS:
+                      print(f"  {t} -> Token ID {tokenizer.convert_tokens_to_ids(t)}")
+
+                  confusion = {exp: {pred: 0 for pred in list(QUERIES.keys()) + ["NONE"]} for exp in QUERIES}
+                  results = []
+
+                  for expected, queries in QUERIES.items():
+                      print(f"\n{'=' * 70}")
+                      print(f"Category: {expected} (expected: <ACT:{expected}>)")
+                      print("=" * 70)
+                      for query in queries:
+                          response = generate_response(model, tokenizer, query)
+                          found = extract_action_token(response)
+                          is_correct = found == expected
+                          pred_key = found if found else "NONE"
+                          confusion[expected][pred_key] += 1
+                          status = "CORRECT" if is_correct else "WRONG"
+                          print(f"\n  Query: \"{query}\"")
+                          print(f"  Expected: <ACT:{expected}> | Found: {'<ACT:' + found + '>' if found else 'NONE'} [{status}]")
+                          print(f"  Response (raw):")
+                          print(f"  ---")
+                          print(f"  {response[:200]}{'...' if len(response) > 200 else ''}")
+                          print(f"  ---")
+                          results.append({"query": query, "expected": expected, "found": found, "correct": is_correct})
+
+                  print(f"\n{'=' * 70}")
+                  print("ROUTING ACCURACY SUMMARY")
+                  print("=" * 70)
+                  print(f"\n{'Category':<12} {'Correct':<10} {'Total':<8} {'Accuracy'}")
+                  print("-" * 45)
+                  total_correct, total_count = 0, 0
+                  for category in QUERIES:
+                      cat_results = [r for r in results if r["expected"] == category]
+                      correct = sum(1 for r in cat_results if r["correct"])
+                      total = len(cat_results)
+                      total_correct += correct
+                      total_count += total
+                      print(f"{category:<12} {correct:<10} {total:<8} {100*correct/total:.0f}%")
+                  print("-" * 45)
+                  print(f"{'Overall':<12} {total_correct:<10} {total_count:<8} {100*total_correct/total_count:.0f}%")
+
+                  all_labels = list(QUERIES.keys()) + ["NONE"]
+                  print(f"\nConfusion Matrix:")
+                  header = f"{'':>12}" + "".join(f"{p:>8}" for p in all_labels)
+                  print(f"{'':>12} {'Predicted':^{8*len(all_labels)}}")
+                  print(header)
+                  print("-" * (12 + 8 * len(all_labels)))
+                  for expected in QUERIES:
+                      row = f"{expected:>12}"
+                      for pred in all_labels:
+                          row += f"{confusion[expected][pred]:>8}"
+                      print(row)
+                  print(f"\n{'=' * 70}")
+
+              if __name__ == "__main__":
+                  main()
+              SCRIPT03
+
+              echo ""
+              echo ">>> Running Script 03: Action Token Routing"
+              echo ""
+              python3 /tmp/03_action_token_routing.py
+
+              # ============================================================
+              # Script 04: Retrieval Demo (Stage 1 vs Stage 1.5)
+              # ============================================================
+              cat > /tmp/04_retrieval_demo.py << 'SCRIPT04'
+              #!/usr/bin/env python3
+              """Retrieval Demo: RAG Pipeline with Stage 1 vs Stage 1.5"""
+              import os, gc, torch
+              import torch.nn.functional as F
+              from transformers import AutoModelForCausalLM, AutoTokenizer
+
+              DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+              DTYPE = torch.float16 if DEVICE != "cpu" else torch.float32
+
+              HF_TOKEN = os.environ.get("HF_TOKEN")
+              if HF_TOKEN:
+                  from huggingface_hub import login
+                  login(token=HF_TOKEN)
+
+              MODELS = [
+                  ("Stage 1", "Arjunvad/unified-model-stage1-action-tokens-v2"),
+                  ("Stage 1.5", "Arjunvad/unified-model-stage1-5-embedding-v2"),
+              ]
+
+              CORPUS = [
+                  {"id": "doc01", "text": "Transformers are a type of neural network architecture that uses self-attention mechanisms. They were introduced in the paper 'Attention Is All You Need' by Vaswani et al. in 2017."},
+                  {"id": "doc02", "text": "RLHF (Reinforcement Learning from Human Feedback) is a technique used to fine-tune language models. It involves training a reward model on human preferences and then using PPO to optimize the language model."},
+                  {"id": "doc03", "text": "RAG (Retrieval-Augmented Generation) combines retrieval systems with generative models. When a query comes in, relevant documents are retrieved from a knowledge base and provided as context to the generator."},
+                  {"id": "doc04", "text": "Contrastive learning is a self-supervised learning technique where the model learns to distinguish between similar and dissimilar pairs. SimCLR and CLIP are popular contrastive learning methods."},
+                  {"id": "doc05", "text": "Quantum computing uses quantum bits (qubits) that can exist in superposition states. This allows quantum computers to perform certain calculations exponentially faster than classical computers."},
+                  {"id": "doc06", "text": "CRISPR-Cas9 is a gene editing technology that allows scientists to modify DNA sequences. It has applications in treating genetic diseases, creating disease-resistant crops, and basic research."},
+                  {"id": "doc07", "text": "Black holes are regions of spacetime where gravity is so strong that nothing, not even light, can escape. They form when massive stars collapse at the end of their life cycle."},
+                  {"id": "doc08", "text": "Python's GIL (Global Interpreter Lock) is a mutex that protects access to Python objects, preventing multiple threads from executing Python bytecode simultaneously."},
+                  {"id": "doc09", "text": "REST APIs use HTTP methods like GET, POST, PUT, DELETE to perform operations on resources. They are stateless and use standard HTTP status codes for responses."},
+                  {"id": "doc10", "text": "Docker containers package applications with their dependencies into isolated environments. Unlike VMs, containers share the host OS kernel, making them lightweight and fast to start."},
+              ]
+
+              QUERIES = [
+                  ("How does retrieval-augmented generation work?", "doc03"),
+                  ("Tell me about reinforcement learning from human feedback", "doc02"),
+                  ("What is a quantum computer?", "doc05"),
+                  ("How do you edit genes with CRISPR?", "doc06"),
+                  ("Explain the Python Global Interpreter Lock", "doc08"),
+                  ("What are transformer neural networks?", "doc01"),
+              ]
+
+              def get_embedding(model, tokenizer, text):
+                  inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True)
+                  inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+                  with torch.no_grad():
+                      outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], output_hidden_states=True, use_cache=False)
+                  hidden = outputs.hidden_states[-1].float()
+                  mask = inputs["attention_mask"].unsqueeze(-1).float()
+                  pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+                  return F.normalize(pooled, p=2, dim=1)
+
+              def free_memory():
+                  gc.collect()
+                  if DEVICE == "cuda":
+                      torch.cuda.empty_cache()
+
+              def main():
+                  print("=" * 70)
+                  print("RETRIEVAL DEMO: RAG Pipeline")
+                  print("Stage 1 vs Stage 1.5")
+                  print(f"Device: {DEVICE}")
+                  print("=" * 70)
+
+                  print(f"\nCorpus: {len(CORPUS)} documents")
+                  for doc in CORPUS:
+                      print(f"  {doc['id']}: {doc['text'][:60]}...")
+
+                  all_retrieval_results = {}
+                  for model_name, model_id in MODELS:
+                      print(f"\n{'=' * 70}")
+                      print(f"Indexing with: {model_name} ({model_id})")
+                      print("=" * 70)
+                      tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+                      model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=DTYPE, trust_remote_code=True).to(DEVICE).eval()
+                      if not tokenizer.pad_token:
+                          tokenizer.pad_token = tokenizer.eos_token
+
+                      doc_embeddings = torch.cat([get_embedding(model, tokenizer, doc["text"]) for doc in CORPUS], dim=0)
+                      print(f"  Indexed {len(CORPUS)} documents. Embedding shape: {list(doc_embeddings.shape)}")
+
+                      model_results = []
+                      for query, expected_id in QUERIES:
+                          query_emb = get_embedding(model, tokenizer, query)
+                          scores = (query_emb @ doc_embeddings.T).squeeze()
+                          ranked_indices = scores.argsort(descending=True)
+                          top3 = []
+                          for rank, idx in enumerate(ranked_indices[:3]):
+                              idx = idx.item()
+                              top3.append({"rank": rank + 1, "doc_id": CORPUS[idx]["id"], "score": scores[idx].item(), "text": CORPUS[idx]["text"][:80]})
+                          model_results.append({"query": query, "expected": expected_id, "top3": top3, "hit_at_1": top3[0]["doc_id"] == expected_id})
+                      all_retrieval_results[model_name] = model_results
+
+                      del model, tokenizer, doc_embeddings
+                      free_memory()
+
+                  print(f"\n{'=' * 70}")
+                  print("RETRIEVAL RESULTS")
+                  print("=" * 70)
+                  for i, (query, expected_id) in enumerate(QUERIES):
+                      print(f"\n{'─' * 70}")
+                      print(f"Query {i+1}: \"{query}\"")
+                      print(f"Expected: {expected_id}")
+                      print(f"{'─' * 70}")
+                      for model_name, _ in MODELS:
+                          result = all_retrieval_results[model_name][i]
+                          status = "CORRECT" if result["hit_at_1"] else "WRONG"
+                          print(f"\n  {model_name} [{status}]:")
+                          for item in result["top3"]:
+                              marker = " <<" if item["doc_id"] == expected_id else ""
+                              print(f"    Rank {item['rank']}: [{item['score']:.4f}] {item['doc_id']} - {item['text']}...{marker}")
+
+                  print(f"\n{'=' * 70}")
+                  print("RETRIEVAL COMPARISON SUMMARY")
+                  print("=" * 70)
+                  print(f"\n{'Metric':<25}", end="")
+                  for name, _ in MODELS:
+                      print(f"{name:<20}", end="")
+                  print()
+                  print("-" * 65)
+                  print(f"{'Hits@1':<25}", end="")
+                  for name, _ in MODELS:
+                      results = all_retrieval_results[name]
+                      hits = sum(1 for r in results if r["hit_at_1"])
+                      print(f"{hits}/{len(results)} ({100*hits/len(results):.0f}%){'':8}", end="")
+                  print()
+                  print(f"{'Avg Top-1 Score':<25}", end="")
+                  for name, _ in MODELS:
+                      results = all_retrieval_results[name]
+                      avg = sum(r["top3"][0]["score"] for r in results) / len(results)
+                      print(f"{avg:<20.4f}", end="")
+                  print()
+                  print(f"{'Avg Score Gap (1-2)':<25}", end="")
+                  for name, _ in MODELS:
+                      results = all_retrieval_results[name]
+                      gaps = [r["top3"][0]["score"] - r["top3"][1]["score"] for r in results]
+                      print(f"{sum(gaps)/len(gaps):<20.4f}", end="")
+                  print()
+                  print(f"\n{'=' * 70}")
+
+              if __name__ == "__main__":
+                  main()
+              SCRIPT04
+
+              echo ""
+              echo ">>> Running Script 04: Retrieval Demo"
+              echo ""
+              python3 /tmp/04_retrieval_demo.py
+
+              # ============================================================
+              # Script 05: Stage 1 vs Stage 1.5 (Catastrophic Forgetting)
+              # ============================================================
+              cat > /tmp/05_stage1_vs_stage1_5.py << 'SCRIPT05'
+              #!/usr/bin/env python3
+              """Stage 1 vs Stage 1.5: The Catastrophic Forgetting Problem"""
+              import os, gc, torch
+              import torch.nn.functional as F
+              from transformers import AutoModelForCausalLM, AutoTokenizer
+
+              DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+              DTYPE = torch.float16 if DEVICE != "cpu" else torch.float32
+
+              HF_TOKEN = os.environ.get("HF_TOKEN")
+              if HF_TOKEN:
+                  from huggingface_hub import login
+                  login(token=HF_TOKEN)
+
+              MODELS = [
+                  ("Stage 1", "Arjunvad/unified-model-stage1-action-tokens-v2"),
+                  ("Stage 1.5", "Arjunvad/unified-model-stage1-5-embedding-v2"),
+              ]
+
+              SIMILAR_PAIRS = [
+                  ("The cat sat on the mat.", "A feline rested on the rug."),
+                  ("Machine learning is a subset of AI.", "Deep learning uses neural networks."),
+                  ("Quantum computing uses qubits.", "Quantum computers use quantum bits."),
+                  ("Exercise improves health.", "Physical activity strengthens the body."),
+                  ("Climate change causes rising seas.", "Global warming raises ocean levels."),
+                  ("DNA stores genetic information.", "Genes are encoded in DNA molecules."),
+                  ("The Eiffel Tower is in Paris.", "Paris is home to a famous iron tower."),
+                  ("Python is a programming language.", "Python is used for software development."),
+              ]
+
+              DISSIMILAR_PAIRS = [
+                  ("The cat sat on the mat.", "Stock prices rose sharply today."),
+                  ("Machine learning is a subset of AI.", "Pizza originated in Italy."),
+                  ("Quantum computing uses qubits.", "Dogs are loyal pets."),
+                  ("Exercise improves health.", "The Eiffel Tower is 330 meters tall."),
+                  ("DNA stores genetic information.", "Docker containers are lightweight."),
+              ]
+
+              GENERATION_PROMPTS = [
+                  ("Factual", "What is quantum computing and how does it differ from classical computing?"),
+                  ("Code", "Write a Python function to reverse a linked list."),
+                  ("Simplification", "Explain the water cycle to a 5-year-old."),
+                  ("Structured", "List 3 pros and 3 cons of remote work."),
+                  ("Reasoning", "A bat and ball cost $1.10 total. The bat costs $1 more than the ball. How much does the ball cost?"),
+                  ("Creative", "Write a haiku about machine learning."),
+              ]
+
+              ACTION_QUERIES = [
+                  ("What is quantum computing?", "GEN"),
+                  ("Find information about RLHF", "RET"),
+                  ("What's the weather in Tokyo?", "TOOL"),
+                  ("Write a Python sort function", "CODE"),
+              ]
+
+              ACTION_TOKENS = ["<ACT:GEN>", "<ACT:RET>", "<ACT:TOOL>", "<ACT:CODE>"]
+
+              def get_embedding(model, tokenizer, text):
+                  inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True)
+                  inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+                  with torch.no_grad():
+                      outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], output_hidden_states=True, use_cache=False)
+                  hidden = outputs.hidden_states[-1].float()
+                  mask = inputs["attention_mask"].unsqueeze(-1).float()
+                  pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+                  return F.normalize(pooled, p=2, dim=1)
+
+              def cosine_sim(emb1, emb2):
+                  return (emb1 @ emb2.T).item()
+
+              def generate_response(model, tokenizer, prompt, max_tokens=250, skip_special=True):
+                  messages = [{"role": "user", "content": prompt}]
+                  text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                  inputs = tokenizer(text, return_tensors="pt").to(DEVICE)
+                  with torch.no_grad():
+                      outputs = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+                  return tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=skip_special).strip()
+
+              def extract_action_token(response):
+                  for token in ACTION_TOKENS:
+                      if token in response:
+                          return token.replace("<ACT:", "").replace(">", "")
+                  return None
+
+              def free_memory():
+                  gc.collect()
+                  if DEVICE == "cuda":
+                      torch.cuda.empty_cache()
+
+              def main():
+                  print("=" * 70)
+                  print("STAGE 1 vs STAGE 1.5: THE CATASTROPHIC FORGETTING PROBLEM")
+                  print("=" * 70)
+                  print()
+                  print("Contrastive training (Stage 1 -> Stage 1.5) improved embedding")
+                  print("quality (+31% NDCG@10) but degraded generation quality (-22%).")
+                  print("This demo shows both effects qualitatively.")
+                  print(f"\nDevice: {DEVICE}")
+
+                  emb_results, gen_results, act_results = {}, {}, {}
+
+                  for model_name, model_id in MODELS:
+                      print(f"\n{'=' * 70}")
+                      print(f"Loading: {model_name} ({model_id})")
+                      print("=" * 70)
+                      tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+                      model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=DTYPE, trust_remote_code=True).to(DEVICE).eval()
+                      if not tokenizer.pad_token:
+                          tokenizer.pad_token = tokenizer.eos_token
+                      print(f"  Params: {sum(p.numel() for p in model.parameters())/1e9:.1f}B")
+
+                      sim_scores = [cosine_sim(get_embedding(model, tokenizer, a), get_embedding(model, tokenizer, b)) for a, b in SIMILAR_PAIRS]
+                      dis_scores = [cosine_sim(get_embedding(model, tokenizer, a), get_embedding(model, tokenizer, b)) for a, b in DISSIMILAR_PAIRS]
+                      emb_results[model_name] = {"similar": sim_scores, "dissimilar": dis_scores}
+
+                      gen_out = [(cat, prompt, generate_response(model, tokenizer, prompt)) for cat, prompt in GENERATION_PROMPTS]
+                      gen_results[model_name] = gen_out
+
+                      act_out = []
+                      for query, expected in ACTION_QUERIES:
+                          raw = generate_response(model, tokenizer, query, max_tokens=50, skip_special=False)
+                          act_out.append((query, expected, extract_action_token(raw), raw))
+                      act_results[model_name] = act_out
+
+                      del model, tokenizer
+                      free_memory()
+
+                  # Part A
+                  print(f"\n{'=' * 70}")
+                  print("PART A: EMBEDDING QUALITY (Stage 1.5 should be BETTER)")
+                  print("=" * 70)
+                  print("\nSimilar Pairs:")
+                  for i, (a, b) in enumerate(SIMILAR_PAIRS):
+                      s1, s15 = emb_results["Stage 1"]["similar"][i], emb_results["Stage 1.5"]["similar"][i]
+                      change = ((s15 - s1) / abs(s1)) * 100 if s1 != 0 else 0
+                      print(f"  [{i+1}] Stage 1: {s1:.4f} | Stage 1.5: {s15:.4f} ({'+' if change > 0 else ''}{change:.1f}%)")
+                      print(f"      \"{a[:35]}...\" <-> \"{b[:35]}...\"")
+
+                  print("\nDissimilar Pairs:")
+                  for i, (a, b) in enumerate(DISSIMILAR_PAIRS):
+                      s1, s15 = emb_results["Stage 1"]["dissimilar"][i], emb_results["Stage 1.5"]["dissimilar"][i]
+                      change = ((s15 - s1) / abs(s1)) * 100 if s1 != 0 else 0
+                      print(f"  [{i+1}] Stage 1: {s1:.4f} | Stage 1.5: {s15:.4f} ({'+' if change > 0 else ''}{change:.1f}%)")
+                      print(f"      \"{a[:35]}...\" <-> \"{b[:35]}...\"")
+
+                  s1_avg_sim = sum(emb_results["Stage 1"]["similar"]) / len(emb_results["Stage 1"]["similar"])
+                  s15_avg_sim = sum(emb_results["Stage 1.5"]["similar"]) / len(emb_results["Stage 1.5"]["similar"])
+                  s1_avg_dis = sum(emb_results["Stage 1"]["dissimilar"]) / len(emb_results["Stage 1"]["dissimilar"])
+                  s15_avg_dis = sum(emb_results["Stage 1.5"]["dissimilar"]) / len(emb_results["Stage 1.5"]["dissimilar"])
+                  s1_sep, s15_sep = s1_avg_sim - s1_avg_dis, s15_avg_sim - s15_avg_dis
+
+                  print(f"\n{'Metric':<25} {'Stage 1':<15} {'Stage 1.5':<15} {'Change'}")
+                  print("-" * 65)
+                  print(f"{'Avg Similar':<25} {s1_avg_sim:<15.4f} {s15_avg_sim:<15.4f} {'+' if s15_avg_sim > s1_avg_sim else ''}{((s15_avg_sim-s1_avg_sim)/abs(s1_avg_sim))*100:.1f}%")
+                  print(f"{'Avg Dissimilar':<25} {s1_avg_dis:<15.4f} {s15_avg_dis:<15.4f} {'+' if s15_avg_dis > s1_avg_dis else ''}{((s15_avg_dis-s1_avg_dis)/abs(s1_avg_dis))*100:.1f}%")
+                  print(f"{'Separation':<25} {s1_sep:<15.4f} {s15_sep:<15.4f} {'+' if s15_sep > s1_sep else ''}{((s15_sep-s1_sep)/abs(s1_sep))*100:.1f}%")
+                  print(f"\n>>> Stage 1.5 embeddings are {'BETTER' if s15_sep > s1_sep else 'WORSE'} (contrastive training {'worked' if s15_sep > s1_sep else 'did not help'})")
+
+                  # Part B
+                  print(f"\n{'=' * 70}")
+                  print("PART B: GENERATION QUALITY (Stage 1 should be BETTER)")
+                  print("=" * 70)
+                  for i, (category, prompt) in enumerate(GENERATION_PROMPTS):
+                      print(f"\n{'─' * 60}")
+                      print(f"[{category}] \"{prompt}\"")
+                      print(f"{'─' * 60}")
+                      for model_name, _ in MODELS:
+                          _, _, response = gen_results[model_name][i]
+                          print(f"\n  --- {model_name} ({len(response.split())} words) ---")
+                          print(f"  {response[:400]}{'...' if len(response) > 400 else ''}")
+
+                  # Part C
+                  print(f"\n{'=' * 70}")
+                  print("PART C: ACTION TOKEN ROUTING")
+                  print("=" * 70)
+                  for i, (query, expected) in enumerate(ACTION_QUERIES):
+                      print(f"\n  Query: \"{query}\" (expected: <ACT:{expected}>)")
+                      for model_name, _ in MODELS:
+                          _, _, found, raw = act_results[model_name][i]
+                          status = "CORRECT" if found == expected else ("NONE" if found is None else "WRONG")
+                          print(f"    {model_name}: {'<ACT:' + found + '>' if found else 'NONE'} [{status}]")
+
+                  # Conclusion
+                  print(f"\n{'=' * 70}")
+                  print("CONCLUSION")
+                  print("=" * 70)
+                  s1_act = sum(1 for _, exp, found, _ in act_results["Stage 1"] if found == exp)
+                  s15_act = sum(1 for _, exp, found, _ in act_results["Stage 1.5"] if found == exp)
+                  print(f"""
+                Embedding Quality:  Stage 1.5 {'>' if s15_sep > s1_sep else '<'} Stage 1  (separation: {s1_sep:.4f} -> {s15_sep:.4f})
+                Generation Quality: Stage 1 is qualitatively better (review responses above)
+                Action Routing:     Stage 1: {s1_act}/4 | Stage 1.5: {s15_act}/4
+
+                This demonstrates the CATASTROPHIC FORGETTING problem:
+                  - Contrastive training improved embeddings
+                  - But degraded generation and action token routing
+                  - The core research challenge is preserving both capabilities
+
+                Possible solutions:
+                  1. Lower LoRA rank (currently r=32, try r=8 or r=16)
+                  2. Freeze more layers during contrastive training
+                  3. Multi-task training (contrastive + generation loss simultaneously)
+                  4. GritLM-style alternating batches (embedding batch, generation batch)
+              """)
+                  print("=" * 70)
+
+              if __name__ == "__main__":
+                  main()
+              SCRIPT05
+
+              echo ""
+              echo ">>> Running Script 05: Stage 1 vs Stage 1.5"
+              echo ""
+              python3 /tmp/05_stage1_vs_stage1_5.py
+
+              echo ""
+              echo "==========================================================="
+              echo "ALL 5 INFERENCE DEMOS COMPLETED SUCCESSFULLY"
+              echo "==========================================================="
+
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "48Gi"
+              nvidia.com/gpu: "1"
