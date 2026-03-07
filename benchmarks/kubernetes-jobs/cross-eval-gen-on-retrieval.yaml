@@ -1,0 +1,278 @@
+# Cross-Task Eval: Generation Models on Retrieval (MTEB)
+#
+# Tests whether pure generation models can do retrieval via mean pooling.
+# PI hypothesis: "pure generation model might be even better than retrieval tuned model"
+#
+# Models:
+#   1. Qwen/Qwen2.5-3B-Instruct  (mean pool + last-token pool)
+#   2. Qwen/Qwen2.5-3B           (mean pool)
+#   3. Qwen/Qwen3-4B             (mean pool + last-token pool)
+#   4. Ours Stage 1               (mean pool, reference)
+#   5. Ours Stage 1.5             (mean pool, reference)
+#
+# Deploy: kubectl apply -f cross-eval-gen-on-retrieval.yaml -n svcl-self-improve
+# Logs:   kubectl logs job/cross-gen-retrieval -n svcl-self-improve -f
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cross-gen-retrieval
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-L40S
+                - NVIDIA-L40
+
+      containers:
+        - name: eval
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "==========================================================="
+              echo "CROSS-TASK: Generation Models on Retrieval (MTEB)"
+              echo "==========================================================="
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              export PATH="/opt/venv/bin:$PATH"
+              pip install --no-cache-dir torch transformers accelerate mteb numpy tqdm huggingface_hub
+
+              export HF_TOKEN="${HF_TOKEN}"
+
+              cat > /tmp/cross_eval_gen_on_retrieval.py << 'PYSCRIPT'
+              import json, os, gc, sys
+              from datetime import datetime
+              import numpy as np
+              import torch
+              import torch.nn.functional as F
+              from tqdm import tqdm
+              import warnings
+              warnings.filterwarnings("ignore")
+
+              TASKS = ["NFCorpus", "SciFact", "ArguAna", "SCIDOCS", "FiQA2018"]
+
+              def mean_pool(hidden_states, attention_mask):
+                  mask = attention_mask.unsqueeze(-1).float()
+                  return (hidden_states.float() * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+
+              def last_token_pool(hidden_states, attention_mask):
+                  left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
+                  if left_padding:
+                      return hidden_states[:, -1]
+                  else:
+                      seq_lens = attention_mask.sum(dim=1) - 1
+                      batch_size = hidden_states.shape[0]
+                      return hidden_states[torch.arange(batch_size, device=hidden_states.device), seq_lens]
+
+              class CausalLMRetrieval:
+                  def __init__(self, model_path, pool_method="mean", device=None):
+                      from transformers import AutoTokenizer, AutoModelForCausalLM
+                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+                      self.pool_method = pool_method
+                      print(f"  Loading CausalLM: {model_path} (pool={pool_method})")
+                      self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                      self.model = AutoModelForCausalLM.from_pretrained(
+                          model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
+                      ).to(self.device).eval()
+                      if not self.tokenizer.pad_token:
+                          self.tokenizer.pad_token = self.tokenizer.eos_token
+                      if pool_method == "last_token":
+                          self.tokenizer.padding_side = "left"
+                      print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e9:.1f}B")
+
+                  def encode(self, sentences, batch_size=8, **kwargs):
+                      all_emb = []
+                      for i in tqdm(range(0, len(sentences), batch_size), desc="Encoding", disable=len(sentences)<100):
+                          batch = sentences[i:i+batch_size]
+                          inputs = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(self.device)
+                          with torch.no_grad():
+                              out = self.model(**inputs, output_hidden_states=True, use_cache=False)
+                              h = out.hidden_states[-1].float()
+                              if self.pool_method == "last_token":
+                                  emb = last_token_pool(h, inputs["attention_mask"])
+                              else:
+                                  emb = mean_pool(h, inputs["attention_mask"])
+                              emb = F.normalize(emb, p=2, dim=1)
+                              all_emb.append(emb.cpu())
+                          del inputs, out, h, emb; torch.cuda.empty_cache()
+                      return torch.cat(all_emb, dim=0).numpy()
+
+              def evaluate_task(model, task_name):
+                  import mteb
+                  try:
+                      task = mteb.get_task(task_name)
+                      task.load_data()
+                      subset = list(task.dataset.keys())[0]
+                      split = "test" if "test" in task.dataset[subset] else list(task.dataset[subset].keys())[0]
+                      data = task.dataset[subset][split]
+                      corpus = {r["id"]: {"title": r.get("title",""), "text": r.get("text","")} for r in data["corpus"]}
+                      queries = {r["id"]: r["text"] for r in data["queries"]}
+                      qrels = data["relevant_docs"]
+                      print(f"    Corpus: {len(corpus)}, Queries: {len(queries)}")
+                      corpus_ids = list(corpus.keys())
+                      corpus_texts = [f"{corpus[c].get('title','')} {corpus[c].get('text','')}".strip() for c in corpus_ids]
+                      corpus_emb = model.encode(corpus_texts, batch_size=8)
+                      query_ids = list(queries.keys())
+                      query_texts = [queries[q] for q in query_ids]
+                      query_emb = model.encode(query_texts, batch_size=16)
+                      scores = np.dot(query_emb, corpus_emb.T)
+                      h1, h10, mrr, ndcg, n = 0, 0, 0, 0, 0
+                      for i, qid in enumerate(query_ids):
+                          if qid not in qrels: continue
+                          n += 1
+                          rel = set(qrels[qid].keys())
+                          ranked = np.argsort(scores[i])[::-1]
+                          top10 = [corpus_ids[idx] for idx in ranked[:10]]
+                          if any(d in rel for d in top10[:1]): h1 += 1
+                          if any(d in rel for d in top10[:10]): h10 += 1
+                          for rank, idx in enumerate(ranked):
+                              if corpus_ids[idx] in rel:
+                                  mrr += 1/(rank+1)
+                                  break
+                          dcg = sum(1/np.log2(r+2) for r, idx in enumerate(ranked[:10]) if corpus_ids[idx] in rel)
+                          idcg = sum(1/np.log2(j+2) for j in range(min(len(rel), 10)))
+                          if idcg > 0: ndcg += dcg/idcg
+                      return {"hits@1": h1/n, "hits@10": h10/n, "ndcg@10": ndcg/n, "mrr": mrr/n}
+                  except Exception as e:
+                      print(f"    Error: {e}")
+                      import traceback; traceback.print_exc()
+                      return {"error": str(e)}
+
+              def main():
+                  HF_TOKEN = os.environ.get("HF_TOKEN")
+                  if HF_TOKEN:
+                      from huggingface_hub import login
+                      login(token=HF_TOKEN)
+
+                  MODELS = [
+                      ("Qwen2.5-3B-Inst (mean)", "qwen25_inst_mean",
+                       lambda: CausalLMRetrieval("Qwen/Qwen2.5-3B-Instruct", pool_method="mean")),
+                      ("Qwen2.5-3B-Inst (last-tok)", "qwen25_inst_last",
+                       lambda: CausalLMRetrieval("Qwen/Qwen2.5-3B-Instruct", pool_method="last_token")),
+                      ("Qwen2.5-3B (mean)", "qwen25_base_mean",
+                       lambda: CausalLMRetrieval("Qwen/Qwen2.5-3B", pool_method="mean")),
+                      ("Qwen3-4B (mean)", "qwen3_4b_mean",
+                       lambda: CausalLMRetrieval("Qwen/Qwen3-4B", pool_method="mean")),
+                      ("Qwen3-4B (last-tok)", "qwen3_4b_last",
+                       lambda: CausalLMRetrieval("Qwen/Qwen3-4B", pool_method="last_token")),
+                      ("Ours Stage 1 (mean)", "ours_s1",
+                       lambda: CausalLMRetrieval("Arjunvad/unified-model-stage1-action-tokens-v2", pool_method="mean")),
+                      ("Ours Stage 1.5 (mean)", "ours_s15",
+                       lambda: CausalLMRetrieval("Arjunvad/unified-model-stage1-5-embedding-v2", pool_method="mean")),
+                  ]
+
+                  all_results = {}
+                  for display_name, key, loader in MODELS:
+                      print("\n" + "=" * 70)
+                      print(f"EVALUATING: {display_name}")
+                      print("=" * 70)
+                      try:
+                          model = loader()
+                          results = {}
+                          for task in TASKS:
+                              print(f"\n  {task}...")
+                              r = evaluate_task(model, task)
+                              results[task] = r
+                              if "error" not in r:
+                                  print(f"    NDCG@10={r['ndcg@10']:.4f}  Hits@1={r['hits@1']:.4f}")
+                          all_results[key] = results
+                          del model; torch.cuda.empty_cache(); gc.collect()
+                      except Exception as e:
+                          print(f"  FAILED: {e}")
+                          import traceback; traceback.print_exc()
+                          all_results[key] = {"error": str(e)}
+
+                  # Known embedding baselines
+                  EMB_BASELINES = {
+                      "Qwen3-Emb-0.6B": {"NFCorpus": 0.2321, "SciFact": 0.5907, "ArguAna": 0.5515, "SCIDOCS": 0.1309, "FiQA2018": 0.3294},
+                      "Qwen3-Emb-4B":   {"NFCorpus": 0.2676, "SciFact": 0.6614, "ArguAna": 0.5694, "SCIDOCS": 0.1453, "FiQA2018": 0.4049},
+                  }
+
+                  keys = [k for _, k, _ in MODELS]
+                  names = {k: dn for dn, k, _ in MODELS}
+                  all_keys = keys + list(EMB_BASELINES.keys())
+
+                  print("\n" + "=" * 140)
+                  print("CROSS-TASK: Generation Models on Retrieval — NDCG@10")
+                  print("=" * 140)
+                  header = f"{'Task':<15}" + "".join(f"{(names.get(k,k))[:18]:<20}" for k in all_keys)
+                  print(header); print("-" * len(header))
+                  avgs = {k: [] for k in all_keys}
+                  for task in TASKS:
+                      row = f"{task:<15}"
+                      for k in all_keys:
+                          if k in all_results and task in all_results.get(k, {}) and "error" not in all_results[k].get(task, {}):
+                              val = all_results[k][task].get("ndcg@10", 0)
+                              row += f"{val:<20.4f}"; avgs[k].append(val)
+                          elif k in EMB_BASELINES:
+                              val = EMB_BASELINES[k].get(task, 0)
+                              row += f"{val:<20.4f}"; avgs[k].append(val)
+                          else:
+                              row += f"{'N/A':<20}"
+                      print(row)
+                  print("-" * len(header))
+                  row = f"{'AVERAGE':<15}"
+                  for k in all_keys:
+                      if avgs[k]:
+                          row += f"{sum(avgs[k])/len(avgs[k]):<20.4f}"
+                      else:
+                          row += f"{'N/A':<20}"
+                  print(row)
+
+                  print("\n" + "=" * 140)
+                  print("KEY QUESTION: Is Qwen2.5-3B-Instruct (our base) already good at retrieval?")
+                  print("If yes → our unified approach starts from a strong foundation")
+                  print("If Qwen3-4B > Qwen3-Emb-4B → retrieval tuning may HURT (PI's hypothesis)")
+                  print("=" * 140)
+
+                  os.makedirs("/results", exist_ok=True)
+                  with open("/results/cross_gen_on_retrieval.json", "w") as f:
+                      json.dump({"timestamp": datetime.now().isoformat(), "results": all_results, "emb_baselines": EMB_BASELINES}, f, indent=2)
+                  print("\nSaved to /results/cross_gen_on_retrieval.json")
+
+              if __name__ == "__main__":
+                  main()
+              PYSCRIPT
+
+              python3 /tmp/cross_eval_gen_on_retrieval.py
+
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "48Gi"
+              nvidia.com/gpu: "1"
