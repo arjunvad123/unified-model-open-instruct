@@ -18,6 +18,7 @@ metadata:
   namespace: svcl-self-improve
 spec:
   backoffLimit: 2
+  activeDeadlineSeconds: 28800  # 8 hours max (3 models × 5 lm-eval tasks)
   template:
     spec:
       restartPolicy: Never

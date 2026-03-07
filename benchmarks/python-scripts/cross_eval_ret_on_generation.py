@@ -81,10 +81,9 @@ def run_lm_eval(model_id, key, model_dir):
         "--batch_size", "auto",
         "--output_path", model_dir,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=False, text=True)
     if result.returncode != 0:
         print(f"  WARNING: Core tasks failed for {model_id}")
-        print(f"  stderr: {result.stderr[:500]}")
         # Don't return yet — try MMLU separately
 
     # MMLU (5-shot)
@@ -98,10 +97,9 @@ def run_lm_eval(model_id, key, model_dir):
         "--batch_size", "auto",
         "--output_path", model_dir,
     ]
-    result = subprocess.run(cmd_mmlu, capture_output=True, text=True)
+    result = subprocess.run(cmd_mmlu, capture_output=False, text=True)
     if result.returncode != 0:
         print(f"  WARNING: MMLU failed for {model_id}")
-        print(f"  stderr: {result.stderr[:500]}")
 
     # Parse results (lm-eval v0.4+ saves as results_TIMESTAMP.json)
     for root, dirs, files in os.walk(model_dir):

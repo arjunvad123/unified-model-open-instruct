@@ -20,6 +20,7 @@ metadata:
   namespace: svcl-self-improve
 spec:
   backoffLimit: 2
+  activeDeadlineSeconds: 43200  # 12 hours max (7 models × 5 MTEB tasks)
   template:
     spec:
       restartPolicy: Never
