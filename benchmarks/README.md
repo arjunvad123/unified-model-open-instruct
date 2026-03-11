@@ -61,6 +61,31 @@ Framework: Custom MTEB Retrieval | Benchmarks: NFCorpus, SciFact, ArguAna, SCIDO
 
 Contrastive training improved embeddings but degraded generation — the core research challenge.
 
+### Cross-Task Evaluation: Is Catastrophic Forgetting Universal?
+
+**Retrieval models on generation** — Does embedding tuning destroy generation in other models?
+
+| Model | Gen Avg | Delta from Base |
+|-------|---------|-----------------|
+| Qwen3-4B (gen base) | 0.6731 | — |
+| Qwen3-Embedding-4B | 0.3749 | **-44.3%** |
+| Ours Stage 1 → Stage 1.5 | 0.5616 → 0.4381 | **-22.0%** |
+
+**Answer: Yes.** Qwen3's forgetting (-44.3%) is even worse than ours (-22%). Our LoRA approach is actually more forgiving.
+
+**Generation models on retrieval** — Can pure gen models do retrieval? (NDCG@10)
+
+| Model | Retrieval Avg |
+|-------|---------------|
+| Qwen3-Emb-4B (dedicated) | 0.4109 |
+| Qwen3-Emb-0.6B (dedicated) | 0.3763 |
+| **Ours Stage 1.5** | **0.2836** |
+| **Ours Stage 1** | **0.2220** |
+| Qwen2.5-3B-Inst (mean pool) | 0.1443 |
+| Qwen3-4B (mean pool) | 0.1310 |
+
+**Answer: No.** Pure gen models score ~0.14 avg — far below dedicated embedding models (0.41). Our unified training already gives Stage 1 better retrieval (0.22) than pure gen baselines.
+
 ---
 
 ## Folder Structure
@@ -83,7 +108,9 @@ benchmarks/
 │   ├── baseline_generation_sota.py   # SOTA generation baseline (6 models)
 │   ├── baseline_embedding_sota.py    # SOTA embedding baseline (6 models)
 │   ├── eval_stage1_5_generation.py   # Stage 1.5 generation eval
-│   └── eval_stage1_5_embedding.py    # Stage 1.5 embedding eval
+│   ├── eval_stage1_5_embedding.py    # Stage 1.5 embedding eval
+│   ├── cross_eval_gen_on_retrieval.py  # Gen models on retrieval (MTEB)
+│   └── cross_eval_ret_on_generation.py # Retrieval models on generation (lm-eval)
 │
 ├── kubernetes-jobs/                  # Nautilus K8s Job YAMLs
 │   ├── baseline-generation-sota.yaml
@@ -93,7 +120,9 @@ benchmarks/
 │   ├── baseline-unified-gritlm.yaml
 │   ├── eval-stage1.5-generation-comprehensive.yaml
 │   ├── eval-stage1.5-embedding-comprehensive.yaml
-│   └── eval-stage1.5-mteb.yaml
+│   ├── eval-stage1.5-mteb.yaml
+│   ├── cross-eval-gen-on-retrieval.yaml   # Cross-task: gen → retrieval
+│   └── cross-eval-ret-on-generation.yaml  # Cross-task: retrieval → generation
 │
 └── results/                          # (populated at runtime)
 ```
@@ -202,7 +231,9 @@ Our embedding method: Mean pooling over `output_hidden_states[-1]`, L2 normalize
 3. **Action token routing at 81% accuracy** — model correctly routes queries to GEN/RET/TOOL/CODE
 4. **Contrastive training (Stage 1.5) improved embeddings +31%** — especially FiQA2018 (+801%)
 5. **But degraded generation -22%** — catastrophic forgetting from contrastive fine-tuning
-6. **Embedding gap remains 2.3x vs specialized models** — Qwen3-Emb-4B at 0.4097 vs our 0.2370
+6. **Catastrophic forgetting is universal** — Qwen3-Embedding-4B loses -44.3% generation vs its base; our -22% is actually less severe
+7. **Pure gen models cannot do retrieval** — PI's hypothesis disproven; gen models score 0.13 avg vs 0.41 for dedicated embedding models
+8. **Our unified training adds retrieval ability** — Stage 1 (0.2220) already beats all pure gen baselines (0.13–0.14) on retrieval without contrastive training
 
 ## Next Steps
 

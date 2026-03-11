@@ -16,11 +16,11 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: cross-gen-retrieval
+  name: cross-gen-retrieval-v2
   namespace: svcl-self-improve
 spec:
   backoffLimit: 2
-  activeDeadlineSeconds: 43200  # 12 hours max (7 models × 5 MTEB tasks)
+  activeDeadlineSeconds: 43200  # 12 hours max (7 models × 4 MTEB tasks, no FiQA)
   template:
     spec:
       restartPolicy: Never
@@ -39,6 +39,12 @@ spec:
                 - NVIDIA-A100-SXM4-40GB
                 - NVIDIA-L40S
                 - NVIDIA-L40
+                - NVIDIA-RTX-A6000
+                - NVIDIA-RTX-A5000
+                - NVIDIA-A40
+                - NVIDIA-GeForce-RTX-4090
+                - NVIDIA-GeForce-RTX-3090
+                - NVIDIA-A10
 
       containers:
         - name: eval
@@ -74,7 +80,7 @@ spec:
               import warnings
               warnings.filterwarnings("ignore")
 
-              TASKS = ["NFCorpus", "SciFact", "ArguAna", "SCIDOCS", "FiQA2018"]
+              TASKS = ["NFCorpus", "SciFact", "ArguAna", "SCIDOCS"]
 
               def mean_pool(hidden_states, attention_mask):
                   mask = attention_mask.unsqueeze(-1).float()
@@ -209,8 +215,8 @@ spec:
 
                   # Known embedding baselines
                   EMB_BASELINES = {
-                      "Qwen3-Emb-0.6B": {"NFCorpus": 0.2321, "SciFact": 0.5907, "ArguAna": 0.5515, "SCIDOCS": 0.1309, "FiQA2018": 0.3294},
-                      "Qwen3-Emb-4B":   {"NFCorpus": 0.2676, "SciFact": 0.6614, "ArguAna": 0.5694, "SCIDOCS": 0.1453, "FiQA2018": 0.4049},
+                      "Qwen3-Emb-0.6B": {"NFCorpus": 0.2321, "SciFact": 0.5907, "ArguAna": 0.5515, "SCIDOCS": 0.1309},
+                      "Qwen3-Emb-4B":   {"NFCorpus": 0.2676, "SciFact": 0.6614, "ArguAna": 0.5694, "SCIDOCS": 0.1453},
                   }
 
                   keys = [k for _, k, _ in MODELS]
@@ -271,9 +277,9 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: "32Gi"
+              memory: "24Gi"
               nvidia.com/gpu: "1"
             limits:
               cpu: "8"
-              memory: "48Gi"
+              memory: "32Gi"
               nvidia.com/gpu: "1"

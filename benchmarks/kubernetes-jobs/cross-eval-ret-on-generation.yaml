@@ -37,6 +37,12 @@ spec:
                 - NVIDIA-A100-SXM4-40GB
                 - NVIDIA-L40S
                 - NVIDIA-L40
+                - NVIDIA-RTX-A6000
+                - NVIDIA-RTX-A5000
+                - NVIDIA-A40
+                - NVIDIA-GeForce-RTX-4090
+                - NVIDIA-GeForce-RTX-3090
+                - NVIDIA-A10
 
       containers:
         - name: eval
@@ -262,9 +268,9 @@ spec:
           resources:
             requests:
               cpu: "4"
-              memory: "32Gi"
+              memory: "24Gi"
               nvidia.com/gpu: "1"
             limits:
               cpu: "8"
-              memory: "48Gi"
+              memory: "32Gi"
               nvidia.com/gpu: "1"
