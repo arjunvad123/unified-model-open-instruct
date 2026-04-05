@@ -45,13 +45,65 @@ from transformers import (
 )
 from datasets import load_dataset
 
-from open_instruct import logger_utils, utils
-from open_instruct.model_utils import push_folder_to_hub, save_with_accelerate
-from open_instruct.utils import (
-    ArgumentParserPlus,
-    clean_last_n_checkpoints,
-    get_last_checkpoint_path,
-)
+try:
+    from open_instruct import logger_utils, utils
+    from open_instruct.model_utils import push_folder_to_hub, save_with_accelerate
+    from open_instruct.utils import (
+        ArgumentParserPlus,
+        clean_last_n_checkpoints,
+        get_last_checkpoint_path,
+    )
+except ImportError:
+    # Fallback: when running without full open_instruct install (e.g., on Nautilus)
+    import logging as _logging
+    import argparse
+    import dataclasses
+
+    class _LoggerUtils:
+        @staticmethod
+        def setup_logger(*args, **kwargs):
+            _logging.basicConfig(
+                format="%(asctime)s %(levelname)s %(filename)s:%(lineno)d — %(message)s",
+                level=_logging.INFO,
+            )
+
+    logger_utils = _LoggerUtils()
+
+    class ArgumentParserPlus:
+        """Minimal replacement that parses dataclass fields into argparse."""
+        def __init__(self, dataclass_types):
+            self.dc_types = dataclass_types if isinstance(dataclass_types, (list, tuple)) else [dataclass_types]
+        def parse(self):
+            parser = argparse.ArgumentParser()
+            dc = self.dc_types[0]
+            for f in dataclasses.fields(dc):
+                name = f"--{f.name}"
+                if f.type is bool or f.type == "bool":
+                    parser.add_argument(name, type=lambda x: x.lower() in ("true", "1", "yes"), default=f.default)
+                elif f.type == Optional[str] or "Optional" in str(f.type):
+                    parser.add_argument(name, type=str, default=f.default)
+                elif f.type == Optional[int]:
+                    parser.add_argument(name, type=int, default=f.default)
+                elif f.type is int or f.type == "int":
+                    parser.add_argument(name, type=int, default=f.default)
+                elif f.type is float or f.type == "float":
+                    parser.add_argument(name, type=float, default=f.default)
+                else:
+                    parser.add_argument(name, type=str, default=f.default)
+            args = parser.parse_args()
+            return dc(**{f.name: getattr(args, f.name) for f in dataclasses.fields(dc)})
+
+    def clean_last_n_checkpoints(output_dir, n):
+        """Remove old checkpoints, keeping the last n."""
+        import glob, shutil
+        checkpoints = sorted(glob.glob(os.path.join(output_dir, "checkpoint-*")))
+        for ckpt in checkpoints[:-n]:
+            shutil.rmtree(ckpt, ignore_errors=True)
+
+    def get_last_checkpoint_path(output_dir):
+        import glob
+        checkpoints = sorted(glob.glob(os.path.join(output_dir, "checkpoint-*")))
+        return checkpoints[-1] if checkpoints else None
 
 logger = get_logger(__name__)
 

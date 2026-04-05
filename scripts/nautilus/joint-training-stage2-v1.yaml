@@ -88,6 +88,9 @@ spec:
               # ---- Login to HuggingFace ----
               python3 -c "from huggingface_hub import login; login(token='${HF_TOKEN}')"
 
+              # ---- Set Python path for open_instruct imports ----
+              export PYTHONPATH="/workspace/repo:$PYTHONPATH"
+
               # ---- Run joint training ----
               echo ""
               echo "============================================================"
