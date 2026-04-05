@@ -92,6 +92,24 @@ def mean_pooling(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> t
     return result
 
 
+def make_bidirectional_attention_mask(attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Convert a 2D attention mask [batch, seq_len] into a 4D bidirectional mask
+    [batch, 1, seq_len, seq_len] that allows all tokens to attend to all other tokens.
+
+    This is the key GritLM innovation: use bidirectional attention for embedding
+    but causal attention for generation. Bidirectional attention gives +5.5 MTEB
+    points per GritLM ablation (Table 4) with zero generation degradation.
+    """
+    bsz, seq_len = attention_mask.shape
+    # Expand to [batch, 1, 1, seq_len] for broadcasting
+    # 0.0 means "attend", large negative means "mask out"
+    expanded = attention_mask[:, None, None, :].expand(bsz, 1, seq_len, seq_len).to(dtype)
+    # Invert: 1→0.0 (attend), 0→large_neg (mask)
+    inverted = (1.0 - expanded) * torch.finfo(dtype).min
+    return inverted
+
+
 def contrastive_loss(
     q_emb: torch.Tensor,
     p_emb: torch.Tensor,
@@ -340,10 +358,31 @@ class AgenticDataset(Dataset):
 # =============================================================================
 def load_embedding_data(
     max_samples: int = 10000,
-    sources: List[str] = ["toucan", "msmarco"]
+    sources: List[str] = ["medi2", "toucan", "msmarco"]
 ) -> List[Dict]:
     """Load embedding training data from various sources."""
     data = []
+
+    if "medi2" in sources:
+        try:
+            logger.info("Loading MEDI2 dataset (GritLM/MEDI2)...")
+            medi2 = load_dataset("GritLM/MEDI2", split="train", streaming=True)
+            count = 0
+            per_source_max = max_samples // max(len(sources), 1)
+            for item in medi2:
+                if count >= per_source_max:
+                    break
+                # MEDI2 format: query, pos, neg, task_name
+                if "query" in item and "pos" in item:
+                    pos_text = item["pos"]
+                    if isinstance(pos_text, list):
+                        pos_text = pos_text[0] if pos_text else ""
+                    if pos_text:
+                        data.append({"query": item["query"], "passage": str(pos_text)[:1000]})
+                        count += 1
+            logger.info(f"Loaded {count} MEDI2 pairs")
+        except Exception as e:
+            logger.warning(f"Could not load MEDI2: {e}")
 
     if "toucan" in sources:
         try:
@@ -522,44 +561,49 @@ class UnifiedFinetuneArguments:
     """Arguments for unified model fine-tuning."""
 
     exp_name: str = "unified_agentic_model"
-    model_name_or_path: str = "Qwen/Qwen2.5-7B"
+    model_name_or_path: str = "Arjunvad/unified-model-stage1-action-tokens-v2"
     model_revision: str = "main"
 
     # Training settings
     use_flash_attn: bool = True
-    use_qlora: bool = True
+    use_qlora: bool = False
     use_lora: bool = True
-    lora_rank: int = 64
-    lora_alpha: int = 128
+    lora_rank: int = 32
+    lora_alpha: int = 64
     lora_dropout: float = 0.05
+
+    # Bidirectional attention for embedding (GritLM key innovation)
+    # When True, embedding forward passes use bidirectional (non-causal) attention.
+    # GritLM Table 4: bidirectional gives +5.5 MTEB points with zero gen degradation.
+    use_bidirectional_embedding: bool = True
 
     # Sequence lengths
     max_seq_length: int = 1024
-    embedding_max_length: int = 256
+    embedding_max_length: int = 512
 
     # Training hyperparameters
-    per_device_train_batch_size: int = 2
+    per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 8
-    learning_rate: float = 2e-4
+    learning_rate: float = 2e-5
     lr_scheduler_type: str = "cosine"
     warmup_ratio: float = 0.03
     weight_decay: float = 0.01
-    num_train_epochs: int = 3
+    num_train_epochs: int = 1
     max_train_steps: Optional[int] = None
 
-    # Loss weighting
-    contrastive_weight: float = 0.3
-    temperature: float = 0.07
+    # Loss weighting (GritLM uses 1.0 — equal weight for emb and gen)
+    contrastive_weight: float = 1.0
+    temperature: float = 0.02
 
     # Embedding-specific settings (CRITICAL for good retrieval)
     embedding_batch_size: int = 32  # Larger batch = more negatives = better embeddings
     gather_embeddings_across_gpus: bool = True  # Gather across GPUs for even larger effective batch
 
     # Dataset settings
-    max_embedding_samples: int = 10000
-    max_generation_samples: int = 10000
-    max_agentic_samples: int = 5000
-    embedding_sources: str = "toucan,msmarco"  # Comma-separated list
+    max_embedding_samples: int = 500000
+    max_generation_samples: int = 100000
+    max_agentic_samples: int = 25000
+    embedding_sources: str = "medi2,toucan,msmarco"  # Comma-separated list
     generation_sources: str = "tulu3,ragbench,hotpotqa"  # Comma-separated list
 
     # Batch composition (per step)
@@ -578,6 +622,10 @@ class UnifiedFinetuneArguments:
     gradient_checkpointing: bool = True
     with_tracking: bool = False
     report_to: str = "tensorboard"  # Comma-separated list (e.g., "tensorboard,wandb")
+
+    # Hub
+    push_to_hub: bool = False
+    hub_model_id: Optional[str] = None
 
 
 # =============================================================================
@@ -827,6 +875,19 @@ def main():
 
     model.train()
 
+    logger.info("=" * 70)
+    logger.info("JOINT TRAINING CONFIGURATION")
+    logger.info(f"  Bidirectional embedding:  {args.use_bidirectional_embedding}")
+    logger.info(f"  Contrastive weight:       {args.contrastive_weight}")
+    logger.info(f"  Temperature:              {args.temperature}")
+    logger.info(f"  LoRA rank:                {args.lora_rank}")
+    logger.info(f"  Learning rate:            {args.learning_rate}")
+    logger.info(f"  Embedding samples:        {len(embedding_dataset)}")
+    logger.info(f"  Generation samples:       {len(generation_dataset)}")
+    logger.info(f"  Agentic samples:          {len(agentic_dataset)}")
+    logger.info(f"  Max train steps:          {args.max_train_steps}")
+    logger.info("=" * 70)
+
     for epoch in range(args.num_train_epochs):
         total_loss = 0
         total_lm_loss = 0
@@ -862,23 +923,42 @@ def main():
 
             # Single accumulation context for all forward passes + backward
             with accelerator.accumulate(model):
-                # ====== EMBEDDING LOSS ======
-                # Get query embeddings (disable gradient checkpointing temporarily for hidden states)
+                # ====== EMBEDDING LOSS (bidirectional attention per GritLM) ======
+                # Build attention kwargs for embedding forward passes.
+                # If use_bidirectional_embedding is True, we construct a 4D
+                # attention mask that allows full bidirectional attention
+                # (all tokens attend to all tokens). This is the key GritLM
+                # innovation: +5.5 MTEB points with zero generation impact.
+                query_attn_kwargs = {}
+                passage_attn_kwargs = {}
+                if args.use_bidirectional_embedding:
+                    query_attn_kwargs["attention_mask"] = make_bidirectional_attention_mask(
+                        emb_batch["query_attention_mask"], dtype=torch.bfloat16
+                    )
+                    passage_attn_kwargs["attention_mask"] = make_bidirectional_attention_mask(
+                        emb_batch["passage_attention_mask"], dtype=torch.bfloat16
+                    )
+                else:
+                    query_attn_kwargs["attention_mask"] = emb_batch["query_attention_mask"]
+                    passage_attn_kwargs["attention_mask"] = emb_batch["passage_attention_mask"]
+
+                # Get query embeddings
                 query_outputs = model(
                     input_ids=emb_batch["query_input_ids"],
-                    attention_mask=emb_batch["query_attention_mask"],
                     output_hidden_states=True,
                     use_cache=False,
+                    **query_attn_kwargs,
                 )
                 query_hidden = query_outputs.hidden_states[-1]
+                # Pool using the original 2D mask (not the 4D bidirectional one)
                 query_emb = mean_pooling(query_hidden, emb_batch["query_attention_mask"])
 
                 # Get passage embeddings
                 passage_outputs = model(
                     input_ids=emb_batch["passage_input_ids"],
-                    attention_mask=emb_batch["passage_attention_mask"],
                     output_hidden_states=True,
                     use_cache=False,
+                    **passage_attn_kwargs,
                 )
                 passage_hidden = passage_outputs.hidden_states[-1]
                 passage_emb = mean_pooling(passage_hidden, emb_batch["passage_attention_mask"])
@@ -1006,8 +1086,30 @@ def main():
     unwrapped_model = accelerator.unwrap_model(model)
 
     if accelerator.is_main_process:
+        # Merge LoRA weights into base model for clean deployment
+        from peft import PeftModel
+        if isinstance(unwrapped_model, PeftModel):
+            logger.info("Merging LoRA adapters into base model...")
+            unwrapped_model = unwrapped_model.merge_and_unload()
+
         unwrapped_model.save_pretrained(final_dir)
         tokenizer.save_pretrained(final_dir)
+
+        # Push to HuggingFace Hub
+        if args.push_to_hub and args.hub_model_id:
+            logger.info(f"Pushing model to HuggingFace Hub: {args.hub_model_id}")
+            try:
+                api = HfApi()
+                api.upload_folder(
+                    folder_path=final_dir,
+                    repo_id=args.hub_model_id,
+                    repo_type="model",
+                    commit_message=f"Joint training: {args.exp_name} (bidirectional={args.use_bidirectional_embedding}, "
+                                   f"lr={args.learning_rate}, rank={args.lora_rank}, temp={args.temperature})",
+                )
+                logger.info(f"Successfully pushed to {args.hub_model_id}")
+            except Exception as e:
+                logger.warning(f"Failed to push to hub: {e}")
 
     logger.info(f"Training complete! Model saved to {final_dir}")
 
