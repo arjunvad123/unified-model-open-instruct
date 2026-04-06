@@ -16,10 +16,10 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: joint-train-stage2-v1
+  name: joint-train-stage2-v2
   namespace: svcl-self-improve
 spec:
-  backoffLimit: 1
+  backoffLimit: 0
   activeDeadlineSeconds: 86400  # 24 hours max
   template:
     spec:
@@ -119,11 +119,11 @@ spec:
                 --num_train_epochs 1 \
                 --per_device_train_batch_size 4 \
                 --gradient_accumulation_steps 8 \
-                --max_embedding_samples 500000 \
-                --max_generation_samples 100000 \
-                --max_agentic_samples 25000 \
-                --embedding_sources medi2,toucan,msmarco \
-                --generation_sources tulu3,ragbench,hotpotqa \
+                --max_embedding_samples 100000 \
+                --max_generation_samples 50000 \
+                --max_agentic_samples 10000 \
+                --embedding_sources medi2 \
+                --generation_sources tulu3 \
                 --embedding_max_length 512 \
                 --max_seq_length 1024 \
                 --warmup_ratio 0.03 \
@@ -132,7 +132,8 @@ spec:
                 --checkpointing_steps 2000 \
                 --output_dir /workspace/output/stage2-joint-v1 \
                 --push_to_hub true \
-                --hub_model_id Arjunvad/unified-model-stage2-joint-v1
+                --hub_model_id Arjunvad/unified-model-stage2-joint-v1 \
+              2>&1 || { echo "TRAINING FAILED"; cat /workspace/output/stage2-joint-v1/*.log 2>/dev/null; exit 1; }
 
               echo ""
               echo "============================================================"
