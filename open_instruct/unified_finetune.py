@@ -146,18 +146,32 @@ def mean_pooling(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> t
 
 def make_bidirectional_attention_mask(attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     """
-    Convert a 2D attention mask [batch, seq_len] into a 4D bidirectional mask
-    [batch, 1, seq_len, seq_len] that allows all tokens to attend to all other tokens.
+    Convert an attention mask into a 4D bidirectional mask that allows all
+    tokens to attend to all other tokens (overriding the default causal mask).
 
     This is the key GritLM innovation: use bidirectional attention for embedding
     but causal attention for generation. Bidirectional attention gives +5.5 MTEB
     points per GritLM ablation (Table 4) with zero generation degradation.
+
+    Accepts 2D [batch, seq_len] or already-expanded masks.
     """
-    bsz, seq_len = attention_mask.shape
-    # Expand to [batch, 1, 1, seq_len] for broadcasting
-    # 0.0 means "attend", large negative means "mask out"
-    expanded = attention_mask[:, None, None, :].expand(bsz, 1, seq_len, seq_len).to(dtype)
-    # Invert: 1→0.0 (attend), 0→large_neg (mask)
+    if attention_mask.dim() == 2:
+        bsz, seq_len = attention_mask.shape
+        # Expand to [batch, 1, seq_len, seq_len]
+        # Row-wise: each query position can attend to all key positions where mask=1
+        expanded = attention_mask[:, None, None, :].expand(bsz, 1, seq_len, seq_len).to(dtype)
+    elif attention_mask.dim() == 4:
+        # Already 4D (e.g., from accelerate) — fill with bidirectional pattern
+        # Use the last dim to determine padding positions
+        bsz, _, seq_len, _ = attention_mask.shape
+        # Extract 2D mask: a position is valid if any attention is allowed from it
+        mask_2d = (attention_mask[:, 0, 0, :] > torch.finfo(dtype).min * 0.5).float()
+        expanded = mask_2d[:, None, None, :].expand(bsz, 1, seq_len, seq_len).to(dtype)
+    else:
+        # 3D or other — just return as-is, let the model handle it
+        return attention_mask
+
+    # Invert: 1→0.0 (attend), 0→large_neg (mask out padding)
     inverted = (1.0 - expanded) * torch.finfo(dtype).min
     return inverted
 
