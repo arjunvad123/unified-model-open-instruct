@@ -2,6 +2,36 @@
 
 This directory contains evaluation scripts for benchmarking the unified agentic model across multiple dimensions.
 
+## Smoke tests vs. research benchmarks
+
+Not every script in this directory is a research-grade benchmark. Treat
+results carefully:
+
+| Script | Kind | What it actually measures |
+|---|---|---|
+| `run_generation_eval.py` | **Smoke test** | ~20 hand-written prompts, substring/keyword matches. Use for regression detection only. |
+| `run_lm_eval.py` | **Research** | Wraps `lm-evaluation-harness` (MMLU, GSM8K, HumanEval, …). Reportable. |
+| `run_mteb.py` | **Research** | Standard MTEB tasks via the official `mteb` package. Reportable. |
+| `run_mteb_comparison.py` | **Research** | MTEB retrieval against gte-Qwen2 / base-Qwen baselines. Reportable. |
+| `run_embedding_eval.py` | **Smoke test** | Custom Banking77 / retrieval / STS-style eval without going through MTEB. |
+| `run_ragas.py` | **Research (with caveat)** | RAGAS metrics; full numbers require an OpenAI judge key, otherwise falls back to manual eval. |
+
+When publishing or comparing model versions, only cite the **research** rows.
+The smoke tests exist to catch regressions during development — their numbers
+should never appear in a report without that label.
+
+### Action / control tokens
+
+The trained tokens used by the unified model are defined in
+`open_instruct/action_tokens.py` and consumed by both training
+(`open_instruct/unified_finetune.py`) and every script in this directory.
+**Do not hardcode token lists in eval scripts** — import from there so the
+tokenizer and the eval harness can never drift apart. The current trained
+set is `<ACT:THINK>`, `<ACT:RET>`, `<ACT:GEN>`, `<ACT:STOP>`, `<WAIT>`,
+`<RET_RESULT>`. (Earlier versions of these scripts referenced
+`<ACT:TOOL>` / `<ACT:CODE>` which were never trained — those tests have been
+removed.)
+
 ## Quick Start
 
 ```bash

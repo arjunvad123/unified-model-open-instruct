@@ -46,6 +46,7 @@ from transformers import (
 from datasets import load_dataset
 
 from open_instruct import logger_utils, utils
+from open_instruct.action_tokens import ACTION_TOKENS
 from open_instruct.model_utils import push_folder_to_hub, save_with_accelerate
 from open_instruct.utils import (
     ArgumentParserPlus,
@@ -55,18 +56,10 @@ from open_instruct.utils import (
 
 logger = get_logger(__name__)
 
-
-# =============================================================================
-# ACTION TOKENS FOR AGENTIC BEHAVIOR (per Technical Report Section 3.2)
-# =============================================================================
-ACTION_TOKENS = [
-    "<ACT:THINK>",   # Internal reasoning step
-    "<ACT:RET>",     # Trigger retrieval action
-    "<ACT:GEN>",     # Generate final response
-    "<ACT:STOP>",    # Terminate generation
-    "<WAIT>",        # Pause for external input
-    "<RET_RESULT>",  # Marks retrieved content injection
-]
+# ACTION_TOKENS is re-exported via `open_instruct.action_tokens` (per Technical
+# Report Section 3.2). Keeping a single source of truth there means the
+# tokenizer the model was trained with and any downstream eval harness stay in
+# lockstep.
 
 
 # =============================================================================

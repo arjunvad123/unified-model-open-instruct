@@ -16,7 +16,9 @@ Usage:
 import argparse
 import json
 import os
+import sys
 from datetime import datetime
+from pathlib import Path
 from typing import List, Dict, Tuple
 from collections import defaultdict
 
@@ -27,6 +29,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.neighbors import KNeighborsClassifier
 from tqdm import tqdm
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from open_instruct.action_tokens import ACTION_TOKENS  # noqa: E402
 
 # Try to import datasets
 try:
@@ -53,9 +61,7 @@ class EmbeddingModel:
         except:
             print("Loading tokenizer from base Qwen...")
             self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B-Instruct", trust_remote_code=True)
-            self.tokenizer.add_special_tokens({
-                "additional_special_tokens": ["<ACT:GEN>", "<ACT:RET>", "<ACT:TOOL>", "<ACT:CODE>"]
-            })
+            self.tokenizer.add_special_tokens({"additional_special_tokens": ACTION_TOKENS})
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token

@@ -18,12 +18,20 @@ Usage:
 import argparse
 import json
 import os
+import sys
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional, Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from open_instruct.action_tokens import ACTION_TOKENS  # noqa: E402
 
 # Check if mteb is installed
 try:
@@ -54,9 +62,7 @@ class UnifiedModelEncoder:
             print("Loading tokenizer from base Qwen...")
             self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B-Instruct", trust_remote_code=True)
             # Add action tokens
-            self.tokenizer.add_special_tokens({
-                "additional_special_tokens": ["<ACT:GEN>", "<ACT:RET>", "<ACT:TOOL>", "<ACT:CODE>"]
-            })
+            self.tokenizer.add_special_tokens({"additional_special_tokens": ACTION_TOKENS})
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token

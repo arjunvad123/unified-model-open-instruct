@@ -13,6 +13,8 @@ from rich.console import Console
 from rich.table import Table
 import time
 
+from open_instruct.action_tokens import ACTION_TOKENS
+
 console = Console()
 
 
@@ -123,14 +125,6 @@ def test_tokenizer():
     console.print("\n[bold blue]=" * 60)
     console.print("[bold blue]Testing Tokenizer")
     console.print("[bold blue]=" * 60)
-
-    ACTION_TOKENS = [
-        "<ACT:THINK>",
-        "<ACT:RET>",
-        "<ACT:GEN>",
-        "<ACT:STOP>",
-        "<WAIT>",
-    ]
 
     console.print("\n[yellow]Loading Qwen2.5-0.5B tokenizer...[/yellow]")
     try:

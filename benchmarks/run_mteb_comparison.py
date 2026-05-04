@@ -16,14 +16,22 @@ Usage:
 import argparse
 import json
 import os
+import sys
 import warnings
 from datetime import datetime
+from pathlib import Path
 from typing import Any, List, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from open_instruct.action_tokens import ACTION_TOKENS  # noqa: E402
 
 warnings.filterwarnings("ignore")
 
@@ -55,9 +63,8 @@ class UnifiedModelMTEB:
             "Qwen/Qwen2.5-3B-Instruct",
             trust_remote_code=True
         )
-        # Add action tokens
-        action_tokens = ["<ACT:GEN>", "<ACT:RET>", "<ACT:TOOL>", "<ACT:CODE>"]
-        self.tokenizer.add_tokens(action_tokens, special_tokens=True)
+        # Add action tokens (matches the trained tokenizer; see open_instruct/action_tokens.py)
+        self.tokenizer.add_tokens(ACTION_TOKENS, special_tokens=True)
 
         # Load model
         self.model = AutoModel.from_pretrained(
