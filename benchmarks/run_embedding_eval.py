@@ -191,9 +191,16 @@ def eval_retrieval(model: EmbeddingModel, num_queries: int = 100) -> Dict:
 
     # Load Natural Questions dataset
     print("Loading Natural Questions dataset...")
+    # TODO(decontam): this loads sentence-transformers/natural-questions TRAIN
+    # split, which is the same source the Stage-1.5-v3 contrastive trainer
+    # samples from (scripts/data/create_contrastive_dataset.py). Any retrieval
+    # number reported from this code path against a Stage-1.5-v3 checkpoint
+    # is contaminated by construction. Swap to a held-out source before
+    # publishing -- candidates: BEIR/nq dev, sentence-transformers/nq dev
+    # split, or the MTEB NQ task. See decontamination/EVAL_CONTAMINATION_CHECK.md.
     try:
         dataset = load_dataset("sentence-transformers/natural-questions", split="train", streaming=True)
-    except:
+    except Exception:
         print("Could not load NQ dataset, using synthetic data...")
         return eval_synthetic_retrieval(model)
 
