@@ -1,0 +1,248 @@
+# Reproduction + missing-baseline run for baseline_benchmark_report.md
+#
+# Two purposes in one job:
+#   1. REPRODUCE the report's "Ours (3B)" generation cells (ARC-Easy,
+#      ARC-Challenge, HellaSwag, Winogrande) under a pinned seed so a
+#      future re-run is bit-comparable.
+#   2. ADD the missing base-Qwen2.5-3B-Instruct row that the audit flagged
+#      (.agents/credibility_audit.md item B/J): without it we cannot
+#      isolate what Stage 1 training actually contributed.
+#
+# Skips MMLU 5-shot intentionally — that's a ~2h task and belongs in a
+# separate longer job. The 4 cheap tasks above each take 5–10 min on one
+# A100, so total runtime is ~1 h for two models.
+#
+# Knobs pinned for reproducibility (audit item D, FAIL):
+#   - --seed 42 (lm-eval defaults are random=0, numpy=torch=fewshot=1234,
+#     SILENTLY)
+#   - dtype=bfloat16 (matches the report's appendix)
+#   - --batch_size auto
+#   - chat template: NOT applied (matches existing baseline-generation-
+#     lmeval.yaml; document the choice so a future re-run with
+#     --apply_chat_template is a clean comparison)
+#
+# Deploy:
+#   kubectl apply -f scripts/nautilus/repro-stage1-with-base-baseline.yaml -n svcl-self-improve
+# Logs:
+#   kubectl logs job/repro-stage1-base -n svcl-self-improve -f
+# Inspect results when done (results land in pod /workspace/results):
+#   kubectl cp <pod-name>:/workspace/results ./results/repro-stage1-base
+#   kubectl delete job/repro-stage1-base -n svcl-self-improve
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: repro-stage1-base
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400  # auto-clean after 24h, per Nautilus rule 5
+  template:
+    spec:
+      restartPolicy: Never
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-L40S
+                - NVIDIA-L40
+
+      containers:
+        - name: eval
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "==========================================================="
+              echo "Stage-1 reproduction + base-Qwen2.5-3B-Instruct contrast"
+              echo "==========================================================="
+              date -u +"start_utc=%Y-%m-%dT%H:%M:%SZ"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              source /opt/venv/bin/activate
+
+              pip install --upgrade pip
+              pip install torch --index-url https://download.pytorch.org/whl/cu121
+              pip install "transformers>=4.51.0" accelerate "lm-eval==0.4.11" numpy
+
+              echo
+              echo "=== Pinned versions (record these in any report) ==="
+              python -c "import torch; print(f'torch={torch.__version__} cuda={torch.cuda.is_available()}')"
+              python -c "import transformers; print(f'transformers={transformers.__version__}')"
+              python -c "import lm_eval; print(f'lm_eval={lm_eval.__version__}')"
+
+              mkdir -p /workspace/results
+              cd /workspace
+
+              cat > run_repro.py << 'PYTHON_SCRIPT'
+              import json, os, subprocess, sys, time
+              from datetime import datetime, timezone
+
+              MODELS = [
+                  ("Ours (Stage-1 3B)",      "Arjunvad/unified-model-stage1-action-tokens-v2", "ours_stage1"),
+                  ("Base Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-3B-Instruct",                     "base_qwen3b_instruct"),
+              ]
+              # 4 cheap tasks the report has numbers for. MMLU intentionally
+              # omitted (separate job — too expensive for first GPU run).
+              TASKS = "arc_easy,arc_challenge,hellaswag,winogrande"
+              SEED = 42
+              RESULTS_DIR = "/workspace/results"
+
+              # Report's "Ours (3B)" target numbers, for delta vs reproduction.
+              REPORT_OURS = {
+                  "arc_easy":      ("acc_norm", 0.6010),
+                  "arc_challenge": ("acc_norm", 0.3985),
+                  "hellaswag":     ("acc_norm", 0.6110),
+                  "winogrande":    ("acc",      0.5706),
+              }
+
+              all_results = {}
+              t0 = time.time()
+
+              for display_name, model_id, key in MODELS:
+                  print("\n" + "=" * 70)
+                  print(f"EVAL: {display_name} ({model_id})")
+                  print("=" * 70)
+                  model_dir = os.path.join(RESULTS_DIR, key)
+                  os.makedirs(model_dir, exist_ok=True)
+
+                  cmd = [
+                      sys.executable, "-m", "lm_eval",
+                      "--model", "hf",
+                      "--model_args", f"pretrained={model_id},trust_remote_code=True,dtype=bfloat16",
+                      "--tasks", TASKS,
+                      "--seed", str(SEED),
+                      "--batch_size", "auto",
+                      "--output_path", model_dir,
+                      "--log_samples",
+                  ]
+                  print("CMD: " + " ".join(cmd))
+                  result = subprocess.run(cmd, capture_output=False, text=True)
+                  if result.returncode != 0:
+                      print(f"  ERROR: {display_name} returned {result.returncode}")
+
+                  # Parse results
+                  model_results = {}
+                  for root, _dirs, files in os.walk(model_dir):
+                      for fname in sorted(files):
+                          if fname.startswith("results") and fname.endswith(".json"):
+                              fpath = os.path.join(root, fname)
+                              try:
+                                  with open(fpath) as f:
+                                      data = json.load(f)
+                                  for tname, tdata in data.get("results", {}).items():
+                                      model_results[tname] = tdata
+                              except Exception as e:
+                                  print(f"  parse error {fpath}: {e}")
+                  all_results[key] = {
+                      "display_name": display_name,
+                      "model_id": model_id,
+                      "tasks": model_results,
+                  }
+                  print(f"  parsed {len(model_results)} task results")
+
+              # ============================================================
+              # Print comparison + reproduction-delta table
+              # ============================================================
+              print("\n" + "=" * 100)
+              print("REPRODUCTION + BASE-MODEL CONTRAST")
+              print("=" * 100)
+              header = f"{'Task':<18}{'Metric':<10}{'Ours (repro)':<15}{'Report Ours':<14}{'Delta':<10}{'Base Qwen3B-I':<15}"
+              print(header)
+              print("-" * len(header))
+
+              def get(model_key, task_substr, metric):
+                  for tname, tdata in all_results.get(model_key, {}).get("tasks", {}).items():
+                      if task_substr in tname.lower():
+                          return tdata.get(metric)
+                  return None
+
+              for task_key, (metric, report_val) in REPORT_OURS.items():
+                  ours = get("ours_stage1", task_key, metric)
+                  base = get("base_qwen3b_instruct", task_key, metric)
+                  ours_s = f"{ours:.4f}" if ours is not None else "N/A"
+                  base_s = f"{base:.4f}" if base is not None else "N/A"
+                  delta_s = f"{(ours - report_val):+.4f}" if ours is not None else "N/A"
+                  print(f"{task_key:<18}{metric:<10}{ours_s:<15}{report_val:<14.4f}{delta_s:<10}{base_s:<15}")
+
+              # ============================================================
+              # Save structured JSON for downstream consumption
+              # ============================================================
+              summary = {
+                  "kind": "reproduction_run",
+                  "purpose": "Reproduce Stage-1 generation cells; add base-Qwen2.5-3B-Instruct row.",
+                  "started_utc": datetime.fromtimestamp(t0, tz=timezone.utc).isoformat(),
+                  "finished_utc": datetime.now(timezone.utc).isoformat(),
+                  "wall_seconds": round(time.time() - t0, 1),
+                  "config": {
+                      "tasks": TASKS,
+                      "seed": SEED,
+                      "dtype": "bfloat16",
+                      "batch_size": "auto",
+                      "apply_chat_template": False,
+                      "lm_eval_version": __import__("lm_eval").__version__,
+                      "transformers_version": __import__("transformers").__version__,
+                      "torch_version": __import__("torch").__version__,
+                      "cuda_available": __import__("torch").cuda.is_available(),
+                  },
+                  "report_targets": REPORT_OURS,
+                  "models": all_results,
+              }
+              out = os.path.join(RESULTS_DIR, "reproduction_summary.json")
+              with open(out, "w") as f:
+                  json.dump(summary, f, indent=2, default=str)
+              print(f"\nWrote {out}")
+              print("=" * 100)
+              PYTHON_SCRIPT
+
+              python run_repro.py
+
+              date -u +"end_utc=%Y-%m-%dT%H:%M:%SZ"
+              echo "Done. Results in /workspace/results. ttlSecondsAfterFinished will clean up the job; copy results out via kubectl cp before that fires."
+
+          resources:
+            requests:
+              memory: "32Gi"
+              cpu: "4"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "48Gi"
+              cpu: "8"
+              nvidia.com/gpu: "1"
+
+          env:
+            - name: HF_HOME
+              value: "/tmp/hf_cache"
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/hf_cache"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule
