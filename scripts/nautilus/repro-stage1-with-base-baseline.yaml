@@ -218,13 +218,14 @@ spec:
               echo "Done. Results in /workspace/results. ttlSecondsAfterFinished will clean up the job; copy results out via kubectl cp before that fires."
 
           resources:
+            # limit/request ratio must be <= 1.2x per Nautilus admission policy
             requests:
               memory: "32Gi"
               cpu: "4"
               nvidia.com/gpu: "1"
             limits:
-              memory: "48Gi"
-              cpu: "8"
+              memory: "38Gi"
+              cpu: "4800m"
               nvidia.com/gpu: "1"
 
           env:
