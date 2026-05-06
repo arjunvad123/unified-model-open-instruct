@@ -43,6 +43,9 @@ spec:
 
       affinity:
         nodeAffinity:
+          # Any 24GB+ GPU is plenty for 3B bf16 inference (~6GB weights +
+          # activation overhead). Broadened from A100/L40 only because the
+          # high-end tier was fully saturated -- broader = faster schedule.
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
             - matchExpressions:
@@ -55,6 +58,12 @@ spec:
                 - NVIDIA-A100-SXM4-40GB
                 - NVIDIA-L40S
                 - NVIDIA-L40
+                - NVIDIA-A40
+                - NVIDIA-RTX-A6000
+                - NVIDIA-RTX-6000-Ada-Generation
+                - NVIDIA-A10
+                - NVIDIA-A30
+                - NVIDIA-L4
 
       containers:
         - name: eval
