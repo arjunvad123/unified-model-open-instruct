@@ -1,0 +1,349 @@
+# 3-seed variance bound for Stage 1 + Stage 1.5 generation tasks
+#
+# Purpose: turn the audit's "single-seed run, no error bars" FAIL (item E)
+# into "addressed". We already have seed=42 numbers from
+# scripts/nautilus/repro-stage1-with-base-baseline.yaml (results in
+# benchmarks/REPRODUCTION_RESULTS.md). This job adds seed=1337 and
+# seed=2024 so we have a 3-seed std-dev on the catastrophic-forgetting
+# headline.
+#
+# Skips:
+#   - Base Qwen2.5-3B-Instruct (already reproduced; not the variance question)
+#   - MMLU 5-shot (~6h cost; separate job if needed)
+#
+# Wall budget: 2 models x 2 seeds x 4 tasks = ~30-40 min on one A100.
+#
+# Deploy:
+#   kubectl apply -f scripts/nautilus/variance-stage1-stage1_5.yaml \
+#     -n svcl-self-improve
+# Logs:
+#   kubectl logs job/variance-stage1-stage1-5 -n svcl-self-improve -f
+# When done (results land at PVC <unified-model-data-vol>/<JOB_NAME>/):
+#   kubectl exec -n svcl-self-improve <pod> -- ls /workspace/results
+#   # Or mount the PVC into a debug pod and copy from there. PVC survives
+#   # job deletion so no rush.
+#   kubectl delete job/variance-stage1-stage1-5 -n svcl-self-improve
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: variance-stage1-stage1-5
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 0  # keep failed pods for debugging (Arjun's preference)
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-L40S
+                - NVIDIA-L40
+                - NVIDIA-A40
+                - NVIDIA-RTX-A6000
+                - NVIDIA-RTX-6000-Ada-Generation
+                - NVIDIA-A10
+                - NVIDIA-A30
+                - NVIDIA-L4
+
+      containers:
+        - name: eval
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "==========================================================="
+              echo "Variance bound: Stage 1 + Stage 1.5, seeds {1337, 2024}"
+              echo "==========================================================="
+              date -u +"start_utc=%Y-%m-%dT%H:%M:%SZ"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              source /opt/venv/bin/activate
+
+              pip install --upgrade pip
+              pip install torch --index-url https://download.pytorch.org/whl/cu121
+              pip install "transformers>=4.51.0" accelerate "lm-eval==0.4.11" numpy
+
+              echo
+              echo "=== Pinned versions ==="
+              python -c "import torch; print(f'torch={torch.__version__} cuda={torch.cuda.is_available()}')"
+              python -c "import transformers; print(f'transformers={transformers.__version__}')"
+              python -c "import lm_eval; print(f'lm_eval={lm_eval.__version__}')"
+
+              mkdir -p /workspace/results
+              cd /workspace
+
+              cat > run_variance.py << 'PYTHON_SCRIPT'
+              import json, os, subprocess, sys, time
+              from datetime import datetime, timezone
+
+              MODELS = [
+                  ("Stage 1",   "Arjunvad/unified-model-stage1-action-tokens-v2", "ours_stage1"),
+                  ("Stage 1.5", "Arjunvad/unified-model-stage1-5-embedding-v2",   "ours_stage1_5"),
+              ]
+              # Seed=42 already covered by repro-stage1-with-base-baseline (see
+              # benchmarks/REPRODUCTION_RESULTS.md). Adding 2 more for a 3-seed
+              # variance bound on the catastrophic-forgetting headline.
+              SEEDS = [1337, 2024]
+              TASKS = "arc_easy,arc_challenge,hellaswag,winogrande"
+              RESULTS_DIR = "/workspace/results"
+
+              # ============================================================
+              # lm-eval 0.4.11 result helpers (mirror of repro script's fixes).
+              # See scripts/nautilus/repro-stage1-with-base-baseline.yaml comments.
+              # ============================================================
+
+              def is_results_file(fname):
+                  return fname.startswith("results") and fname.endswith(".json") and not fname.endswith(".jsonl")
+
+              def find_latest_results_file(results_root, min_mtime=None):
+                  candidates = []
+                  for root, _dirs, files in os.walk(results_root):
+                      for fname in files:
+                          if not is_results_file(fname):
+                              continue
+                          fpath = os.path.join(root, fname)
+                          try:
+                              mtime = os.path.getmtime(fpath)
+                          except OSError as e:
+                              print(f"  stat error {fpath}: {e}")
+                              continue
+                          if min_mtime is not None and mtime < min_mtime:
+                              continue
+                          candidates.append((mtime, fpath))
+                  if not candidates:
+                      return None
+                  candidates.sort()
+                  return candidates[-1][1]
+
+              def flatten_metric_keys(task_data):
+                  flat = dict(task_data)
+                  for raw_key, value in task_data.items():
+                      if isinstance(raw_key, str) and "," in raw_key:
+                          base_key, filter_name = raw_key.split(",", 1)
+                          if filter_name == "none" or base_key not in flat:
+                              flat[base_key] = value
+                  return flat
+
+              def metric_value(task_data, metric):
+                  if metric in task_data:
+                      return task_data[metric]
+                  none_key = f"{metric},none"
+                  if none_key in task_data:
+                      return task_data[none_key]
+                  for key, value in task_data.items():
+                      if isinstance(key, str) and key.split(",", 1)[0] == metric:
+                          return value
+                  return None
+
+              # Seed=42 baselines from REPRODUCTION_RESULTS.md (4-task subset).
+              SEED_42 = {
+                  "ours_stage1": {
+                      "arc_easy":      ("acc_norm", 0.6023),
+                      "arc_challenge": ("acc_norm", 0.3985),
+                      "hellaswag":     ("acc_norm", 0.6102),
+                      "winogrande":    ("acc",      0.5659),
+                  },
+                  "ours_stage1_5": {
+                      "arc_easy":      ("acc_norm", 0.4238),
+                      "arc_challenge": ("acc_norm", 0.3003),
+                      "hellaswag":     ("acc_norm", 0.4018),
+                      "winogrande":    ("acc",      0.5454),
+                  },
+              }
+
+              all_results = {}
+              t0 = time.time()
+
+              for seed in SEEDS:
+                  for display_name, model_id, key in MODELS:
+                      print("\n" + "=" * 70)
+                      print(f"EVAL: {display_name} (seed={seed})")
+                      print("=" * 70)
+                      run_key = f"{key}__seed{seed}"
+                      model_dir = os.path.join(RESULTS_DIR, run_key)
+                      os.makedirs(model_dir, exist_ok=True)
+
+                      cmd = [
+                          sys.executable, "-m", "lm_eval",
+                          "--model", "hf",
+                          "--model_args", f"pretrained={model_id},trust_remote_code=True,dtype=bfloat16",
+                          "--tasks", TASKS,
+                          "--seed", str(seed),
+                          "--batch_size", "auto",
+                          "--output_path", model_dir,
+                          "--log_samples",
+                      ]
+                      print("CMD: " + " ".join(cmd))
+                      eval_started = time.time()
+                      result = subprocess.run(cmd, capture_output=False, text=True)
+                      if result.returncode != 0:
+                          print(f"  ERROR: {display_name} seed={seed} returned {result.returncode}")
+
+                      results_file = find_latest_results_file(model_dir, min_mtime=eval_started - 1.0)
+                      model_results = {}
+                      if results_file is None:
+                          print(f"  no fresh results_*.json found under {model_dir}")
+                      else:
+                          print(f"  Found results file: {results_file}")
+                          try:
+                              with open(results_file) as f:
+                                  data = json.load(f)
+                              for tname, tdata in data.get("results", {}).items():
+                                  model_results[tname] = flatten_metric_keys(tdata)
+                          except Exception as e:
+                              print(f"  parse error {results_file}: {e}")
+                      all_results[run_key] = {
+                          "display_name": display_name,
+                          "model_id": model_id,
+                          "model_key": key,
+                          "seed": seed,
+                          "tasks": model_results,
+                      }
+                      print(f"  parsed {len(model_results)} task results")
+
+              # ============================================================
+              # Variance table
+              # ============================================================
+              import statistics
+              print("\n" + "=" * 110)
+              print("VARIANCE TABLE -- per-task acc / acc_norm across seeds {42 (prior), 1337, 2024}")
+              print("=" * 110)
+
+              def get(run_key, task_substr, metric):
+                  for tname, tdata in all_results.get(run_key, {}).get("tasks", {}).items():
+                      if task_substr in tname.lower():
+                          return metric_value(tdata, metric)
+                  return None
+
+              header = (f"{'Model':<15}{'Task':<14}{'Metric':<9}"
+                        f"{'seed42':<10}{'seed1337':<11}{'seed2024':<11}{'mean':<9}{'std':<9}")
+              print(header)
+              print("-" * len(header))
+
+              all_means = {}
+              for model_key, baselines in SEED_42.items():
+                  display = "Stage 1" if model_key == "ours_stage1" else "Stage 1.5"
+                  task_means = {}
+                  for task_key, (metric, seed42_val) in baselines.items():
+                      v_1337 = get(f"{model_key}__seed1337", task_key, metric)
+                      v_2024 = get(f"{model_key}__seed2024", task_key, metric)
+                      values = [seed42_val] + [v for v in (v_1337, v_2024) if v is not None]
+                      mean = statistics.mean(values) if values else None
+                      sd = statistics.stdev(values) if len(values) >= 2 else None
+                      task_means[task_key] = mean
+                      def fmt(x):
+                          return f"{x:.4f}" if x is not None else "  N/A "
+                      print(f"{display:<15}{task_key:<14}{metric:<9}"
+                            f"{fmt(seed42_val):<10}{fmt(v_1337):<11}{fmt(v_2024):<11}"
+                            f"{fmt(mean):<9}{fmt(sd):<9}")
+                  all_means[model_key] = task_means
+
+              # Headline: catastrophic forgetting with 3-seed mean
+              print()
+              print("Catastrophic forgetting headline with 3-seed mean (4-task avg):")
+              s1_avg_means = [v for v in all_means.get("ours_stage1", {}).values() if v is not None]
+              s15_avg_means = [v for v in all_means.get("ours_stage1_5", {}).values() if v is not None]
+              if s1_avg_means and s15_avg_means:
+                  s1_mean = statistics.mean(s1_avg_means)
+                  s15_mean = statistics.mean(s15_avg_means)
+                  pct = 100.0 * (s15_mean - s1_mean) / s1_mean if s1_mean else 0.0
+                  print(f"  Stage 1 4-task avg (3-seed mean):   {s1_mean:.4f}")
+                  print(f"  Stage 1.5 4-task avg (3-seed mean): {s15_mean:.4f}")
+                  print(f"  Delta: {pct:+.1f}%   (BENCHMARK_REPORT.md headline: -22% across 5 tasks)")
+
+              summary = {
+                  "kind": "variance_run",
+                  "purpose": "Add seed=1337 + seed=2024 to existing seed=42 reproduction; bound noise on catastrophic-forgetting headline.",
+                  "started_utc": datetime.fromtimestamp(t0, tz=timezone.utc).isoformat(),
+                  "finished_utc": datetime.now(timezone.utc).isoformat(),
+                  "wall_seconds": round(time.time() - t0, 1),
+                  "config": {
+                      "tasks": TASKS,
+                      "seeds_in_this_run": SEEDS,
+                      "seed42_baselines_from": "benchmarks/REPRODUCTION_RESULTS.md",
+                      "dtype": "bfloat16",
+                      "batch_size": "auto",
+                      "apply_chat_template": False,
+                      "lm_eval_version": __import__("lm_eval").__version__,
+                      "transformers_version": __import__("transformers").__version__,
+                      "torch_version": __import__("torch").__version__,
+                      "cuda_available": __import__("torch").cuda.is_available(),
+                  },
+                  "seed_42_baselines": SEED_42,
+                  "models": all_results,
+              }
+              out = os.path.join(RESULTS_DIR, "variance_summary.json")
+              with open(out, "w") as f:
+                  json.dump(summary, f, indent=2, default=str)
+              print(f"\nWrote {out}")
+              print("=" * 100)
+              PYTHON_SCRIPT
+
+              python run_variance.py
+
+              date -u +"end_utc=%Y-%m-%dT%H:%M:%SZ"
+              echo "Done. Results persisted to PVC unified-model-data-vol/$JOB_NAME/."
+
+          resources:
+            requests:
+              memory: "32Gi"
+              cpu: "4"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "38Gi"
+              cpu: "4800m"
+              nvidia.com/gpu: "1"
+
+          env:
+            - name: JOB_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: "metadata.labels['batch.kubernetes.io/job-name']"
+            - name: HF_HOME
+              value: "/tmp/hf_cache"
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/hf_cache"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+          volumeMounts:
+            - name: results
+              mountPath: /workspace/results
+              subPathExpr: "$(JOB_NAME)"
+
+      volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: unified-model-data-vol
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule
