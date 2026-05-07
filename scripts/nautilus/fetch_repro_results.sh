@@ -1,6 +1,12 @@
 #!/bin/bash
 # Fetch results from a completed repro-stage1-base Nautilus job.
 #
+# CRITICAL: the YAML mounts no PVC for /workspace/results. Pod-ephemeral
+# storage. If you delete the Job (or it auto-cleans via ttl), the data is
+# GONE. Always run THIS SCRIPT FIRST, then delete. Lost a 32-minute A100
+# run once because I deleted the job to re-apply an updated YAML without
+# fetching first. Don't repeat.
+#
 # Run this once `kubectl get job repro-stage1-base -n svcl-self-improve`
 # shows COMPLETIONS=1/1. Copies /workspace/results out of the pod into
 # results/repro-stage1-base/ and prints the headline reproduction-delta

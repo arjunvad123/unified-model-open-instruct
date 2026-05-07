@@ -25,9 +25,11 @@
 #   kubectl apply -f scripts/nautilus/repro-stage1-with-base-baseline.yaml -n svcl-self-improve
 # Logs:
 #   kubectl logs job/repro-stage1-base -n svcl-self-improve -f
-# Inspect results when done (results land in pod /workspace/results):
-#   kubectl cp <pod-name>:/workspace/results ./results/repro-stage1-base
+# When done (COMPLETIONS=1/1) -- ALWAYS in this order:
+#   bash scripts/nautilus/fetch_repro_results.sh    # MUST run BEFORE delete
 #   kubectl delete job/repro-stage1-base -n svcl-self-improve
+# /workspace/results is pod-ephemeral (no PVC). Deleting the Job before
+# fetching = data lost forever. Lost one A100 run this way already.
 
 apiVersion: batch/v1
 kind: Job
