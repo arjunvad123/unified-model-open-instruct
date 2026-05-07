@@ -41,21 +41,34 @@ the above generation rows; no extra dataset.
 | `contrastive-stage1.5-medi2-v1.yaml` (shipped v2 embedding model) | `GritLM/MEDI2` train | 500K triplets |
 | `contrastive-stage1.5-train-v3.yaml` | `microsoft/ms_marco` v1.1 train, `sentence-transformers/natural-questions` train, `hotpotqa/hotpot_qa` fullwiki train, `rajpurkar/squad` train | 20K each |
 
+**Stage 2 joint training** (`scripts/nautilus/joint-training-stage2-v1.yaml`,
+`open_instruct/unified_finetune.py` with `use_bidirectional_embedding=True`):
+- Embedding: `GritLM/MEDI2` train (500K)
+- Generation: `allenai/tulu-3-sft-mixture` (~50–100K), plus optional
+  `Agent-Ark/Toucan-1.5M` and `rungalileo/ragbench` if flags enable them
+- Synthetic agentic trajectories generated locally from the generation rows
+
+The contamination surface is the same as Stage 1 + Stage 1.5 — Stage 2's
+methodology change is bidirectional attention, not new data sources.
+
 ## Eval prompts to scan
 
-51 hardcoded smoke prompts across three eval scripts, dumped to
-`benchmarks/smoke_prompts.jsonl` by `benchmarks/dump_smoke_prompts.py`:
+77 hardcoded smoke + qualitative prompts across five eval/demo scripts,
+dumped to `benchmarks/smoke_prompts.jsonl` by
+`benchmarks/dump_smoke_prompts.py`:
 
 | Source script | Counts |
 |---|---|
 | `run_generation_eval.py` | 8 routing + 5 QA + 5 math + 3 code = 21 |
 | `run_ragas.py` | 5 RAG questions |
 | `run_embedding_eval.py` | 10 query/doc pairs (20 strings) + 5 distractors = 25 |
+| `inference-scripts/01_generation_demo.py` | 16 qualitative prompts |
+| `inference-scripts/03_action_token_routing.py` | 10 routing demo prompts |
 
-This covers the smoke tests only. Standard eval suites (MTEB BEIR
-tasks, lm-eval-harness ARC/HellaSwag/MMLU/Winogrande/GSM8K) are
-themselves canonical benchmarks — contamination against those should
-be checked separately by scanning the respective HF datasets against
+This covers the smoke tests + qualitative inference demos only. Standard
+eval suites (MTEB BEIR tasks, lm-eval-harness ARC/HellaSwag/MMLU/Winogrande/
+GSM8K) are themselves canonical benchmarks — contamination against those
+should be checked separately by scanning the respective HF datasets against
 the training corpus, not via this file.
 
 ## Running the empirical scan (cluster)

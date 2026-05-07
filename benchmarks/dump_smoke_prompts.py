@@ -92,6 +92,40 @@ EMBEDDING_DISTRACTORS = [
     "The stock market opened higher today.",
 ]
 
+# benchmarks/inference-scripts/01_generation_demo.py — qualitative prompts
+DEMO_01_GENERATION = [
+    "What causes the seasons on Earth?",
+    "Explain how vaccines work.",
+    "What is the greenhouse effect?",
+    "How does gravity work?",
+    "If all roses are flowers and some flowers fade quickly, can we conclude all roses fade quickly? Explain your reasoning.",
+    "A bat and ball cost $1.10 total. The bat costs $1 more than the ball. How much does the ball cost?",
+    "If it takes 5 machines 5 minutes to make 5 widgets, how long would it take 100 machines to make 100 widgets?",
+    "There are three boxes. One contains only apples, one contains only oranges, and one contains both. The labels are all wrong. You can pick one fruit from one box. How do you label all boxes correctly?",
+    "Write a Python function to find the nth Fibonacci number.",
+    "Write a Python function to check if a string is a palindrome.",
+    "Write a Python function to merge two sorted lists into one sorted list.",
+    "Write a Python class for a stack with push, pop, and peek methods.",
+    "List exactly 5 benefits of regular exercise, numbered 1 through 5.",
+    "Summarize the concept of photosynthesis in exactly 2 sentences.",
+    "Write a haiku about the ocean.",
+    "Explain recursion to a 10-year-old in 3 sentences or less.",
+]
+
+# benchmarks/inference-scripts/03_action_token_routing.py — routing demos
+DEMO_03_ROUTING = [
+    "What is quantum computing?",
+    "Explain the theory of relativity in simple terms.",
+    "What are the main causes of World War I?",
+    "Describe how the human immune system works.",
+    "What is the difference between mitosis and meiosis?",
+    "Find information about the latest developments in fusion energy.",
+    "Search for research papers on transformer architectures.",
+    "Look up statistics on global renewable energy adoption.",
+    "Find articles about CRISPR gene editing applications.",
+    "Search for the history of the internet.",
+]
+
 
 def main() -> None:
     rows: list[dict] = []
@@ -103,6 +137,8 @@ def main() -> None:
         ("run_generation_eval.math", MATH),
         ("run_generation_eval.code", CODE),
         ("run_ragas.test_cases", RAGAS_QUESTIONS),
+        ("inference_scripts.01_generation_demo", DEMO_01_GENERATION),
+        ("inference_scripts.03_action_token_routing", DEMO_03_ROUTING),
     ]:
         for p in prompts:
             rows.append({"source": source, "prompt": p})
