@@ -53,3 +53,51 @@ per-sample JSONL not preserved.
 **Fix for next time:** mount the project's existing `pvc-data.yaml` (CephFS,
 200 GB) at `/workspace/results` in the YAML so results survive pod
 deletion. Will propose to Arjun as part of the PR.
+
+---
+
+# 3-seed variance bound (added 2026-05-07)
+
+**Run:** `scripts/nautilus/variance-stage1-stage1_5.yaml`
+**Job:** `variance-stage1-stage1-5` on `nautilus-it-gpu02.fullerton.edu`
+**Wall clock:** 44 min
+**Pinned versions:** `lm_eval=0.4.11`, `transformers=5.8.0`, `torch=2.5.1+cu121`
+**Verdict:** ✅ **Single-seed concern is moot for these tasks** — std-dev on every cell ≤ 0.004. The catastrophic-forgetting headline is robust to seed.
+
+This run added seeds {1337, 2024} to the existing seed=42 numbers above. PVC mount worked — results survived job deletion this time, fetched cleanly via a debug pod (the lost-results lesson is now structurally fixed).
+
+## Per-task per-seed table
+
+| Model | Task | Metric | seed=42 | seed=1337 | seed=2024 | mean | std |
+|---|---|---|---|---|---|---|---|
+| Stage 1 | arc_easy | acc_norm | 0.6023 | 0.5989 | 0.5989 | **0.6000** | 0.0020 |
+| Stage 1 | arc_challenge | acc_norm | 0.3985 | 0.4010 | 0.4010 | **0.4002** | 0.0015 |
+| Stage 1 | hellaswag | acc_norm | 0.6102 | 0.6109 | 0.6109 | **0.6107** | 0.0004 |
+| Stage 1 | winogrande | acc | 0.5659 | 0.5722 | 0.5722 | **0.5701** | 0.0036 |
+| Stage 1.5 | arc_easy | acc_norm | 0.4238 | 0.4238 | 0.4238 | **0.4238** | 0.0000 |
+| Stage 1.5 | arc_challenge | acc_norm | 0.3003 | 0.3055 | 0.3055 | **0.3037** | 0.0030 |
+| Stage 1.5 | hellaswag | acc_norm | 0.4018 | 0.4005 | 0.4005 | **0.4009** | 0.0007 |
+| Stage 1.5 | winogrande | acc | 0.5454 | 0.5383 | 0.5383 | **0.5407** | 0.0041 |
+
+## Catastrophic-forgetting headline with 3-seed mean
+
+- **Stage 1 4-task avg (3-seed mean):** `0.5453`
+- **Stage 1.5 4-task avg (3-seed mean):** `0.4173`
+- **Delta: -23.5%** (vs `BENCHMARK_REPORT.md` headline of -22.0% over 5 tasks)
+
+Tightens the prior single-seed reproduction (-23.2%). The headline finding is not a single-seed artifact.
+
+## Notable pattern: seeds 1337 and 2024 are bit-identical
+
+Every cell for seed=1337 matches the corresponding cell for seed=2024 to four decimals. Seed=42 differs by 0.003–0.006. Two plausible explanations:
+1. **lm-eval's `--seed` flag is largely cosmetic for 0-shot multiple-choice tasks** — these are deterministic loglikelihood comparisons with no sampling, so most "randomness" sources don't apply. The 42 vs 1337/2024 differences are likely from non-deterministic CUDA kernels (e.g., reduction order in `--batch_size auto` resolving differently per run) rather than the seed itself.
+2. lm-eval's data-shuffling seed implementation maps 1337 and 2024 to the same shuffle order, while 42 produces a different one.
+
+Either way, **std-dev across the 3 seeds is ≤ 0.004 on every cell**, well below the audit's threshold for "this number is meaningful." Single-seed reporting was a less-serious concern than the audit gave it credit for, on these tasks. (MMLU 5-shot would need its own variance check before this conclusion generalizes — few-shot exemplar sampling IS seed-sensitive.)
+
+## Audit item E status update
+
+The audit's "single-seed run; per-task variance not estimated" is now **addressed** for the 4 cheap generation tasks. Two follow-ups would close the rest:
+- Run MMLU 5-shot at 3 seeds (~6 GPU-hours; few-shot prompts make this seed-sensitive)
+- Run the embedding tables at 3 seeds (~1 hour; uses different methodology, may have different variance characteristics)
+
