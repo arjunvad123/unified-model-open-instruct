@@ -19,7 +19,7 @@ metadata:
   name: baseline-unified
   namespace: svcl-self-improve
 spec:
-  backoffLimit: 2
+  backoffLimit: 0  # match Arjun's preference (commit d989fb16): keep failed pods for debugging
   template:
     spec:
       restartPolicy: Never
@@ -399,7 +399,16 @@ spec:
               cpu: "8"
               nvidia.com/gpu: "1"
 
+          volumeMounts:
+            - name: results
+              mountPath: /workspace/results
+              subPathExpr: "$(JOB_NAME)"
+
           env:
+            - name: JOB_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: "metadata.labels['batch.kubernetes.io/job-name']"
             - name: HF_HOME
               value: "/tmp/hf_cache"
             - name: TRANSFORMERS_CACHE
@@ -413,6 +422,11 @@ spec:
                 secretKeyRef:
                   name: hf-token
                   key: token
+
+      volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: unified-model-data-vol
 
       tolerations:
         - key: nvidia.com/gpu

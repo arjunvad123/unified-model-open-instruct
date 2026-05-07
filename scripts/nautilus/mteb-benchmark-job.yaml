@@ -18,7 +18,7 @@ metadata:
   name: mteb-benchmark
   namespace: svcl-self-improve
 spec:
-  backoffLimit: 2
+  backoffLimit: 0  # match Arjun's preference (commit d989fb16): keep failed pods for debugging
   template:
     spec:
       restartPolicy: Never
@@ -42,6 +42,9 @@ spec:
               memory: "300Mi"
               cpu: "120m"
           volumeMounts:
+            - name: results
+              mountPath: /workspace/results
+              subPathExpr: \"$(JOB_NAME)\"
             - name: git-repo-code
               mountPath: /opt/repo
 
@@ -89,6 +92,7 @@ spec:
 
               # === COPY BENCHMARK SCRIPT ===
               echo "Setting up benchmark..."
+              # TODO(canonical-paths): write to /workspace/results/mteb so output lands on the PVC subPathExpr mount
               mkdir -p results/mteb
 
               # === RUN MTEB BENCHMARKS ===
@@ -113,6 +117,7 @@ spec:
               cat results/mteb/comparison_summary.json
 
               # Keep results accessible
+              # TODO(canonical-paths): redundant once script writes directly to /workspace/results/mteb (PVC mount). Drop this copy.
               echo "Copying results to /data/mteb_results..."
               cp -r results/mteb /data/mteb_results_$(date +%Y%m%d_%H%M%S)
 
@@ -139,6 +144,10 @@ spec:
 
           # === ENVIRONMENT VARIABLES ===
           env:
+            - name: JOB_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: "metadata.labels['batch.kubernetes.io/job-name']"
             - name: HF_HOME
               value: "/root/.cache/huggingface"
             - name: TRANSFORMERS_CACHE
@@ -148,6 +157,9 @@ spec:
 
       # === VOLUMES ===
       volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: unified-model-data-vol
         - name: git-repo-code
           emptyDir: {}
         - name: data-storage
