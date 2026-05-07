@@ -1,0 +1,163 @@
+# Joint Training: Stage 2 (GritLM-style bidirectional embedding + generation)
+#
+# Key innovations over Stage 1.5 (sequential contrastive):
+#   1. Bidirectional attention for embedding (is_causal=False) — +5.5 MTEB per GritLM
+#   2. Joint training (alternating emb/gen/agentic batches) — zero forgetting
+#   3. Equal loss weighting (contrastive_weight=1.0) — per GritLM
+#   4. Temperature 0.02 — sharper contrastive signal
+#
+# Base model: Stage 1 (action token SFT on Qwen2.5-3B-Instruct)
+# Data: MEDI2 500K (embedding) + Tulu3/RAGBench/HotpotQA (generation) + synthetic agentic
+# Expected: ~8-12 hours on single A100
+#
+# Deploy: kubectl apply -f joint-training-stage2-v1.yaml -n svcl-self-improve
+# Logs:   kubectl logs job/joint-train-stage2-v1 -n svcl-self-improve -f
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: joint-train-stage2-v2
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 86400  # 24 hours max
+  template:
+    spec:
+      restartPolicy: Never
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-L40S
+                - NVIDIA-L40
+                - NVIDIA-RTX-A6000
+                - NVIDIA-A40
+                - NVIDIA-GeForce-RTX-4090
+
+      containers:
+        - name: train
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "============================================================"
+              echo "JOINT TRAINING: Stage 2 (Bidirectional Embedding + Gen)"
+              echo "============================================================"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+              echo ""
+
+              # ---- System deps ----
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              # ---- Python env ----
+              python3 -m venv /opt/venv
+              export PATH="/opt/venv/bin:$PATH"
+
+              pip install --no-cache-dir \
+                torch \
+                transformers \
+                accelerate \
+                peft \
+                datasets \
+                huggingface_hub \
+                tqdm \
+                numpy \
+                bitsandbytes
+
+              # ---- Clone repo ----
+              echo "Cloning repository..."
+              git clone https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/repo
+              cd /workspace/repo
+              git checkout benchmarking-suite
+              echo "Checked out benchmarking-suite branch"
+
+              # ---- Login to HuggingFace ----
+              python3 -c "from huggingface_hub import login; login(token='${HF_TOKEN}')"
+
+              # ---- Set Python path for open_instruct imports ----
+              export PYTHONPATH="/workspace/repo:$PYTHONPATH"
+
+              # ---- Run joint training ----
+              echo ""
+              echo "============================================================"
+              echo "Starting joint training..."
+              echo "  Base: Arjunvad/unified-model-stage1-action-tokens-v2"
+              echo "  Bidirectional embedding: True"
+              echo "  Contrastive weight: 1.0"
+              echo "  Temperature: 0.02"
+              echo "  LoRA rank: 32, alpha: 64"
+              echo "  LR: 2e-5, epochs: 1"
+              echo "  Data: MEDI2 (500K) + Tulu3 + RAGBench + HotpotQA"
+              echo "============================================================"
+              echo ""
+
+              python3 open_instruct/unified_finetune.py \
+                --model_name_or_path Arjunvad/unified-model-stage1-action-tokens-v2 \
+                --use_lora true \
+                --use_qlora false \
+                --lora_rank 32 \
+                --lora_alpha 64 \
+                --use_bidirectional_embedding true \
+                --use_flash_attn false \
+                --temperature 0.02 \
+                --contrastive_weight 1.0 \
+                --learning_rate 2e-5 \
+                --num_train_epochs 1 \
+                --per_device_train_batch_size 4 \
+                --gradient_accumulation_steps 8 \
+                --max_embedding_samples 100000 \
+                --max_generation_samples 50000 \
+                --max_agentic_samples 10000 \
+                --embedding_sources medi2 \
+                --generation_sources tulu3 \
+                --embedding_max_length 512 \
+                --max_seq_length 1024 \
+                --warmup_ratio 0.03 \
+                --gradient_checkpointing true \
+                --logging_steps 10 \
+                --checkpointing_steps 2000 \
+                --output_dir /workspace/output/stage2-joint-v1 \
+                --push_to_hub true \
+                --hub_model_id Arjunvad/unified-model-stage2-joint-v1 \
+              2>&1 || { echo "TRAINING FAILED"; cat /workspace/output/stage2-joint-v1/*.log 2>/dev/null; exit 1; }
+
+              echo ""
+              echo "============================================================"
+              echo "TRAINING COMPLETE"
+              echo "Model pushed to: Arjunvad/unified-model-stage2-joint-v1"
+              echo "============================================================"
+
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+            - name: TRANSFORMERS_CACHE
+              value: /workspace/cache
+            - name: HF_HOME
+              value: /workspace/cache
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "48Gi"
+              nvidia.com/gpu: "1"

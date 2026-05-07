@@ -1,0 +1,258 @@
+# Generation Benchmark: Stage 1.5 (Ours, 3B) vs Qwen2.5-3B-Instruct vs SmolLM3-3B
+# lm-evaluation-harness: ARC-Easy, ARC-Challenge, HellaSwag, Winogrande, MMLU
+#
+# Deploy: kubectl apply -f eval-stage1.5-generation-comprehensive.yaml -n svcl-self-improve
+# Logs:   kubectl logs job/eval-gen-bench -n svcl-self-improve -f
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eval-gen-bench
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-L40S
+                - NVIDIA-L40
+
+      containers:
+        - name: eval
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "==========================================================="
+              echo "Generation Benchmark"
+              echo "Stage 1.5 (Ours, 3B) vs Qwen2.5-3B-Instruct vs SmolLM3-3B"
+              echo "==========================================================="
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              source /opt/venv/bin/activate
+
+              pip install --upgrade pip
+              pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+              pip install "transformers>=4.51.0" accelerate lm-eval numpy
+
+              python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+              python -c "import lm_eval; print(f'lm-eval version: {lm_eval.__version__}')"
+
+              mkdir -p /workspace/results
+              cd /workspace
+
+              TASKS="arc_easy,arc_challenge,hellaswag,winogrande"
+              MMLU_TASK="mmlu"
+
+              cat > run_gen_eval.py << 'PYTHON_SCRIPT'
+              import json, os, subprocess, sys, re
+              from datetime import datetime
+
+              MODELS = [
+                  ("Stage 1.5 (Ours, 3B)", "Arjunvad/unified-model-stage1-5-embedding-v2", "stage1_5"),
+                  ("Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-3B-Instruct", "qwen25_3b"),
+                  ("SmolLM3-3B", "HuggingFaceTB/SmolLM3-3B", "smollm3_3b"),
+              ]
+
+              TASKS = "arc_easy,arc_challenge,hellaswag,winogrande"
+              MMLU_TASK = "mmlu"
+              RESULTS_DIR = "/workspace/results"
+
+              all_results = {}
+
+              for display_name, model_id, key in MODELS:
+                  print("\n" + "=" * 70)
+                  print(f"EVALUATING: {display_name} ({model_id})")
+                  print("=" * 70)
+
+                  model_dir = os.path.join(RESULTS_DIR, key)
+                  os.makedirs(model_dir, exist_ok=True)
+
+                  # Run core tasks (ARC, HellaSwag, Winogrande)
+                  print(f"\n  Running: {TASKS}")
+                  cmd_core = [
+                      sys.executable, "-m", "lm_eval",
+                      "--model", "hf",
+                      "--model_args", f"pretrained={model_id},trust_remote_code=True,dtype=bfloat16",
+                      "--tasks", TASKS,
+                      "--batch_size", "8",
+                      "--output_path", model_dir,
+                      "--log_samples",
+                  ]
+                  result = subprocess.run(cmd_core, capture_output=False, text=True)
+                  if result.returncode != 0:
+                      print(f"  WARNING: Core tasks failed for {display_name}")
+
+                  # Run MMLU separately (memory intensive)
+                  print(f"\n  Running: {MMLU_TASK}")
+                  cmd_mmlu = [
+                      sys.executable, "-m", "lm_eval",
+                      "--model", "hf",
+                      "--model_args", f"pretrained={model_id},trust_remote_code=True,dtype=bfloat16",
+                      "--tasks", MMLU_TASK,
+                      "--num_fewshot", "5",
+                      "--batch_size", "4",
+                      "--output_path", model_dir,
+                      "--log_samples",
+                  ]
+                  result = subprocess.run(cmd_mmlu, capture_output=False, text=True)
+                  if result.returncode != 0:
+                      print(f"  WARNING: MMLU failed for {display_name}")
+
+                  # Parse results from output files
+                  model_results = {}
+                  for root, dirs, files in os.walk(model_dir):
+                      for fname in files:
+                          if fname == "results.json":
+                              fpath = os.path.join(root, fname)
+                              try:
+                                  with open(fpath) as f:
+                                      data = json.load(f)
+                                  if "results" in data:
+                                      for task_name, task_data in data["results"].items():
+                                          clean_name = task_name.split(",")[0].strip()
+                                          model_results[clean_name] = task_data
+                              except Exception as e:
+                                  print(f"  Error parsing {fpath}: {e}")
+
+                  all_results[key] = {
+                      "display_name": display_name,
+                      "model_id": model_id,
+                      "tasks": model_results,
+                  }
+                  print(f"\n  Parsed {len(model_results)} task results for {display_name}")
+
+              # ============================================================
+              # Print comparison table
+              # ============================================================
+              print("\n" + "=" * 100)
+              print("GENERATION BENCHMARK RESULTS")
+              print("=" * 100)
+
+              task_display = [
+                  ("arc_easy", "acc_norm", "ARC-Easy"),
+                  ("arc_challenge", "acc_norm", "ARC-Challenge"),
+                  ("hellaswag", "acc_norm", "HellaSwag"),
+                  ("winogrande", "acc", "Winogrande"),
+              ]
+
+              keys = ["stage1_5", "qwen25_3b", "smollm3_3b"]
+              names = {"stage1_5": "Stage 1.5 (Ours)", "qwen25_3b": "Qwen2.5-3B", "smollm3_3b": "SmolLM3-3B"}
+
+              header = f"{'Task':<18}" + "".join(f"{names[k]:<22}" for k in keys)
+              print(f"\n{header}")
+              print("-" * len(header))
+
+              avg_scores = {k: [] for k in keys}
+
+              for task_key, metric, task_label in task_display:
+                  row = f"{task_label:<18}"
+                  for k in keys:
+                      found = False
+                      if k in all_results:
+                          tasks = all_results[k].get("tasks", {})
+                          for tname, tdata in tasks.items():
+                              if task_key in tname.lower():
+                                  val = tdata.get(metric, tdata.get("acc", None))
+                                  if val is not None:
+                                      row += f"{val:<22.4f}"
+                                      avg_scores[k].append(val)
+                                      found = True
+                                      break
+                      if not found:
+                          row += f"{'N/A':<22}"
+                  print(row)
+
+              # MMLU
+              row = f"{'MMLU (5-shot)':<18}"
+              for k in keys:
+                  found = False
+                  if k in all_results:
+                      tasks = all_results[k].get("tasks", {})
+                      for tname, tdata in tasks.items():
+                          if "mmlu" in tname.lower() and "stem" not in tname.lower() and "humanities" not in tname.lower():
+                              val = tdata.get("acc", tdata.get("acc_norm", None))
+                              if val is not None:
+                                  row += f"{val:<22.4f}"
+                                  avg_scores[k].append(val)
+                                  found = True
+                                  break
+                  if not found:
+                      row += f"{'N/A':<22}"
+              print(row)
+
+              print("-" * len(header))
+              row = f"{'AVERAGE':<18}"
+              for k in keys:
+                  vals = avg_scores[k]
+                  if vals:
+                      row += f"{sum(vals)/len(vals):<22.4f}"
+                  else:
+                      row += f"{'N/A':<22}"
+              print(row)
+
+              # Save full results
+              with open(os.path.join(RESULTS_DIR, "generation_benchmark.json"), "w") as f:
+                  json.dump({
+                      "timestamp": datetime.now().isoformat(),
+                      "models": {k: v for k, v in all_results.items()},
+                  }, f, indent=2, default=str)
+
+              print(f"\nSaved to {RESULTS_DIR}/generation_benchmark.json")
+              print("=" * 100)
+
+              PYTHON_SCRIPT
+
+              python run_gen_eval.py
+
+              echo "Done. Pod alive 30min for log inspection..."
+              sleep 1800
+
+          resources:
+            requests:
+              memory: "32Gi"
+              cpu: "4"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "48Gi"
+              cpu: "8"
+              nvidia.com/gpu: "1"
+
+          env:
+            - name: HF_HOME
+              value: "/tmp/hf_cache"
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/hf_cache"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule

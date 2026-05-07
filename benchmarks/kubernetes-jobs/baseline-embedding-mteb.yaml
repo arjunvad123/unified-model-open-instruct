@@ -1,0 +1,324 @@
+# Baseline Embedding Benchmark: Our Model (3B) vs Top 5 Embedding Models
+# Framework: MTEB Retrieval (NFCorpus, SciFact, ArguAna, SCIDOCS, FiQA2018)
+#
+# Models:
+#   1. Ours: Arjunvad/unified-model-stage1-action-tokens-v2 (3B, CausalLM)
+#   2. sentence-transformers/all-MiniLM-L6-v2 (22M)
+#   3. BAAI/bge-small-en-v1.5 (33M)
+#   4. nomic-ai/nomic-embed-text-v1.5 (137M)
+#   5. BAAI/bge-large-en-v1.5 (335M)
+#   6. intfloat/e5-large-v2 (335M)
+#
+# Deploy: kubectl apply -f baseline-embedding-mteb.yaml -n svcl-self-improve
+# Logs:   kubectl logs job/baseline-emb-mteb -n svcl-self-improve -f
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: baseline-emb-mteb
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-L40S
+                - NVIDIA-L40
+
+      containers:
+        - name: eval
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "==========================================================="
+              echo "Baseline Embedding Benchmark (MTEB Retrieval)"
+              echo "Our Model (3B) vs Top 5 Embedding Models"
+              echo "==========================================================="
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              source /opt/venv/bin/activate
+
+              pip install --upgrade pip
+              pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+              pip install "transformers>=4.51.0" "sentence-transformers>=2.7.0" accelerate mteb numpy tqdm
+
+              python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+
+              mkdir -p /workspace/results
+              cd /workspace
+
+              cat > run_baseline_emb.py << 'PYTHON_SCRIPT'
+              import json, os, gc, sys
+              from datetime import datetime
+              import numpy as np
+              import torch
+              import torch.nn.functional as F
+              from tqdm import tqdm
+              import warnings
+              warnings.filterwarnings("ignore")
+
+              TASKS = ["NFCorpus", "SciFact", "ArguAna", "SCIDOCS", "FiQA2018"]
+
+              # ============================================================
+              # Model wrapper: CausalLM (our model) — mean pooling
+              # ============================================================
+              class CausalLMEmbedding:
+                  def __init__(self, model_path, device=None):
+                      from transformers import AutoTokenizer, AutoModelForCausalLM
+                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+                      print(f"  Loading CausalLM: {model_path}")
+                      self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                      self.model = AutoModelForCausalLM.from_pretrained(
+                          model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
+                      ).to(self.device).eval()
+                      if not self.tokenizer.pad_token:
+                          self.tokenizer.pad_token = self.tokenizer.eos_token
+                      print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e9:.1f}B")
+
+                  def encode(self, sentences, batch_size=8, **kwargs):
+                      all_emb = []
+                      for i in tqdm(range(0, len(sentences), batch_size), desc="Encoding", disable=len(sentences)<100):
+                          batch = sentences[i:i+batch_size]
+                          inputs = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt").to(self.device)
+                          with torch.no_grad():
+                              out = self.model(**inputs, output_hidden_states=True, use_cache=False)
+                              h = out.hidden_states[-1].float()
+                              m = inputs["attention_mask"].unsqueeze(-1).float()
+                              emb = F.normalize((h * m).sum(1) / m.sum(1).clamp(min=1e-9), p=2, dim=1)
+                              all_emb.append(emb.cpu())
+                          del inputs, out, h, m, emb; torch.cuda.empty_cache()
+                      return torch.cat(all_emb, dim=0).numpy()
+
+              # ============================================================
+              # Model wrapper: SentenceTransformer (standard embedding models)
+              # ============================================================
+              class STEmbedding:
+                  def __init__(self, model_name, device=None):
+                      from sentence_transformers import SentenceTransformer
+                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+                      print(f"  Loading SentenceTransformer: {model_name}")
+                      self.model = SentenceTransformer(model_name, device=self.device, trust_remote_code=True)
+                      print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e6:.1f}M")
+
+                  def encode(self, sentences, batch_size=64, **kwargs):
+                      return self.model.encode(sentences, batch_size=batch_size, show_progress_bar=len(sentences)>100, normalize_embeddings=True)
+
+              # ============================================================
+              # Model wrapper: E5 (needs "query: " / "passage: " prefix)
+              # ============================================================
+              class E5Embedding:
+                  def __init__(self, model_name, device=None):
+                      from sentence_transformers import SentenceTransformer
+                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+                      print(f"  Loading E5: {model_name}")
+                      self.model = SentenceTransformer(model_name, device=self.device)
+                      print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e6:.1f}M")
+
+                  def encode(self, sentences, batch_size=64, prompt_name=None, **kwargs):
+                      if prompt_name == "query":
+                          sentences = ["query: " + s for s in sentences]
+                      else:
+                          sentences = ["passage: " + s for s in sentences]
+                      return self.model.encode(sentences, batch_size=batch_size, show_progress_bar=len(sentences)>100, normalize_embeddings=True)
+
+              # ============================================================
+              # Model wrapper: BGE (needs "Represent this sentence: " for queries)
+              # ============================================================
+              class BGEEmbedding:
+                  def __init__(self, model_name, device=None):
+                      from sentence_transformers import SentenceTransformer
+                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+                      print(f"  Loading BGE: {model_name}")
+                      self.model = SentenceTransformer(model_name, device=self.device)
+                      print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e6:.1f}M")
+
+                  def encode(self, sentences, batch_size=64, prompt_name=None, **kwargs):
+                      if prompt_name == "query":
+                          sentences = ["Represent this sentence for searching relevant passages: " + s for s in sentences]
+                      return self.model.encode(sentences, batch_size=batch_size, show_progress_bar=len(sentences)>100, normalize_embeddings=True)
+
+              # ============================================================
+              # Evaluation
+              # ============================================================
+              def evaluate_task(model, task_name, use_query_prompt=False):
+                  import mteb
+                  try:
+                      task = mteb.get_task(task_name)
+                      task.load_data()
+                      subset = list(task.dataset.keys())[0]
+                      split = "test" if "test" in task.dataset[subset] else list(task.dataset[subset].keys())[0]
+                      data = task.dataset[subset][split]
+
+                      corpus = {r["id"]: {"title": r.get("title",""), "text": r.get("text","")} for r in data["corpus"]}
+                      queries = {r["id"]: r["text"] for r in data["queries"]}
+                      qrels = data["relevant_docs"]
+                      print(f"    Corpus: {len(corpus)}, Queries: {len(queries)}")
+
+                      corpus_ids = list(corpus.keys())
+                      corpus_texts = [f"{corpus[c].get('title','')} {corpus[c].get('text','')}".strip() for c in corpus_ids]
+                      corpus_emb = model.encode(corpus_texts, batch_size=32)
+
+                      query_ids = list(queries.keys())
+                      query_texts = [queries[q] for q in query_ids]
+                      query_emb = model.encode(query_texts, batch_size=64, prompt_name="query" if use_query_prompt else None)
+
+                      scores = np.dot(query_emb, corpus_emb.T)
+
+                      h1, h10, mrr, ndcg, n = 0, 0, 0, 0, 0
+                      for i, qid in enumerate(query_ids):
+                          if qid not in qrels: continue
+                          n += 1
+                          rel = set(qrels[qid].keys())
+                          ranked = np.argsort(scores[i])[::-1]
+                          top10 = [corpus_ids[idx] for idx in ranked[:10]]
+                          if any(d in rel for d in top10[:1]): h1 += 1
+                          if any(d in rel for d in top10[:10]): h10 += 1
+                          for rank, idx in enumerate(ranked):
+                              if corpus_ids[idx] in rel:
+                                  mrr += 1/(rank+1)
+                                  break
+                          dcg = sum(1/np.log2(r+2) for r, idx in enumerate(ranked[:10]) if corpus_ids[idx] in rel)
+                          idcg = sum(1/np.log2(j+2) for j in range(min(len(rel), 10)))
+                          if idcg > 0: ndcg += dcg/idcg
+
+                      return {"hits@1": h1/n, "hits@10": h10/n, "ndcg@10": ndcg/n, "mrr": mrr/n}
+                  except Exception as e:
+                      print(f"    Error: {e}")
+                      import traceback; traceback.print_exc()
+                      return {"error": str(e)}
+
+              def main():
+                  MODELS = [
+                      ("Ours (3B)",              "ours",     lambda: CausalLMEmbedding("Arjunvad/unified-model-stage1-action-tokens-v2"), False),
+                      ("all-MiniLM-L6-v2 (22M)", "minilm",   lambda: STEmbedding("sentence-transformers/all-MiniLM-L6-v2"), False),
+                      ("bge-small-en-v1.5 (33M)","bge_s",    lambda: BGEEmbedding("BAAI/bge-small-en-v1.5"), True),
+                      ("nomic-embed-v1.5 (137M)","nomic",    lambda: STEmbedding("nomic-ai/nomic-embed-text-v1.5"), False),
+                      ("bge-large-en-v1.5 (335M)","bge_l",   lambda: BGEEmbedding("BAAI/bge-large-en-v1.5"), True),
+                      ("e5-large-v2 (335M)",     "e5_l",     lambda: E5Embedding("intfloat/e5-large-v2"), True),
+                  ]
+
+                  all_results = {}
+                  for display_name, key, loader, use_prompt in MODELS:
+                      print("\n" + "=" * 70)
+                      print(f"EVALUATING: {display_name}")
+                      print("=" * 70)
+                      try:
+                          model = loader()
+                          results = {}
+                          for task in TASKS:
+                              print(f"\n  {task}...")
+                              r = evaluate_task(model, task, use_prompt)
+                              results[task] = r
+                              if "error" not in r:
+                                  print(f"    Hits@1={r['hits@1']:.4f}  NDCG@10={r['ndcg@10']:.4f}  MRR={r['mrr']:.4f}")
+                          all_results[key] = results
+                          del model; torch.cuda.empty_cache(); gc.collect()
+                      except Exception as e:
+                          print(f"  FAILED: {e}")
+                          import traceback; traceback.print_exc()
+                          all_results[key] = {"error": str(e)}
+
+                  # Print comparison table
+                  keys = ["ours", "minilm", "bge_s", "nomic", "bge_l", "e5_l"]
+                  names = {
+                      "ours": "Ours (3B)",
+                      "minilm": "MiniLM",
+                      "bge_s": "BGE-S",
+                      "nomic": "Nomic",
+                      "bge_l": "BGE-L",
+                      "e5_l": "E5-L",
+                  }
+
+                  print("\n" + "=" * 110)
+                  print("EMBEDDING BASELINE BENCHMARK RESULTS")
+                  print("=" * 110)
+
+                  for metric in ["ndcg@10", "hits@1", "hits@10", "mrr"]:
+                      print(f"\n--- {metric.upper()} ---")
+                      header = f"{'Task':<15}" + "".join(f"{names[k]:<16}" for k in keys)
+                      print(header); print("-" * len(header))
+                      avgs = {k: [] for k in keys}
+                      for task in TASKS:
+                          row = f"{task:<15}"
+                          for k in keys:
+                              if k in all_results and task in all_results.get(k,{}) and "error" not in all_results[k].get(task,{}):
+                                  val = all_results[k][task].get(metric, 0)
+                                  row += f"{val:<16.4f}"
+                                  avgs[k].append(val)
+                              else:
+                                  row += f"{'N/A':<16}"
+                          print(row)
+                      print("-" * len(header))
+                      row = f"{'AVERAGE':<15}"
+                      for k in keys:
+                          if avgs[k]:
+                              row += f"{sum(avgs[k])/len(avgs[k]):<16.4f}"
+                          else:
+                              row += f"{'N/A':<16}"
+                      print(row)
+
+                  with open("results/baseline_embedding.json", "w") as f:
+                      json.dump({"timestamp": datetime.now().isoformat(), "tasks": TASKS, "results": all_results}, f, indent=2)
+                  print(f"\nSaved to results/baseline_embedding.json")
+                  print("=" * 110)
+
+              if __name__ == "__main__":
+                  main()
+              PYTHON_SCRIPT
+
+              python run_baseline_emb.py
+
+              echo "Done. Pod alive 30min for log inspection..."
+              sleep 1800
+
+          resources:
+            requests:
+              memory: "32Gi"
+              cpu: "4"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "48Gi"
+              cpu: "8"
+              nvidia.com/gpu: "1"
+
+          env:
+            - name: HF_HOME
+              value: "/tmp/hf_cache"
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/hf_cache"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule
