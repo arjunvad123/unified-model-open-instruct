@@ -140,15 +140,16 @@ spec:
           from datasets import Dataset
 
           OUTPUT_DIR = "/workspace/data/action_token_sft"
-          NUM_EXAMPLES_PER_ACTION = 2500  # 2500 * 4 = 10,000 total
+          # Trained routing tokens are GEN and RET only. <ACT:TOOL> and <ACT:CODE>
+          # were never trained into Stage 1 and are intentionally excluded.
+          # See open_instruct/action_tokens.py for the canonical trained set.
+          NUM_EXAMPLES_PER_ACTION = 2500  # 2500 * 2 = 5,000 total
           SEED = 42
 
-          # Action tokens matching the test script
+          # Action tokens matching the trained set in open_instruct/action_tokens.py
           ACTION_TOKENS = {
               "GEN": "<ACT:GEN>",
               "RET": "<ACT:RET>",
-              "TOOL": "<ACT:TOOL>",
-              "CODE": "<ACT:CODE>",
           }
 
           TOPICS = [
@@ -234,75 +235,13 @@ spec:
                   ]
               })
 
-          # =========================================================================
-          # TOOL examples - tool use/API calls
-          # =========================================================================
-          tool_templates = [
-              ("What's the current weather in Tokyo?", "Let me check the weather API."),
-              ("What time is it in London?", "Let me look up the current time."),
-              ("Calculate 2847 * 3921", "Let me use the calculator."),
-              ("What's the stock price of Apple?", "Let me check the stock API."),
-              ("Convert 100 USD to EUR", "Let me use the currency converter."),
-              ("What's the latest news about {}?", "Let me fetch the latest news."),
-              ("Check the flight status for AA123", "Let me check the flight API."),
-              ("What's the current Bitcoin price?", "Let me query the crypto API."),
-              ("Look up the definition of '{}'", "Let me search the dictionary."),
-              ("Translate 'hello' to Spanish", "Let me use the translation API."),
-              ("What day of the week is January 15, 2025?", "Let me calculate that date."),
-              ("How many days until Christmas?", "Let me calculate the days."),
-              ("What's the population of France?", "Let me look up that data."),
-              ("Check if example.com is up", "Let me ping the website."),
-              ("What's the distance from New York to LA?", "Let me calculate the distance."),
-          ]
-
-          for _ in range(NUM_EXAMPLES_PER_ACTION):
-              template_q, template_a = random.choice(tool_templates)
-              topic = random.choice(TOPICS) if "{}" in template_q else ""
-              question = template_q.format(topic) if topic else template_q
-              data.append({
-                  "messages": [
-                      {"role": "user", "content": question},
-                      {"role": "assistant", "content": f"{ACTION_TOKENS['TOOL']} {template_a}"}
-                  ]
-              })
-
-          # =========================================================================
-          # CODE examples - code generation tasks
-          # =========================================================================
-          code_templates = [
-              ("Write a Python function to sort a list", "Here's a Python function:"),
-              ("Create a function to calculate factorial", "Here's the implementation:"),
-              ("Write code to reverse a string", "Here's the code:"),
-              ("Implement binary search in Python", "Here's the binary search implementation:"),
-              ("Write a class for a linked list", "Here's a linked list class:"),
-              ("Create a function to check if a number is prime", "Here's the prime checker:"),
-              ("Write code to merge two sorted lists", "Here's the merge function:"),
-              ("Implement a stack data structure", "Here's the stack implementation:"),
-              ("Write a function to find duplicates in a list", "Here's the function:"),
-              ("Create a recursive fibonacci function", "Here's the fibonacci implementation:"),
-              ("Write code to read a JSON file", "Here's how to read JSON:"),
-              ("Implement a basic HTTP server", "Here's a basic server:"),
-              ("Write a function to validate email addresses", "Here's the validator:"),
-              ("Create a decorator for timing functions", "Here's the timing decorator:"),
-              ("Write code to parse CSV data", "Here's the CSV parser:"),
-              ("Implement a simple cache decorator", "Here's the cache implementation:"),
-              ("Write a function to flatten nested lists", "Here's the flatten function:"),
-              ("Create a context manager for file handling", "Here's the context manager:"),
-              ("Write code for {} algorithm", "Here's the algorithm implementation:"),
-              ("Implement a {} data structure", "Here's the data structure:"),
-          ]
-
-          for _ in range(NUM_EXAMPLES_PER_ACTION):
-              template_q, template_a = random.choice(code_templates)
-              topic = random.choice(TOPICS) if "{}" in template_q else ""
-              question = template_q.format(topic) if topic else template_q
-              answer = template_a.format(topic) if "{}" in template_a and topic else template_a
-              data.append({
-                  "messages": [
-                      {"role": "user", "content": question},
-                      {"role": "assistant", "content": f"{ACTION_TOKENS['CODE']} {answer}"}
-                  ]
-              })
+          # NOTE: Earlier versions of this YAML generated TOOL and CODE examples
+          # using <ACT:TOOL> / <ACT:CODE> tokens. Those tokens were never trained
+          # into the model and have been removed. The trained set is
+          # THINK/RET/GEN/STOP/WAIT/RET_RESULT (open_instruct/action_tokens.py).
+          # If a future round wants to add TOOL or CODE as routed actions, add
+          # them to the registry first and restore the corresponding example
+          # blocks here.
 
           random.shuffle(data)
           dataset = Dataset.from_list(data)
@@ -312,8 +251,6 @@ spec:
           print(f"Created {len(dataset)} examples at {OUTPUT_DIR}")
           print(f"  - {NUM_EXAMPLES_PER_ACTION} GEN examples")
           print(f"  - {NUM_EXAMPLES_PER_ACTION} RET examples")
-          print(f"  - {NUM_EXAMPLES_PER_ACTION} TOOL examples")
-          print(f"  - {NUM_EXAMPLES_PER_ACTION} CODE examples")
 
           # Show samples
           print("\nSample examples:")
@@ -335,11 +272,16 @@ spec:
           STAGE1_5_PATH = "/workspace/stage1_5_model"
           TOKENIZER_DIR = "/workspace/tokenizer_with_actions"
 
+          # Trained action tokens — must match open_instruct/action_tokens.py exactly.
+          # <ACT:TOOL> and <ACT:CODE> were referenced in earlier drafts but never
+          # trained; intentionally excluded.
           ACTION_TOKENS = [
-              "<ACT:GEN>",
+              "<ACT:THINK>",
               "<ACT:RET>",
-              "<ACT:TOOL>",
-              "<ACT:CODE>",
+              "<ACT:GEN>",
+              "<ACT:STOP>",
+              "<WAIT>",
+              "<RET_RESULT>",
           ]
 
           print(f"Loading tokenizer from Stage 1.5 model...")
@@ -590,7 +532,15 @@ spec:
           from huggingface_hub import HfApi, login
 
           OUTPUT_DIR = "/persistent/output/unified_stage1_with_embeddings_merged"
-          ACTION_TOKENS = ["<ACT:GEN>", "<ACT:RET>", "<ACT:TOOL>", "<ACT:CODE>"]
+          # Must match the trained set in open_instruct/action_tokens.py.
+          ACTION_TOKENS = [
+              "<ACT:THINK>",
+              "<ACT:RET>",
+              "<ACT:GEN>",
+              "<ACT:STOP>",
+              "<WAIT>",
+              "<RET_RESULT>",
+          ]
           HF_TOKEN = os.environ.get("HF_TOKEN")
 
           print("Loading trained model for testing...")
@@ -602,15 +552,15 @@ spec:
               trust_remote_code=True,
           )
 
+          # Routing test prompts. TOOL/CODE prompts removed: those tokens were
+          # never trained and would always score 0% by construction.
           test_prompts = [
               ("What is quantum computing?", "GEN"),
               ("Find information on machine learning", "RET"),
-              ("What's the current weather in Tokyo?", "TOOL"),
-              ("Write a Python function to sort a list", "CODE"),
               ("Explain neural networks to me", "GEN"),
               ("Search for documents about climate change", "RET"),
-              ("Calculate 2847 * 3921", "TOOL"),
-              ("Implement binary search in Python", "CODE"),
+              ("What is the difference between mitosis and meiosis?", "GEN"),
+              ("Look up statistics on global renewable energy adoption", "RET"),
           ]
 
           print("\n" + "=" * 60)

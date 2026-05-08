@@ -16,7 +16,9 @@ Usage:
 import argparse
 import json
 import os
+import sys
 from datetime import datetime
+from pathlib import Path
 from typing import List, Dict, Tuple
 from collections import defaultdict
 
@@ -27,6 +29,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.neighbors import KNeighborsClassifier
 from tqdm import tqdm
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from open_instruct.action_tokens import ACTION_TOKENS  # noqa: E402
 
 # Try to import datasets
 try:
@@ -53,9 +61,7 @@ class EmbeddingModel:
         except:
             print("Loading tokenizer from base Qwen...")
             self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B-Instruct", trust_remote_code=True)
-            self.tokenizer.add_special_tokens({
-                "additional_special_tokens": ["<ACT:GEN>", "<ACT:RET>", "<ACT:TOOL>", "<ACT:CODE>"]
-            })
+            self.tokenizer.add_special_tokens({"additional_special_tokens": ACTION_TOKENS})
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -185,9 +191,16 @@ def eval_retrieval(model: EmbeddingModel, num_queries: int = 100) -> Dict:
 
     # Load Natural Questions dataset
     print("Loading Natural Questions dataset...")
+    # TODO(decontam): this loads sentence-transformers/natural-questions TRAIN
+    # split, which is the same source the Stage-1.5-v3 contrastive trainer
+    # samples from (scripts/data/create_contrastive_dataset.py). Any retrieval
+    # number reported from this code path against a Stage-1.5-v3 checkpoint
+    # is contaminated by construction. Swap to a held-out source before
+    # publishing -- candidates: BEIR/nq dev, sentence-transformers/nq dev
+    # split, or the MTEB NQ task. See decontamination/EVAL_CONTAMINATION_CHECK.md.
     try:
         dataset = load_dataset("sentence-transformers/natural-questions", split="train", streaming=True)
-    except:
+    except Exception:
         print("Could not load NQ dataset, using synthetic data...")
         return eval_synthetic_retrieval(model)
 

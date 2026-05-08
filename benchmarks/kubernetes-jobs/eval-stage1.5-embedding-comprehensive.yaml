@@ -1,24 +1,16 @@
-# Baseline Embedding Benchmark: Our Model (3B) vs Top 5 Embedding Models
-# Framework: MTEB Retrieval (NFCorpus, SciFact, ArguAna, SCIDOCS, FiQA2018)
+# Embedding Benchmark: Stage 1.5 (Ours, 3B) vs Qwen3-Embedding-4B
+# MTEB Retrieval: NFCorpus, SciFact, ArguAna, SCIDOCS, FiQA2018
 #
-# Models:
-#   1. Ours: Arjunvad/unified-model-stage1-action-tokens-v2 (3B, CausalLM)
-#   2. sentence-transformers/all-MiniLM-L6-v2 (22M)
-#   3. BAAI/bge-small-en-v1.5 (33M)
-#   4. nomic-ai/nomic-embed-text-v1.5 (137M)
-#   5. BAAI/bge-large-en-v1.5 (335M)
-#   6. intfloat/e5-large-v2 (335M)
-#
-# Deploy: kubectl apply -f baseline-embedding-mteb.yaml -n svcl-self-improve
-# Logs:   kubectl logs job/baseline-emb-mteb -n svcl-self-improve -f
+# Deploy: kubectl apply -f eval-stage1.5-embedding-comprehensive.yaml -n svcl-self-improve
+# Logs:   kubectl logs job/eval-emb-bench -n svcl-self-improve -f
 
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: baseline-emb-mteb
+  name: eval-emb-bench
   namespace: svcl-self-improve
 spec:
-  backoffLimit: 0  # match Arjun's preference (commit d989fb16): keep failed pods for debugging
+  backoffLimit: 2
   template:
     spec:
       restartPolicy: Never
@@ -48,8 +40,8 @@ spec:
               set -e
 
               echo "==========================================================="
-              echo "Baseline Embedding Benchmark (MTEB Retrieval)"
-              echo "Our Model (3B) vs Top 5 Embedding Models"
+              echo "Embedding Benchmark"
+              echo "Stage 1.5 (Ours, 3B) vs Qwen3-Embedding-4B"
               echo "==========================================================="
               nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
@@ -62,15 +54,15 @@ spec:
 
               pip install --upgrade pip
               pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-              pip install "transformers>=4.51.0" "sentence-transformers>=2.7.0" accelerate mteb numpy tqdm
+              pip install "transformers>=4.51.0" "sentence-transformers>=2.7.0" accelerate peft mteb numpy tqdm
 
               python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
 
               mkdir -p /workspace/results
               cd /workspace
 
-              cat > run_baseline_emb.py << 'PYTHON_SCRIPT'
-              import json, os, gc, sys
+              cat > run_eval.py << 'PYTHON_SCRIPT'
+              import json, os, gc
               from datetime import datetime
               import numpy as np
               import torch
@@ -82,13 +74,13 @@ spec:
               TASKS = ["NFCorpus", "SciFact", "ArguAna", "SCIDOCS", "FiQA2018"]
 
               # ============================================================
-              # Model wrapper: CausalLM (our model) — mean pooling
+              # Our model: CausalLM + output_hidden_states + mean pooling
               # ============================================================
               class CausalLMEmbedding:
                   def __init__(self, model_path, device=None):
                       from transformers import AutoTokenizer, AutoModelForCausalLM
                       self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-                      print(f"  Loading CausalLM: {model_path}")
+                      print(f"  Loading: {model_path}")
                       self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
                       self.model = AutoModelForCausalLM.from_pretrained(
                           model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
@@ -97,7 +89,7 @@ spec:
                           self.tokenizer.pad_token = self.tokenizer.eos_token
                       print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e9:.1f}B")
 
-                  def encode(self, sentences, batch_size=8, **kwargs):
+                  def encode(self, sentences, batch_size=32, **kwargs):
                       all_emb = []
                       for i in tqdm(range(0, len(sentences), batch_size), desc="Encoding", disable=len(sentences)<100):
                           batch = sentences[i:i+batch_size]
@@ -108,56 +100,39 @@ spec:
                               m = inputs["attention_mask"].unsqueeze(-1).float()
                               emb = F.normalize((h * m).sum(1) / m.sum(1).clamp(min=1e-9), p=2, dim=1)
                               all_emb.append(emb.cpu())
-                          del inputs, out, h, m, emb; torch.cuda.empty_cache()
                       return torch.cat(all_emb, dim=0).numpy()
 
               # ============================================================
-              # Model wrapper: SentenceTransformer (standard embedding models)
+              # Qwen3-Embedding-4B: AutoModel + last-token pool + instruction
               # ============================================================
-              class STEmbedding:
-                  def __init__(self, model_name, device=None):
-                      from sentence_transformers import SentenceTransformer
+              class Qwen3Embedding:
+                  def __init__(self, device=None):
+                      from transformers import AutoTokenizer, AutoModel
                       self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-                      print(f"  Loading SentenceTransformer: {model_name}")
-                      self.model = SentenceTransformer(model_name, device=self.device, trust_remote_code=True)
-                      print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e6:.1f}M")
+                      name = "Qwen/Qwen3-Embedding-4B"
+                      print(f"  Loading: {name}")
+                      self.tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True, padding_side='left')
+                      self.model = AutoModel.from_pretrained(
+                          name, trust_remote_code=True, torch_dtype=torch.float16
+                      ).to(self.device).eval()
+                      self.instruction = "Given a web search query, retrieve relevant passages that answer the query"
+                      print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e9:.1f}B")
 
-                  def encode(self, sentences, batch_size=64, **kwargs):
-                      return self.model.encode(sentences, batch_size=batch_size, show_progress_bar=len(sentences)>100, normalize_embeddings=True)
-
-              # ============================================================
-              # Model wrapper: E5 (needs "query: " / "passage: " prefix)
-              # ============================================================
-              class E5Embedding:
-                  def __init__(self, model_name, device=None):
-                      from sentence_transformers import SentenceTransformer
-                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-                      print(f"  Loading E5: {model_name}")
-                      self.model = SentenceTransformer(model_name, device=self.device)
-                      print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e6:.1f}M")
-
-                  def encode(self, sentences, batch_size=64, prompt_name=None, **kwargs):
-                      if prompt_name == "query":
-                          sentences = ["query: " + s for s in sentences]
-                      else:
-                          sentences = ["passage: " + s for s in sentences]
-                      return self.model.encode(sentences, batch_size=batch_size, show_progress_bar=len(sentences)>100, normalize_embeddings=True)
-
-              # ============================================================
-              # Model wrapper: BGE (needs "Represent this sentence: " for queries)
-              # ============================================================
-              class BGEEmbedding:
-                  def __init__(self, model_name, device=None):
-                      from sentence_transformers import SentenceTransformer
-                      self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-                      print(f"  Loading BGE: {model_name}")
-                      self.model = SentenceTransformer(model_name, device=self.device)
-                      print(f"  Params: {sum(p.numel() for p in self.model.parameters())/1e6:.1f}M")
-
-                  def encode(self, sentences, batch_size=64, prompt_name=None, **kwargs):
-                      if prompt_name == "query":
-                          sentences = ["Represent this sentence for searching relevant passages: " + s for s in sentences]
-                      return self.model.encode(sentences, batch_size=batch_size, show_progress_bar=len(sentences)>100, normalize_embeddings=True)
+                  def encode(self, sentences, batch_size=8, prompt_name=None, **kwargs):
+                      all_emb = []
+                      for i in tqdm(range(0, len(sentences), batch_size), desc="Encoding", disable=len(sentences)<100):
+                          batch = sentences[i:i+batch_size]
+                          if prompt_name == "query":
+                              batch = [f"Instruct: {self.instruction}\nQuery:{s}" for s in batch]
+                          inputs = self.tokenizer(batch, padding=True, truncation=True, max_length=512, return_tensors="pt")
+                          inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                          with torch.no_grad():
+                              out = self.model(**inputs)
+                              seq_lens = inputs["attention_mask"].sum(dim=1) - 1
+                              emb = out.last_hidden_state[torch.arange(len(batch), device=self.device), seq_lens].float()
+                              emb = F.normalize(emb, p=2, dim=1)
+                              all_emb.append(emb.cpu())
+                      return torch.cat(all_emb, dim=0).numpy()
 
               # ============================================================
               # Evaluation
@@ -182,7 +157,7 @@ spec:
 
                       query_ids = list(queries.keys())
                       query_texts = [queries[q] for q in query_ids]
-                      query_emb = model.encode(query_texts, batch_size=64, prompt_name="query" if use_query_prompt else None)
+                      query_emb = model.encode(query_texts, batch_size=32, prompt_name="query" if use_query_prompt else None)
 
                       scores = np.dot(query_emb, corpus_emb.T)
 
@@ -211,19 +186,15 @@ spec:
 
               def main():
                   MODELS = [
-                      ("Ours (3B)",              "ours",     lambda: CausalLMEmbedding("Arjunvad/unified-model-stage1-action-tokens-v2"), False),
-                      ("all-MiniLM-L6-v2 (22M)", "minilm",   lambda: STEmbedding("sentence-transformers/all-MiniLM-L6-v2"), False),
-                      ("bge-small-en-v1.5 (33M)","bge_s",    lambda: BGEEmbedding("BAAI/bge-small-en-v1.5"), True),
-                      ("nomic-embed-v1.5 (137M)","nomic",    lambda: STEmbedding("nomic-ai/nomic-embed-text-v1.5"), False),
-                      ("bge-large-en-v1.5 (335M)","bge_l",   lambda: BGEEmbedding("BAAI/bge-large-en-v1.5"), True),
-                      ("e5-large-v2 (335M)",     "e5_l",     lambda: E5Embedding("intfloat/e5-large-v2"), True),
+                      ("Stage 1.5 (Ours, 3B)", "stage1_5", lambda: CausalLMEmbedding("Arjunvad/unified-model-stage1-5-embedding-v2"), False),
+                      ("Qwen3-Embedding-4B", "qwen3_emb_4b", lambda: Qwen3Embedding(), True),
                   ]
 
                   all_results = {}
                   for display_name, key, loader, use_prompt in MODELS:
-                      print("\n" + "=" * 70)
+                      print("\n" + "="*70)
                       print(f"EVALUATING: {display_name}")
-                      print("=" * 70)
+                      print("="*70)
                       try:
                           model = loader()
                           results = {}
@@ -240,55 +211,46 @@ spec:
                           import traceback; traceback.print_exc()
                           all_results[key] = {"error": str(e)}
 
-                  # Print comparison table
-                  keys = ["ours", "minilm", "bge_s", "nomic", "bge_l", "e5_l"]
-                  names = {
-                      "ours": "Ours (3B)",
-                      "minilm": "MiniLM",
-                      "bge_s": "BGE-S",
-                      "nomic": "Nomic",
-                      "bge_l": "BGE-L",
-                      "e5_l": "E5-L",
-                  }
+                  # Print comparison
+                  keys = ["stage1_5", "qwen3_emb_4b"]
+                  names = {"stage1_5": "Stage 1.5 (Ours)", "qwen3_emb_4b": "Qwen3-Emb 4B"}
 
-                  print("\n" + "=" * 110)
-                  print("EMBEDDING BASELINE BENCHMARK RESULTS")
-                  print("=" * 110)
+                  print("\n" + "="*90)
+                  print("EMBEDDING BENCHMARK RESULTS")
+                  print("="*90)
 
-                  for metric in ["ndcg@10", "hits@1", "hits@10", "mrr"]:
+                  for metric in ["hits@1", "hits@10", "ndcg@10", "mrr"]:
                       print(f"\n--- {metric.upper()} ---")
-                      header = f"{'Task':<15}" + "".join(f"{names[k]:<16}" for k in keys)
-                      print(header); print("-" * len(header))
-                      avgs = {k: [] for k in keys}
+                      header = f"{'Task':<15}" + "".join(f"{names[k]:<25}" for k in keys)
+                      print(header); print("-"*len(header))
                       for task in TASKS:
                           row = f"{task:<15}"
                           for k in keys:
-                              if k in all_results and task in all_results.get(k,{}) and "error" not in all_results[k].get(task,{}):
-                                  val = all_results[k][task].get(metric, 0)
-                                  row += f"{val:<16.4f}"
-                                  avgs[k].append(val)
+                              if k in all_results and task in all_results[k] and "error" not in all_results[k].get(task,{}):
+                                  row += f"{all_results[k][task].get(metric,0):<25.4f}"
                               else:
-                                  row += f"{'N/A':<16}"
+                                  row += f"{'N/A':<25}"
                           print(row)
-                      print("-" * len(header))
+                      print("-"*len(header))
                       row = f"{'AVERAGE':<15}"
                       for k in keys:
-                          if avgs[k]:
-                              row += f"{sum(avgs[k])/len(avgs[k]):<16.4f}"
+                          if k in all_results and "error" not in all_results.get(k,{}):
+                              vals = [all_results[k][t].get(metric,0) for t in TASKS if t in all_results[k] and "error" not in all_results[k].get(t,{})]
+                              row += f"{sum(vals)/len(vals) if vals else 0:<25.4f}"
                           else:
-                              row += f"{'N/A':<16}"
+                              row += f"{'N/A':<25}"
                       print(row)
 
-                  with open("results/baseline_embedding.json", "w") as f:
+                  with open("results/embedding_benchmark.json","w") as f:
                       json.dump({"timestamp": datetime.now().isoformat(), "tasks": TASKS, "results": all_results}, f, indent=2)
-                  print(f"\nSaved to results/baseline_embedding.json")
-                  print("=" * 110)
+                  print(f"\nSaved to results/embedding_benchmark.json")
+                  print("="*90)
 
               if __name__ == "__main__":
                   main()
               PYTHON_SCRIPT
 
-              python run_baseline_emb.py
+              python run_eval.py
 
               echo "Done. Pod alive 30min for log inspection..."
               sleep 1800
@@ -303,34 +265,18 @@ spec:
               cpu: "8"
               nvidia.com/gpu: "1"
 
-          volumeMounts:
-            - name: results
-              mountPath: /workspace/results
-              subPathExpr: "$(JOB_NAME)"
-
           env:
-            - name: JOB_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: "metadata.labels['batch.kubernetes.io/job-name']"
             - name: HF_HOME
               value: "/tmp/hf_cache"
             - name: TRANSFORMERS_CACHE
               value: "/tmp/hf_cache"
             - name: PYTHONUNBUFFERED
               value: "1"
-            - name: PYTORCH_CUDA_ALLOC_CONF
-              value: "expandable_segments:True"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: hf-token
                   key: token
-
-      volumes:
-        - name: results
-          persistentVolumeClaim:
-            claimName: unified-model-data-vol
 
       tolerations:
         - key: nvidia.com/gpu

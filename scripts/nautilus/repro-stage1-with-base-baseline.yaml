@@ -1,0 +1,396 @@
+# Reproduction run for benchmarks/BENCHMARK_REPORT.md (Sections 1 + 3)
+#
+# Three purposes in one job:
+#   1. REPRODUCE the report's "Ours (Stage 1)" generation cells (ARC-Easy,
+#      ARC-Challenge, HellaSwag, Winogrande) under a pinned seed so a
+#      future re-run is bit-comparable.
+#   2. REPRODUCE the catastrophic-forgetting headline (Stage 1 -> Stage 1.5
+#      generation degradation, claimed -22%). Section 3 of the report.
+#   3. RE-VERIFY the base-Qwen2.5-3B-Instruct row from Section 1 in our env.
+#
+# Skips MMLU 5-shot intentionally — that's a ~2h task and belongs in a
+# separate longer job. The 4 cheap tasks above each take 5–10 min on one
+# A100, so total runtime is ~1.5 h for three models.
+#
+# Knobs pinned for reproducibility (audit item D, FAIL):
+#   - --seed 42 (lm-eval defaults are random=0, numpy=torch=fewshot=1234,
+#     SILENTLY)
+#   - dtype=bfloat16 (matches the report's appendix)
+#   - --batch_size auto
+#   - chat template: NOT applied (matches existing baseline-generation-
+#     lmeval.yaml; document the choice so a future re-run with
+#     --apply_chat_template is a clean comparison)
+#
+# Deploy:
+#   kubectl apply -f scripts/nautilus/repro-stage1-with-base-baseline.yaml -n svcl-self-improve
+# Logs:
+#   kubectl logs job/repro-stage1-base -n svcl-self-improve -f
+# When done (COMPLETIONS=1/1) -- ALWAYS in this order:
+#   bash scripts/nautilus/fetch_repro_results.sh    # MUST run BEFORE delete
+#   kubectl delete job/repro-stage1-base -n svcl-self-improve
+# /workspace/results is pod-ephemeral (no PVC). Deleting the Job before
+# fetching = data lost forever. Lost one A100 run this way already.
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: repro-stage1-base
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 0  # match Arjun's preference (commit d989fb16): keep failed pods for debugging
+  ttlSecondsAfterFinished: 86400  # auto-clean after 24h, per Nautilus rule 5
+  template:
+    spec:
+      restartPolicy: Never
+
+      affinity:
+        nodeAffinity:
+          # Any 24GB+ GPU is plenty for 3B bf16 inference (~6GB weights +
+          # activation overhead). Broadened from A100/L40 only because the
+          # high-end tier was fully saturated -- broader = faster schedule.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-L40S
+                - NVIDIA-L40
+                - NVIDIA-A40
+                - NVIDIA-RTX-A6000
+                - NVIDIA-RTX-6000-Ada-Generation
+                - NVIDIA-A10
+                - NVIDIA-A30
+                - NVIDIA-L4
+
+      containers:
+        - name: eval
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "==========================================================="
+              echo "Stage-1 reproduction + base-Qwen2.5-3B-Instruct contrast"
+              echo "==========================================================="
+              date -u +"start_utc=%Y-%m-%dT%H:%M:%SZ"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              source /opt/venv/bin/activate
+
+              pip install --upgrade pip
+              pip install torch --index-url https://download.pytorch.org/whl/cu121
+              pip install "transformers>=4.51.0" accelerate "lm-eval==0.4.11" numpy
+
+              echo
+              echo "=== Pinned versions (record these in any report) ==="
+              python -c "import torch; print(f'torch={torch.__version__} cuda={torch.cuda.is_available()}')"
+              python -c "import transformers; print(f'transformers={transformers.__version__}')"
+              python -c "import lm_eval; print(f'lm_eval={lm_eval.__version__}')"
+
+              mkdir -p /workspace/results
+              cd /workspace
+
+              cat > run_repro.py << 'PYTHON_SCRIPT'
+              import json, os, subprocess, sys, time
+              from datetime import datetime, timezone
+
+              MODELS = [
+                  ("Ours (Stage-1 3B)",        "Arjunvad/unified-model-stage1-action-tokens-v2", "ours_stage1"),
+                  ("Ours (Stage-1.5 3B)",      "Arjunvad/unified-model-stage1-5-embedding-v2",   "ours_stage1_5"),
+                  ("Base Qwen2.5-3B-Instruct", "Qwen/Qwen2.5-3B-Instruct",                       "base_qwen3b_instruct"),
+              ]
+              # 4 cheap tasks the report has numbers for. MMLU intentionally
+              # omitted (separate job — too expensive for first GPU run).
+              TASKS = "arc_easy,arc_challenge,hellaswag,winogrande"
+              SEED = 42
+              RESULTS_DIR = "/workspace/results"
+
+              # ============================================================
+              # lm-eval 0.4.11 result helpers (parser bug fix from earlier run)
+              #
+              # Three things to handle:
+              #   1. lm-eval saves results_<TIMESTAMP>.json under
+              #      <output_path>/<model_id_with_slashes_replaced>/
+              #      and --log_samples adds per-task .jsonl files alongside.
+              #      Old parser walked ALL results-prefixed files and didn't
+              #      pin to the newest run -> stale data on re-runs.
+              #   2. lm-eval 0.4.x metric keys include the filter, e.g.
+              #      "acc_norm,none" not "acc_norm". Old parser asked for
+              #      "acc_norm" and got None.
+              #   3. Need to ignore .jsonl sample files even though some
+              #      lm-eval versions name them with "results" prefix.
+              # ============================================================
+
+              def is_results_file(fname):
+                  return fname.startswith("results") and fname.endswith(".json") and not fname.endswith(".jsonl")
+
+              def find_latest_results_file(results_root, min_mtime=None):
+                  candidates = []
+                  for root, _dirs, files in os.walk(results_root):
+                      for fname in files:
+                          if not is_results_file(fname):
+                              continue
+                          fpath = os.path.join(root, fname)
+                          try:
+                              mtime = os.path.getmtime(fpath)
+                          except OSError as e:
+                              print(f"  stat error {fpath}: {e}")
+                              continue
+                          if min_mtime is not None and mtime < min_mtime:
+                              continue
+                          candidates.append((mtime, fpath))
+                  if not candidates:
+                      return None
+                  candidates.sort()
+                  return candidates[-1][1]
+
+              def flatten_metric_keys(task_data):
+                  # lm-eval 0.4.x stores metrics as "<name>,<filter>". Mirror
+                  # bare keys ("acc_norm" -> the value at "acc_norm,none") so
+                  # downstream callers can ask for the report-style name.
+                  flat = dict(task_data)
+                  for raw_key, value in task_data.items():
+                      if isinstance(raw_key, str) and "," in raw_key:
+                          base_key, filter_name = raw_key.split(",", 1)
+                          if filter_name == "none" or base_key not in flat:
+                              flat[base_key] = value
+                  return flat
+
+              def metric_value(task_data, metric):
+                  if metric in task_data:
+                      return task_data[metric]
+                  none_key = f"{metric},none"
+                  if none_key in task_data:
+                      return task_data[none_key]
+                  for key, value in task_data.items():
+                      if isinstance(key, str) and key.split(",", 1)[0] == metric:
+                          return value
+                  return None
+
+              # Targets from BENCHMARK_REPORT.md sections 1 + 3.
+              REPORT_STAGE1 = {
+                  "arc_easy":      ("acc_norm", 0.6010),
+                  "arc_challenge": ("acc_norm", 0.3985),
+                  "hellaswag":     ("acc_norm", 0.6110),
+                  "winogrande":    ("acc",      0.5706),
+              }
+              REPORT_STAGE1_5 = {
+                  "arc_easy":      ("acc_norm", 0.4253),
+                  "arc_challenge": ("acc_norm", 0.3029),
+                  "hellaswag":     ("acc_norm", 0.4022),
+                  "winogrande":    ("acc",      0.5451),
+              }
+              REPORT_BASE_QWEN = {
+                  "arc_easy":      ("acc_norm", 0.7306),
+                  "arc_challenge": ("acc_norm", 0.4787),
+                  "hellaswag":     ("acc_norm", 0.7289),
+                  "winogrande":    ("acc",      0.6935),
+              }
+
+              all_results = {}
+              t0 = time.time()
+
+              for display_name, model_id, key in MODELS:
+                  print("\n" + "=" * 70)
+                  print(f"EVAL: {display_name} ({model_id})")
+                  print("=" * 70)
+                  model_dir = os.path.join(RESULTS_DIR, key)
+                  os.makedirs(model_dir, exist_ok=True)
+
+                  cmd = [
+                      sys.executable, "-m", "lm_eval",
+                      "--model", "hf",
+                      "--model_args", f"pretrained={model_id},trust_remote_code=True,dtype=bfloat16",
+                      "--tasks", TASKS,
+                      "--seed", str(SEED),
+                      "--batch_size", "auto",
+                      "--output_path", model_dir,
+                      "--log_samples",
+                  ]
+                  print("CMD: " + " ".join(cmd))
+                  eval_started = time.time()
+                  result = subprocess.run(cmd, capture_output=False, text=True)
+                  if result.returncode != 0:
+                      print(f"  ERROR: {display_name} returned {result.returncode}")
+
+                  # Parse the newest fresh lm-eval result file. With
+                  # --output_path model_dir, lm-eval 0.4.11 writes under:
+                  #   model_dir/<model_id_with_slashes_replaced>/results_<TIMESTAMP>.json
+                  # plus per-task .jsonl sample files (--log_samples) alongside.
+                  model_results = {}
+                  results_file = find_latest_results_file(model_dir, min_mtime=eval_started - 1.0)
+                  if results_file is None:
+                      print(f"  no fresh results_*.json found under {model_dir}")
+                  else:
+                      print(f"  Found results file: {results_file}")
+                      try:
+                          with open(results_file) as f:
+                              data = json.load(f)
+                          for tname, tdata in data.get("results", {}).items():
+                              model_results[tname] = flatten_metric_keys(tdata)
+                      except Exception as e:
+                          print(f"  parse error {results_file}: {e}")
+                  all_results[key] = {
+                      "display_name": display_name,
+                      "model_id": model_id,
+                      "tasks": model_results,
+                  }
+                  print(f"  parsed {len(model_results)} task results")
+
+              # ============================================================
+              # Print comparison + reproduction-delta table
+              # ============================================================
+              print("\n" + "=" * 110)
+              print("REPRODUCTION TABLE -- repro vs BENCHMARK_REPORT.md")
+              print("=" * 110)
+              header = (f"{'Task':<14}{'Metric':<9}"
+                        f"{'Stage1 repro':<13}{'S1 report':<11}{'Δ':<8}"
+                        f"{'Stage1.5 repro':<15}{'S1.5 report':<12}{'Δ':<8}"
+                        f"{'BaseQwen3B repro':<17}{'Base report':<11}")
+              print(header)
+              print("-" * len(header))
+
+              def get(model_key, task_substr, metric):
+                  for tname, tdata in all_results.get(model_key, {}).get("tasks", {}).items():
+                      if task_substr in tname.lower():
+                          return metric_value(tdata, metric)
+                  return None
+
+              def fmt(v):
+                  return f"{v:.4f}" if v is not None else "N/A"
+
+              def delta(repro, target):
+                  if repro is None:
+                      return "N/A"
+                  return f"{(repro - target):+.4f}"
+
+              for task_key, (metric, _) in REPORT_STAGE1.items():
+                  s1 = get("ours_stage1", task_key, metric)
+                  s15 = get("ours_stage1_5", task_key, metric)
+                  base = get("base_qwen3b_instruct", task_key, metric)
+                  s1_t = REPORT_STAGE1[task_key][1]
+                  s15_t = REPORT_STAGE1_5[task_key][1]
+                  base_t = REPORT_BASE_QWEN[task_key][1]
+                  print(f"{task_key:<14}{metric:<9}"
+                        f"{fmt(s1):<13}{s1_t:<11.4f}{delta(s1, s1_t):<8}"
+                        f"{fmt(s15):<15}{s15_t:<12.4f}{delta(s15, s15_t):<8}"
+                        f"{fmt(base):<17}{base_t:<11.4f}")
+
+              # Headline catastrophic-forgetting check
+              print()
+              print("Catastrophic forgetting check (Stage 1 -> Stage 1.5 generation drop):")
+              s1_avg, s15_avg, n = 0.0, 0.0, 0
+              for task_key, (metric, _) in REPORT_STAGE1.items():
+                  s1 = get("ours_stage1", task_key, metric)
+                  s15 = get("ours_stage1_5", task_key, metric)
+                  if s1 is not None and s15 is not None:
+                      s1_avg += s1
+                      s15_avg += s15
+                      n += 1
+              if n:
+                  s1_avg /= n
+                  s15_avg /= n
+                  pct = 100.0 * (s15_avg - s1_avg) / s1_avg if s1_avg else 0.0
+                  print(f"  Stage 1 4-task avg:  {s1_avg:.4f}")
+                  print(f"  Stage 1.5 4-task avg: {s15_avg:.4f}")
+                  print(f"  Delta: {pct:+.1f}%   (BENCHMARK_REPORT.md headline: ~ -22% across 5 tasks)")
+
+              # ============================================================
+              # Save structured JSON for downstream consumption
+              # ============================================================
+              summary = {
+                  "kind": "reproduction_run",
+                  "purpose": "Reproduce Stage-1 + Stage-1.5 + base-Qwen3B-Inst generation cells from BENCHMARK_REPORT.md.",
+                  "started_utc": datetime.fromtimestamp(t0, tz=timezone.utc).isoformat(),
+                  "finished_utc": datetime.now(timezone.utc).isoformat(),
+                  "wall_seconds": round(time.time() - t0, 1),
+                  "config": {
+                      "tasks": TASKS,
+                      "seed": SEED,
+                      "dtype": "bfloat16",
+                      "batch_size": "auto",
+                      "apply_chat_template": False,
+                      "lm_eval_version": __import__("lm_eval").__version__,
+                      "transformers_version": __import__("transformers").__version__,
+                      "torch_version": __import__("torch").__version__,
+                      "cuda_available": __import__("torch").cuda.is_available(),
+                  },
+                  "report_targets": {
+                      "stage1": REPORT_STAGE1,
+                      "stage1_5": REPORT_STAGE1_5,
+                      "base_qwen3b_instruct": REPORT_BASE_QWEN,
+                  },
+                  "models": all_results,
+              }
+              out = os.path.join(RESULTS_DIR, "reproduction_summary.json")
+              with open(out, "w") as f:
+                  json.dump(summary, f, indent=2, default=str)
+              print(f"\nWrote {out}")
+              print("=" * 100)
+              PYTHON_SCRIPT
+
+              python run_repro.py
+
+              date -u +"end_utc=%Y-%m-%dT%H:%M:%SZ"
+              echo "Done. Results in /workspace/results. ttlSecondsAfterFinished will clean up the job; copy results out via kubectl cp before that fires."
+
+          resources:
+            # limit/request ratio must be <= 1.2x per Nautilus admission policy
+            requests:
+              memory: "32Gi"
+              cpu: "4"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "38Gi"
+              cpu: "4800m"
+              nvidia.com/gpu: "1"
+
+          env:
+            - name: JOB_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: "metadata.labels['batch.kubernetes.io/job-name']"
+            - name: HF_HOME
+              value: "/tmp/hf_cache"
+            - name: TRANSFORMERS_CACHE
+              value: "/tmp/hf_cache"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+          # Persist /workspace/results to the shared CephFS PVC under a per-job
+          # subdirectory. Container code keeps writing to /workspace/results;
+          # subPathExpr maps that to <PVC>/<JOB_NAME>/ so concurrent eval Jobs
+          # don't collide. Survives pod deletion -- no more lost-results.
+          volumeMounts:
+            - name: results
+              mountPath: /workspace/results
+              subPathExpr: "$(JOB_NAME)"
+
+      volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: unified-model-data-vol
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule

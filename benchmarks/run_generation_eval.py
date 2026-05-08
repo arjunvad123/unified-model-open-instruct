@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-Generation Quality Evaluation for Unified Agentic Model
+Generation Quality Smoke Test for Unified Agentic Model.
 
-Tests generation capabilities:
-1. Action Token Routing Accuracy
-2. Basic QA Quality
-3. Code Generation
-4. Math Problem Solving
+This is a SMOKE TEST, not a research-grade benchmark. It runs a tiny
+hand-written prompt set against the model and checks substring / action-token
+hits. Use it to catch regressions during development; for credible numbers run
+the lm-evaluation-harness benchmarks reported in baseline_benchmark_report.md.
+
+Tests:
+1. Action token routing (does the model emit the expected trained tokens?)
+2. Basic QA (substring match against gold keywords)
+3. Math (substring match against gold answer)
+4. Code generation (keyword presence heuristic)
 
 Usage:
     python benchmarks/run_generation_eval.py
@@ -16,11 +21,21 @@ Usage:
 import argparse
 import json
 import os
-import re
-from datetime import datetime
-from typing import List, Dict, Tuple
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List
 
 import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from open_instruct.action_tokens import ACTION_TOKENS, ROUTING_TOKENS  # noqa: E402
+
+SCRIPT_VERSION = "2026-05-03-smoke-v2"
 
 
 class GenerationModel:
@@ -37,12 +52,10 @@ class GenerationModel:
         # Load tokenizer
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        except:
+        except Exception:
             print("Loading tokenizer from base Qwen...")
             self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B-Instruct", trust_remote_code=True)
-            self.tokenizer.add_special_tokens({
-                "additional_special_tokens": ["<ACT:GEN>", "<ACT:RET>", "<ACT:TOOL>", "<ACT:CODE>"]
-            })
+            self.tokenizer.add_special_tokens({"additional_special_tokens": ACTION_TOKENS})
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -76,82 +89,121 @@ class GenerationModel:
         return response.strip()
 
 
+def _first_routing_token(response: str) -> str | None:
+    """Return the earliest routing token (THINK/RET/GEN/STOP) found in the response."""
+    earliest_idx = None
+    earliest_token = None
+    for token in ROUTING_TOKENS:
+        idx = response.find(token)
+        if idx == -1:
+            continue
+        if earliest_idx is None or idx < earliest_idx:
+            earliest_idx = idx
+            earliest_token = token
+    return earliest_token
+
+
 def eval_action_token_routing(model: GenerationModel) -> Dict:
-    """Evaluate action token routing accuracy."""
-    print("\n" + "="*60)
-    print("ACTION TOKEN ROUTING EVALUATION")
-    print("="*60)
+    """Smoke-test action token routing.
 
-    test_cases = [
-        # GEN queries
-        ("What is machine learning?", "<ACT:GEN>"),
-        ("Explain the concept of recursion", "<ACT:GEN>"),
-        ("What are the benefits of exercise?", "<ACT:GEN>"),
-        ("How does photosynthesis work?", "<ACT:GEN>"),
+    Trained tokens (per open_instruct.action_tokens) are
+    THINK/RET/GEN/STOP/WAIT/RET_RESULT. Synthetic trajectories teach two
+    routes:
+      - direct:    <ACT:THINK> ... <ACT:GEN> ... <ACT:STOP>
+      - retrieval: <ACT:THINK> ... <ACT:RET> ... <ACT:GEN> ... <ACT:STOP>
 
-        # RET queries
-        ("Find information about RLHF", "<ACT:RET>"),
-        ("Search for how transformers use attention", "<ACT:RET>"),
-        ("Look up the latest news about AI", "<ACT:RET>"),
-        ("Find documents about climate change", "<ACT:RET>"),
+    For each query we record the first routing token emitted and whether the
+    response contains GEN (any path) and RET (only on retrieval-style queries).
+    There is no TOOL/CODE route in training; do not test for those tokens.
+    """
+    print("\n" + "=" * 60)
+    print("ACTION TOKEN ROUTING SMOKE TEST")
+    print("=" * 60)
 
-        # TOOL queries
-        ("What's the weather in San Francisco?", "<ACT:TOOL>"),
-        ("Calculate 1234 * 5678", "<ACT:TOOL>"),
-        ("What time is it in Tokyo?", "<ACT:TOOL>"),
-        ("Convert 100 USD to EUR", "<ACT:TOOL>"),
-
-        # CODE queries
-        ("Write a Python function to check if a number is prime", "<ACT:CODE>"),
-        ("Implement a binary search algorithm", "<ACT:CODE>"),
-        ("Create a function to reverse a linked list", "<ACT:CODE>"),
-        ("Write code to sort a list using quicksort", "<ACT:CODE>"),
+    # category -> list of prompts. "direct" expects THINK->GEN, "retrieval"
+    # expects THINK->RET->GEN.
+    test_cases: List[Dict] = [
+        {"prompt": "What is machine learning?", "category": "direct"},
+        {"prompt": "Explain the concept of recursion", "category": "direct"},
+        {"prompt": "What are the benefits of exercise?", "category": "direct"},
+        {"prompt": "How does photosynthesis work?", "category": "direct"},
+        {"prompt": "Find information about RLHF", "category": "retrieval"},
+        {"prompt": "Search for how transformers use attention", "category": "retrieval"},
+        {"prompt": "Look up the latest news about AI", "category": "retrieval"},
+        {"prompt": "Find documents about climate change", "category": "retrieval"},
     ]
 
-    results_by_type = {"<ACT:GEN>": [], "<ACT:RET>": [], "<ACT:TOOL>": [], "<ACT:CODE>": []}
-    correct = 0
-    total = 0
+    per_query: List[Dict] = []
+    counters = {
+        "any_routing_token_emitted": 0,
+        "starts_with_think": 0,
+        "contains_gen": 0,
+        "direct_correct": 0,
+        "retrieval_correct": 0,
+    }
+    direct_total = sum(1 for c in test_cases if c["category"] == "direct")
+    retrieval_total = len(test_cases) - direct_total
 
-    for query, expected in test_cases:
-        response = model.generate(query, max_new_tokens=50)
+    for case in test_cases:
+        prompt = case["prompt"]
+        category = case["category"]
+        response = model.generate(prompt, max_new_tokens=80)
 
-        # Extract action token from response
-        detected = None
-        for token in ["<ACT:GEN>", "<ACT:RET>", "<ACT:TOOL>", "<ACT:CODE>"]:
-            if token in response:
-                detected = token
-                break
+        first = _first_routing_token(response)
+        contains_ret = "<ACT:RET>" in response
+        contains_gen = "<ACT:GEN>" in response
+        starts_with_think = first == "<ACT:THINK>"
 
-        is_correct = detected == expected
-        if is_correct:
-            correct += 1
-        total += 1
+        if first is not None:
+            counters["any_routing_token_emitted"] += 1
+        if starts_with_think:
+            counters["starts_with_think"] += 1
+        if contains_gen:
+            counters["contains_gen"] += 1
 
-        results_by_type[expected].append(is_correct)
+        if category == "direct":
+            # Direct path: GEN reached, RET was not used
+            correct = contains_gen and not contains_ret
+            if correct:
+                counters["direct_correct"] += 1
+        else:
+            # Retrieval path: RET used and GEN reached
+            correct = contains_ret and contains_gen
+            if correct:
+                counters["retrieval_correct"] += 1
 
-        print(f"  Query: {query[:40]}...")
-        print(f"    Expected: {expected}, Detected: {detected}, Correct: {is_correct}")
+        per_query.append({
+            "prompt": prompt,
+            "category": category,
+            "first_routing_token": first,
+            "contains_ret": contains_ret,
+            "contains_gen": contains_gen,
+            "starts_with_think": starts_with_think,
+            "category_correct": correct,
+        })
 
-    # Compute per-type accuracy
-    type_accuracy = {}
-    for action_type, results in results_by_type.items():
-        if results:
-            type_accuracy[action_type] = sum(results) / len(results)
+        print(f"  [{category}] {prompt[:50]}")
+        print(f"    first={first} ret={contains_ret} gen={contains_gen} ok={correct}")
 
-    overall_accuracy = correct / total if total > 0 else 0
-
+    total = len(test_cases)
     results = {
-        "task": "ActionTokenRouting",
-        "overall_accuracy": float(overall_accuracy),
-        "type_accuracy": type_accuracy,
-        "correct": correct,
+        "task": "ActionTokenRoutingSmoke",
+        "trained_routing_tokens": ROUTING_TOKENS,
         "total": total,
+        "fraction_emitted_any_routing_token": counters["any_routing_token_emitted"] / total,
+        "fraction_starts_with_think": counters["starts_with_think"] / total,
+        "fraction_contains_gen": counters["contains_gen"] / total,
+        "direct_path_accuracy": counters["direct_correct"] / direct_total if direct_total else 0.0,
+        "retrieval_path_accuracy": counters["retrieval_correct"] / retrieval_total if retrieval_total else 0.0,
+        "per_query": per_query,
     }
 
-    print(f"\nResults:")
-    print(f"  Overall Accuracy: {overall_accuracy:.4f} ({correct}/{total})")
-    for action_type, acc in type_accuracy.items():
-        print(f"  {action_type}: {acc:.4f}")
+    print("\nResults:")
+    print(f"  emitted any routing token: {results['fraction_emitted_any_routing_token']:.2%}")
+    print(f"  starts with <ACT:THINK>:   {results['fraction_starts_with_think']:.2%}")
+    print(f"  contains <ACT:GEN>:        {results['fraction_contains_gen']:.2%}")
+    print(f"  direct path accuracy:      {results['direct_path_accuracy']:.2%}")
+    print(f"  retrieval path accuracy:   {results['retrieval_path_accuracy']:.2%}")
 
     return results
 
@@ -325,8 +377,35 @@ def eval_code_generation(model: GenerationModel) -> Dict:
     return results
 
 
+def _git_commit() -> str | None:
+    """Best-effort current git commit for run provenance."""
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(REPO_ROOT),
+            stderr=subprocess.DEVNULL,
+        )
+        return out.decode().strip()
+    except Exception:
+        return None
+
+
+def _run_metadata(model_name: str) -> Dict:
+    """Reproducibility metadata embedded in every result dict."""
+    return {
+        "model": model_name,
+        "script": "benchmarks/run_generation_eval.py",
+        "script_version": SCRIPT_VERSION,
+        "kind": "smoke_test",
+        "git_commit": _git_commit(),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "torch_version": torch.__version__,
+        "trained_action_tokens": ACTION_TOKENS,
+    }
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Generation quality evaluation")
+    parser = argparse.ArgumentParser(description="Generation quality smoke test")
 
     parser.add_argument(
         "--model",
@@ -348,24 +427,24 @@ def main():
 
     args = parser.parse_args()
 
-    print("="*60)
-    print("GENERATION QUALITY EVALUATION")
-    print("="*60)
+    print("=" * 60)
+    print("GENERATION QUALITY SMOKE TEST")
+    print("(NOT a research benchmark — see baseline_benchmark_report.md)")
+    print("=" * 60)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     all_results = {}
 
     # Evaluate unified model
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"EVALUATING: {args.model}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     model = GenerationModel(args.model)
 
     results = {
-        "model": args.model,
-        "timestamp": datetime.now().isoformat(),
+        **_run_metadata(args.model),
         "tasks": {},
     }
 
@@ -383,19 +462,18 @@ def main():
 
     # Optionally compare with base
     if args.compare_base:
-        print(f"\n{'='*60}")
-        print(f"EVALUATING BASELINE: Qwen/Qwen2.5-3B-Instruct")
-        print(f"{'='*60}")
+        print(f"\n{'=' * 60}")
+        print("EVALUATING BASELINE: Qwen/Qwen2.5-3B-Instruct")
+        print(f"{'=' * 60}")
 
         base_model = GenerationModel("Qwen/Qwen2.5-3B-Instruct")
 
         base_results = {
-            "model": "Qwen/Qwen2.5-3B-Instruct",
-            "timestamp": datetime.now().isoformat(),
+            **_run_metadata("Qwen/Qwen2.5-3B-Instruct"),
             "tasks": {},
         }
 
-        # Base model won't have action tokens, so skip that test
+        # Base model wasn't trained on action tokens, so skip that test
         base_results["tasks"]["qa"] = eval_qa_quality(base_model)
         base_results["tasks"]["math"] = eval_math(base_model)
         base_results["tasks"]["code"] = eval_code_generation(base_model)
@@ -407,16 +485,21 @@ def main():
             json.dump(base_results, f, indent=2)
 
     # Print summary
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("SUMMARY")
-    print("="*60)
+    print("=" * 60)
 
     for model_name, res in all_results.items():
         print(f"\n{model_name}:")
         tasks = res["tasks"]
 
         if "action_routing" in tasks:
-            print(f"  Action Routing: {tasks['action_routing']['overall_accuracy']:.4f}")
+            ar = tasks["action_routing"]
+            print(
+                f"  Action Routing: direct={ar['direct_path_accuracy']:.2%}"
+                f" retrieval={ar['retrieval_path_accuracy']:.2%}"
+                f" any_routing_token={ar['fraction_emitted_any_routing_token']:.2%}"
+            )
 
         if "qa" in tasks:
             print(f"  QA Accuracy: {tasks['qa']['accuracy']:.4f}")

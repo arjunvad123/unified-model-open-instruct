@@ -134,7 +134,7 @@
 ### Strengths
 1. **Strong MMLU performance** (0.6269) — beats models 2-4x larger (Mistral-7B, Phi-2)
 2. **Unified architecture** — single model handles both generation and embedding tasks
-3. **Action token routing** — 81% routing accuracy enables task switching
+3. **Action token routing** — eval pending; the original harness tested untrained `<ACT:TOOL>`/`<ACT:CODE>` tokens. Trained set is THINK/RET/GEN/STOP/WAIT/RET_RESULT (see `open_instruct/action_tokens.py`). Reproducible routing number to be added after re-running the corrected `benchmarks/inference-scripts/03_action_token_routing.py`.
 
 ### Weaknesses
 1. **Embedding quality is the primary bottleneck** — 2.4x worse than specialized models
@@ -157,7 +157,7 @@
 
 ### Frameworks
 - Embedding: Custom MTEB retrieval evaluation (mean pooling + cosine similarity)
-- Generation: lm-evaluation-harness v0.4+ (0-shot for core tasks, 5-shot for MMLU)
+- Generation: lm-evaluation-harness `0.4.11` (0-shot for core tasks, 5-shot for MMLU). The original report wrote "v0.4+" but did not pin a specific version; `0.4.11` is the version under which an independent reproduction succeeded — see `benchmarks/REPRODUCTION_RESULTS.md`. Any small per-cell delta (e.g. base-Qwen2.5-3B-Instruct HellaSwag acc_norm 0.7499 vs 0.7289) is consistent with metric implementation drift across v0.4.x patch versions and/or chat-template handling.
 - All models loaded in bfloat16
 
 ### Models Evaluated

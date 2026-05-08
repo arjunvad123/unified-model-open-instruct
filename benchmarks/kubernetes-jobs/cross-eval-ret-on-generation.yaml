@@ -1,0 +1,276 @@
+# Cross-Task Eval: Retrieval/Embedding Models on Generation (lm-eval)
+#
+# Tests whether embedding-tuned models retain generation ability.
+# Validates our Stage 1.5 catastrophic forgetting finding.
+#
+# Models:
+#   1. Qwen/Qwen3-Embedding-0.6B  (embedding-tuned)
+#   2. Qwen/Qwen3-Embedding-4B    (embedding-tuned)
+#   3. Qwen/Qwen3-4B              (base gen model, same size as Qwen3-Emb-4B)
+#
+# Deploy: kubectl apply -f cross-eval-ret-on-generation.yaml -n svcl-self-improve
+# Logs:   kubectl logs job/cross-ret-generation -n svcl-self-improve -f
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cross-ret-generation
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: 28800  # 8 hours max (3 models × 5 lm-eval tasks)
+  template:
+    spec:
+      restartPolicy: Never
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A100-80GB-PCIe
+                - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-A100-SXM4-40GB
+                - NVIDIA-L40S
+                - NVIDIA-L40
+                - NVIDIA-RTX-A6000
+                - NVIDIA-RTX-A5000
+                - NVIDIA-A40
+                - NVIDIA-GeForce-RTX-4090
+                - NVIDIA-GeForce-RTX-3090
+                - NVIDIA-A10
+
+      containers:
+        - name: eval
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              echo "==========================================================="
+              echo "CROSS-TASK: Retrieval Models on Generation (lm-eval)"
+              echo "==========================================================="
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              export PATH="/opt/venv/bin:$PATH"
+              pip install --no-cache-dir torch transformers accelerate lm-eval numpy huggingface_hub
+
+              export HF_TOKEN="${HF_TOKEN}"
+
+              RESULTS="/results/cross_eval"
+              mkdir -p $RESULTS
+
+              CORE_TASKS="arc_easy,arc_challenge,hellaswag,winogrande"
+
+              # ============================================================
+              # Model 1: Qwen3-Embedding-0.6B
+              # ============================================================
+              echo ""
+              echo "==========================================================="
+              echo "MODEL 1: Qwen/Qwen3-Embedding-0.6B (embedding-tuned)"
+              echo "==========================================================="
+              python3 -m lm_eval \
+                --model hf \
+                --model_args "pretrained=Qwen/Qwen3-Embedding-0.6B,trust_remote_code=True,dtype=bfloat16" \
+                --tasks $CORE_TASKS \
+                --batch_size auto \
+                --output_path $RESULTS/qwen3_emb_06 || echo "Core tasks FAILED for Qwen3-Embedding-0.6B"
+
+              python3 -m lm_eval \
+                --model hf \
+                --model_args "pretrained=Qwen/Qwen3-Embedding-0.6B,trust_remote_code=True,dtype=bfloat16" \
+                --tasks mmlu \
+                --num_fewshot 5 \
+                --batch_size auto \
+                --output_path $RESULTS/qwen3_emb_06 || echo "MMLU FAILED for Qwen3-Embedding-0.6B"
+
+              # ============================================================
+              # Model 2: Qwen3-Embedding-4B
+              # ============================================================
+              echo ""
+              echo "==========================================================="
+              echo "MODEL 2: Qwen/Qwen3-Embedding-4B (embedding-tuned)"
+              echo "==========================================================="
+              python3 -m lm_eval \
+                --model hf \
+                --model_args "pretrained=Qwen/Qwen3-Embedding-4B,trust_remote_code=True,dtype=bfloat16" \
+                --tasks $CORE_TASKS \
+                --batch_size auto \
+                --output_path $RESULTS/qwen3_emb_4b || echo "Core tasks FAILED for Qwen3-Embedding-4B"
+
+              python3 -m lm_eval \
+                --model hf \
+                --model_args "pretrained=Qwen/Qwen3-Embedding-4B,trust_remote_code=True,dtype=bfloat16" \
+                --tasks mmlu \
+                --num_fewshot 5 \
+                --batch_size auto \
+                --output_path $RESULTS/qwen3_emb_4b || echo "MMLU FAILED for Qwen3-Embedding-4B"
+
+              # ============================================================
+              # Model 3: Qwen3-4B (generation base — same size as Emb-4B)
+              # ============================================================
+              echo ""
+              echo "==========================================================="
+              echo "MODEL 3: Qwen/Qwen3-4B (base gen model, reference)"
+              echo "==========================================================="
+              python3 -m lm_eval \
+                --model hf \
+                --model_args "pretrained=Qwen/Qwen3-4B,trust_remote_code=True,dtype=bfloat16" \
+                --tasks $CORE_TASKS \
+                --batch_size auto \
+                --output_path $RESULTS/qwen3_4b_gen || echo "Core tasks FAILED for Qwen3-4B"
+
+              python3 -m lm_eval \
+                --model hf \
+                --model_args "pretrained=Qwen/Qwen3-4B,trust_remote_code=True,dtype=bfloat16" \
+                --tasks mmlu \
+                --num_fewshot 5 \
+                --batch_size auto \
+                --output_path $RESULTS/qwen3_4b_gen || echo "MMLU FAILED for Qwen3-4B"
+
+              # ============================================================
+              # Parse and compare all results
+              # ============================================================
+              cat > /tmp/parse_results.py << 'PARSESCRIPT'
+              import json, os, sys
+
+              RESULTS_DIR = "/results/cross_eval"
+              MODELS = [
+                  ("Qwen3-Emb-0.6B", "qwen3_emb_06"),
+                  ("Qwen3-Emb-4B", "qwen3_emb_4b"),
+                  ("Qwen3-4B (gen)", "qwen3_4b_gen"),
+              ]
+
+              KNOWN = {
+                  "Ours Stage 1":   {"arc_easy": 0.6010, "arc_challenge": 0.3985, "hellaswag": 0.6110, "winogrande": 0.5706, "mmlu": 0.6269},
+                  "Ours Stage 1.5": {"arc_easy": 0.4253, "arc_challenge": 0.3029, "hellaswag": 0.4022, "winogrande": 0.5451, "mmlu": 0.5148},
+                  "Qwen2.5-3B-Inst":{"arc_easy": 0.7306, "arc_challenge": 0.4787, "hellaswag": 0.7289, "winogrande": 0.6935, "mmlu": 0.6835},
+              }
+
+              TASK_MAP = [
+                  ("arc_easy", "acc_norm", "ARC-Easy"),
+                  ("arc_challenge", "acc_norm", "ARC-Challenge"),
+                  ("hellaswag", "acc_norm", "HellaSwag"),
+                  ("winogrande", "acc", "Winogrande"),
+                  ("mmlu", "acc", "MMLU (5-shot)"),
+              ]
+
+              all_parsed = {}
+              for name, key in MODELS:
+                  model_dir = os.path.join(RESULTS_DIR, key)
+                  parsed = {}
+                  if os.path.exists(model_dir):
+                      for root, dirs, files in os.walk(model_dir):
+                          for fname in sorted(files):
+                              if fname.startswith("results") and fname.endswith(".json"):
+                                  try:
+                                      with open(os.path.join(root, fname)) as f:
+                                          data = json.load(f)
+                                      if "results" in data:
+                                          for tname, tdata in data["results"].items():
+                                              flat = {}
+                                              for mk, mv in tdata.items():
+                                                  flat[mk.split(",")[0] if "," in mk else mk] = mv
+                                              parsed[tname] = flat
+                                  except Exception:
+                                      pass
+                  all_parsed[name] = parsed
+
+              print("\n" + "=" * 140)
+              print("CROSS-TASK: Retrieval Models on Generation")
+              print("=" * 140)
+
+              all_keys = [n for n, _ in MODELS] + list(KNOWN.keys())
+              header = f"{'Task':<18}" + "".join(f"{k[:18]:<20}" for k in all_keys)
+              print(f"\n{header}")
+              print("-" * len(header))
+
+              avgs = {k: [] for k in all_keys}
+              for task_key, metric, label in TASK_MAP:
+                  row = f"{label:<18}"
+                  for k in all_keys:
+                      if k in all_parsed:
+                          found = False
+                          for tname, tdata in all_parsed[k].items():
+                              if task_key in tname.lower():
+                                  val = tdata.get(metric, tdata.get("acc", None))
+                                  if val is not None:
+                                      row += f"{val:<20.4f}"; avgs[k].append(val); found = True; break
+                          if not found:
+                              row += f"{'FAILED':<20}"
+                      elif k in KNOWN:
+                          val = KNOWN[k].get(task_key)
+                          if val: row += f"{val:<20.4f}"; avgs[k].append(val)
+                          else: row += f"{'N/A':<20}"
+                  print(row)
+
+              print("-" * len(header))
+              row = f"{'AVERAGE':<18}"
+              for k in all_keys:
+                  if avgs[k]:
+                      row += f"{sum(avgs[k])/len(avgs[k]):<20.4f}"
+                  else:
+                      row += f"{'N/A':<20}"
+              print(row)
+
+              # Key comparison
+              print("\n" + "=" * 140)
+              print("KEY FINDING: Does embedding tuning destroy generation?")
+              print("=" * 140)
+              gen_4b = avgs.get("Qwen3-4B (gen)", [])
+              emb_4b = avgs.get("Qwen3-Emb-4B", [])
+              if gen_4b and emb_4b:
+                  g = sum(gen_4b)/len(gen_4b)
+                  e = sum(emb_4b)/len(emb_4b)
+                  d = ((e-g)/g)*100
+                  print(f"  Qwen3-4B (gen):       {g:.4f}")
+                  print(f"  Qwen3-Embedding-4B:   {e:.4f}")
+                  print(f"  Delta:                {d:+.1f}%")
+                  if d < -10:
+                      print("  >>> CONFIRMS catastrophic forgetting in embedding tuning")
+                  else:
+                      print("  >>> Embedding tuning preserved generation (different from our result)")
+
+              our_d = ((0.4381-0.5616)/0.5616)*100
+              print(f"\n  Our Stage 1→1.5:      {our_d:+.1f}%")
+              print("  If Qwen3 shows similar drop, the forgetting is EXPECTED, not a bug")
+              print("=" * 140)
+
+              with open(os.path.join(RESULTS_DIR, "ret_on_generation_summary.json"), "w") as f:
+                  json.dump({"parsed": {k: avgs.get(k, []) for k in all_keys}}, f, indent=2)
+              PARSESCRIPT
+
+              python3 /tmp/parse_results.py
+
+              echo ""
+              echo "==========================================================="
+              echo "CROSS-TASK EVAL COMPLETE"
+              echo "==========================================================="
+
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: "24Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"
