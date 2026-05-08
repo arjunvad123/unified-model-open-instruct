@@ -57,7 +57,7 @@ Framework: Custom MTEB Retrieval | Benchmarks: NFCorpus, SciFact, ArguAna, SCIDO
 |------------|---------|-----------|--------|
 | Generation (avg 5 tasks) | 0.5616 | 0.4381 | **-22%** |
 | Embedding (NDCG@10 avg) | 0.1810 | 0.2370 | **+31%** |
-| Action Routing | 81% | degraded | **regressed** |
+| Action Routing | eval pending | degraded | **harness needs revalidation** |
 
 Contrastive training improved embeddings but degraded generation — the core research challenge.
 
@@ -258,7 +258,7 @@ Our embedding method: Mean pooling over `output_hidden_states[-1]`, L2 normalize
 
 1. **MMLU is our strongest benchmark** (0.6269) — competitive with models 2-4x larger, beats Phi-2 and SmolLM2
 2. **Unified architecture works** — single model handles generation, embedding, and action token routing
-3. **Action token routing at 81% accuracy** — model correctly routes queries to GEN/RET/TOOL/CODE
+3. **Action token routing — eval pending.** Original harness tested untrained `<ACT:TOOL>`/`<ACT:CODE>` tokens; trained set is THINK/RET/GEN/STOP/WAIT/RET_RESULT (see `open_instruct/action_tokens.py`). Reproducible number to be added after re-running the corrected `benchmarks/inference-scripts/03_action_token_routing.py`
 4. **Contrastive training (Stage 1.5) improved embeddings +31%** — especially FiQA2018 (+801%)
 5. **But degraded generation -22%** — catastrophic forgetting from contrastive fine-tuning
 6. **Catastrophic forgetting is universal** — Qwen3-Embedding-4B loses -44.3% generation vs its base; our -22% is actually less severe

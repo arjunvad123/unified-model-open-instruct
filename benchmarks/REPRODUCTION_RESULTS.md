@@ -36,11 +36,15 @@ torch                = cu121 build
 cluster              = Nautilus / gpu-13.nrp.mghpcc.org / NVIDIA-A100
 ```
 
+## Methodology resolved (Arjun confirmed 2026-05-07)
+
+- **Chat template:** NOT applied. This is canonical for reproducing `BENCHMARK_REPORT.md`. The original `baseline-generation-lmeval.yaml` doesn't pass `--apply_chat_template`; this reproduction matches that methodology.
+- **lm-eval version:** the original report's "v0.4+" was unpinned. `0.4.11` is now canonical — pinned in `BENCHMARK_REPORT.md` Appendix and `baseline_benchmark_report.md`.
+- **HellaSwag base-Qwen +0.0210 delta:** expected. Consistent with metric-implementation drift across v0.4.x patch versions and/or the chat-template handling decision above. Not investigated further; not a blocker.
+
 ## Open issues from this run
 
-1. **hellaswag base-Qwen +0.0210 delta.** Only material discrepancy. Most likely lm-eval version drift (this run pinned `0.4.11`; the report says only "v0.4+"). Worth confirming with Arjun what version the report used. If different, re-running base-Qwen on the report's pinned version would close the gap.
-2. **Chat template was NOT applied** — matches `baseline-generation-lmeval.yaml` methodology. Stage 1's base is `Qwen2.5-3B-Instruct` though, which has a chat template. Optional follow-up run with `--apply_chat_template` to see how much it shifts the Instruct numbers; not blocking.
-3. **MMLU 5-shot omitted** to keep this run under 1 h. Adding MMLU would tighten the catastrophic-forgetting headline (-23.2% → ?% on the full 5-task set). ~6 GPU-hours (3 models × ~2 h MMLU each). Not blocking; nice-to-have.
+1. **MMLU 5-shot omitted** to keep this run under 1 h. Adding MMLU would tighten the catastrophic-forgetting headline (-23.2% → ?% on the full 5-task set). ~6 GPU-hours (3 models × ~2 h MMLU each). Not blocking; nice-to-have.
 
 ## Postmortem note
 

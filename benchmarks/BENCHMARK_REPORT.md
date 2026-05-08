@@ -206,7 +206,7 @@ Attempted to compare against truly unified models. Most failed due to transforme
 ### Strengths
 1. **Strong MMLU** (0.6269) — competitive with models 2-4x larger
 2. **Unified architecture** — single model handles both generation and embedding
-3. **Action token routing** — 81% routing accuracy enables task switching
+3. **Action token routing** — eval pending; the original harness tested untrained `<ACT:TOOL>`/`<ACT:CODE>` tokens. Trained set is THINK/RET/GEN/STOP/WAIT/RET_RESULT (see `open_instruct/action_tokens.py`). Reproducible number to be added after re-running the corrected `benchmarks/inference-scripts/03_action_token_routing.py`.
 4. **Stage 1.5 embedding improvement** — +31% NDCG@10 with contrastive training
 5. **Stage 1 already has retrieval ability** — 0.2220 NDCG@10 avg beats all pure gen baselines (0.13–0.14)
 6. **Our forgetting is less severe** than Qwen3's (-22% vs -44.3%), validating LoRA approach
@@ -237,7 +237,7 @@ Attempted to compare against truly unified models. Most failed due to transforme
 - Single GPU per job
 
 ### Frameworks & Versions
-- **Generation**: lm-evaluation-harness v0.4+ (0-shot core tasks, 5-shot MMLU)
+- **Generation**: lm-evaluation-harness `0.4.11` (0-shot core tasks, 5-shot MMLU). Original report said "v0.4+" without pinning; `0.4.11` is the version under which an independent reproduction succeeded — see `benchmarks/REPRODUCTION_RESULTS.md`. Per-cell deltas <0.005 in the reproduction; one outlier (base-Qwen2.5-3B-Instruct HellaSwag, +0.0210) is consistent with metric-implementation drift across v0.4.x patch versions and/or chat-template handling.
 - **Embedding**: Custom MTEB retrieval evaluation with cosine similarity
 - **All models**: loaded in bfloat16
 

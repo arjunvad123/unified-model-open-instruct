@@ -1,5 +1,12 @@
 # Joint Training: Stage 2 (GritLM-style bidirectional embedding + generation)
 #
+# *** STATUS: EXPERIMENTAL / UNVALIDATED ***
+# Last activity Apr 6 2026 (4D attention-mask fix). No checked-in evidence
+# the run trained to completion afterwards. Treat the design as work-in-
+# progress, not a landed result. Re-launching may surface additional
+# downstream errors from the Apr 4–6 debugging chain. Confirm with Arjun
+# before allocating compute.
+#
 # Key innovations over Stage 1.5 (sequential contrastive):
 #   1. Bidirectional attention for embedding (is_causal=False) — +5.5 MTEB per GritLM
 #   2. Joint training (alternating emb/gen/agentic batches) — zero forgetting

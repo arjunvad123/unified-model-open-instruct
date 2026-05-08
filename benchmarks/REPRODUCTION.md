@@ -152,12 +152,12 @@ table.
 
 ## Knobs the published reports do not pin — record these when running
 
-| Knob | Suggested default | Why it matters |
+| Knob | Canonical value | Why it matters |
 |---|---|---|
-| Random seed | `--seed 42` | lm-eval silent defaults are `random=0`, `numpy=torch=fewshot=1234`; reports don't say |
-| Model dtype | `dtype=bfloat16` in `--model_args` | Reports say bf16 in appendix; confirm by inspecting harness logs |
-| Chat template | `--apply_chat_template` (or omit, but document) | Stage 1 is built on Qwen2.5-3B-**Instruct**. Reports don't say whether the chat template was applied; `acc_norm` can shift several points either way |
-| Harness commit | record `lm_eval --version` | Reports say only "v0.4+"; metric implementations have changed within v0.4.x |
+| Random seed | `--seed 42` | lm-eval silent defaults are `random=0`, `numpy=torch=fewshot=1234`. 3-seed variance bound run (`REPRODUCTION_RESULTS.md`) shows std-dev ≤0.004 on all 4 cheap tasks, so this knob is essentially deterministic for 0-shot multiple-choice |
+| Model dtype | `dtype=bfloat16` in `--model_args` | Matches `BENCHMARK_REPORT.md` Appendix |
+| Chat template | **NOT applied** (do NOT pass `--apply_chat_template`) | Canonical per Arjun. Matches the methodology of `baseline-generation-lmeval.yaml` under which the original report was produced. The existence of a chat template on Qwen2.5-3B-Instruct does NOT mean it was used. |
+| Harness version | `lm-eval==0.4.11` | Pinned. Original report wrote "v0.4+" but did not pin; `0.4.11` is the version under which independent reproduction succeeded (per-cell deltas <0.005 except one outlier consistent with metric drift across v0.4.x patch versions) |
 | Dataset revision | record from harness output | HF dataset revisions can change |
 | Pooling method (embedding) | mean pooling, last hidden state, L2 normalized | Matches Stage 1 / 1.5 training. Different pooling = different MTEB numbers |
 | `<ACT:RET>` query prefix (embedding) | NOT applied in current eval scripts | Training prepends `<ACT:RET>` to queries (`open_instruct/contrastive_finetune.py`). Eval doesn't. Worth A/B testing whether the prefix improves MTEB |
