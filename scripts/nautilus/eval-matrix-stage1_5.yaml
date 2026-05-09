@@ -422,7 +422,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: hf-token
-                  key: HF_TOKEN
+                  key: token
           resources:
             requests:
               memory: 32Gi
