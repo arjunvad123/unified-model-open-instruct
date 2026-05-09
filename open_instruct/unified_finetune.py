@@ -1115,13 +1115,34 @@ def main():
                     all_query_emb = accelerator.gather(query_emb)
                     all_passage_emb = accelerator.gather(passage_emb)
 
-                    # Gather hard negatives across ranks too — otherwise each
-                    # rank optimizes a different loss (its local negatives only),
-                    # which destabilizes distributed training and weakens the
-                    # MEDI2 hard-negative signal. Fix per Codex review on PR #2.
-                    if negative_emb is not None:
+                    # Synchronize whether every rank has negatives this step.
+                    # `embedding_sources` can mix datasets with and without a
+                    # `negative` field, so different ranks may end up with
+                    # `negative_emb is None` in the same step. Calling
+                    # `accelerator.gather(negative_emb)` only on some ranks
+                    # diverges the collective and hangs distributed training;
+                    # gathering with mismatched shapes (different per-rank
+                    # negative counts) errors. Use a unanimity check so all
+                    # ranks make the same decision. Fix per Codex review on
+                    # PR #2 (round 2).
+                    local_has_neg = torch.tensor(
+                        [1 if negative_emb is not None else 0],
+                        device=accelerator.device,
+                        dtype=torch.long,
+                    )
+                    all_has_neg = accelerator.gather(local_has_neg)
+                    all_ranks_have_negatives = bool(all_has_neg.min().item())
+
+                    if all_ranks_have_negatives:
                         all_negative_emb = accelerator.gather(negative_emb)
                         all_passage_emb = torch.cat([all_passage_emb, all_negative_emb], dim=0)
+                    elif debug_mode and accelerator.is_main_process and bool(all_has_neg.max().item()):
+                        # At least one rank had negatives but not all — we
+                        # dropped them this step to keep the collective safe.
+                        logger.info(
+                            f"[DEBUG Step {completed_steps}] Skipping hard negatives: "
+                            f"per-rank has_neg={all_has_neg.tolist()}"
+                        )
 
                     if debug_mode and accelerator.is_main_process:
                         logger.info(f"[DEBUG Step {completed_steps}] After gathering: "
