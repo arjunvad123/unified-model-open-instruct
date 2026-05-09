@@ -252,11 +252,42 @@ def eval_retrieval(model: EmbeddingModel, num_queries: int = 100) -> Dict:
         if len(pairs) >= num_queries:
             break
 
+    # Filter the corpus down to only the documents referenced by the
+    # sampled queries, then iterate that filtered subset. The previous
+    # implementation walked every row of `corpus_ds` and used the early
+    # break as a best-effort short-circuit, which still degraded to a
+    # full corpus pass whenever the needed docs sat near the end of the
+    # corpus or any were missing. With a batched filter the scan happens
+    # at Arrow level (much faster than per-row Python) and the iteration
+    # below is O(needed) instead of O(corpus). Fix per Codex review on
+    # PR #2.
+    needed_doc_ids_set = {str(d) for d in needed_doc_ids}
+    if hasattr(corpus_ds, "filter"):
+        try:
+            filtered_corpus = corpus_ds.filter(
+                lambda batch: [str(d) in needed_doc_ids_set for d in batch["id"]],
+                batched=True,
+                batch_size=10_000,
+                desc="Filtering corpus to needed docs",
+            )
+        except Exception:
+            # Fall back to row-iteration with early break for non-HF
+            # dataset-like objects that don't support the batched filter.
+            filtered_corpus = corpus_ds
+    else:
+        filtered_corpus = corpus_ds
+
     documents_by_id = {}
-    corpus_total = len(corpus_ds) if hasattr(corpus_ds, "__len__") else None
-    for row in tqdm(corpus_ds, total=corpus_total, desc="Loading documents"):
+    filtered_total = (
+        len(filtered_corpus) if hasattr(filtered_corpus, "__len__") else None
+    )
+    for row in tqdm(
+        filtered_corpus, total=filtered_total, desc="Loading documents"
+    ):
         doc_id = str(row["id"])
-        if doc_id not in needed_doc_ids:
+        if doc_id not in needed_doc_ids_set:
+            # Only reachable on the fallback path where filtered_corpus is
+            # the unfiltered corpus_ds; preserves the original semantics.
             continue
 
         title = (row.get("title") or "").strip()
@@ -265,7 +296,7 @@ def eval_retrieval(model: EmbeddingModel, num_queries: int = 100) -> Dict:
         if document:
             documents_by_id[doc_id] = document
 
-        if len(documents_by_id) >= len(needed_doc_ids):
+        if len(documents_by_id) >= len(needed_doc_ids_set):
             break
 
     pairs = [

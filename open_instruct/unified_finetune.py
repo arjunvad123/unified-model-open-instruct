@@ -50,7 +50,7 @@ from datasets import load_dataset
 # inside a fresh container with only its requirements installed).
 try:
     from open_instruct import logger_utils, utils
-    from open_instruct.action_tokens import ACTION_TOKENS
+    from open_instruct.action_tokens import ACT_RET, ACTION_TOKENS
     from open_instruct.model_utils import push_folder_to_hub, save_with_accelerate
     from open_instruct.utils import (
         ArgumentParserPlus,
@@ -113,15 +113,17 @@ except ImportError:
         return checkpoints[-1] if checkpoints else None
 
     # Registry not on path either -- fall back to the literal trained set.
-    # MUST stay in lockstep with open_instruct/action_tokens.py.
-    ACTION_TOKENS = [
-        "<ACT:THINK>",
-        "<ACT:RET>",
-        "<ACT:GEN>",
-        "<ACT:STOP>",
-        "<WAIT>",
-        "<RET_RESULT>",
-    ]
+    # MUST stay in lockstep with open_instruct/action_tokens.py. The named
+    # constants below mirror the registry so downstream code (e.g. the
+    # EmbeddingDataset query prefix) can reference a name rather than a
+    # string literal in either branch.
+    ACT_THINK = "<ACT:THINK>"
+    ACT_RET = "<ACT:RET>"
+    ACT_GEN = "<ACT:GEN>"
+    ACT_STOP = "<ACT:STOP>"
+    WAIT = "<WAIT>"
+    RET_RESULT = "<RET_RESULT>"
+    ACTION_TOKENS = [ACT_THINK, ACT_RET, ACT_GEN, ACT_STOP, WAIT, RET_RESULT]
 
 logger = get_logger(__name__)
 
@@ -257,7 +259,10 @@ def contrastive_loss(
 class EmbeddingDataset(Dataset):
     """Dataset for embedding training (query-passage pairs)."""
 
-    QUERY_PREFIX = "<ACT:RET> "
+    # Derived from the action-tokens registry (open_instruct/action_tokens.py)
+    # so a future renaming of the routing token surfaces as an import error
+    # rather than silently drifting here. Fix per Codex review on PR #2.
+    QUERY_PREFIX = f"{ACT_RET} "
 
     def __init__(self, data: List[Dict], tokenizer, max_length: int = 256):
         self.data = data
