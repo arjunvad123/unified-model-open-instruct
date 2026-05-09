@@ -257,6 +257,8 @@ def contrastive_loss(
 class EmbeddingDataset(Dataset):
     """Dataset for embedding training (query-passage pairs)."""
 
+    QUERY_PREFIX = "<ACT:RET> "
+
     def __init__(self, data: List[Dict], tokenizer, max_length: int = 256):
         self.data = data
         self.tokenizer = tokenizer
@@ -269,7 +271,7 @@ class EmbeddingDataset(Dataset):
         item = self.data[idx]
 
         query = self.tokenizer(
-            item["query"],
+            self.QUERY_PREFIX + item["query"],
             max_length=self.max_length,
             padding="max_length",
             truncation=True,
@@ -284,12 +286,44 @@ class EmbeddingDataset(Dataset):
             return_tensors="pt"
         )
 
+        negative = None
+        if item.get("negative"):
+            negative = self.tokenizer(
+                item["negative"],
+                max_length=self.max_length,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt"
+            )
+
         return {
             "query_input_ids": query["input_ids"].squeeze(0),
             "query_attention_mask": query["attention_mask"].squeeze(0),
             "passage_input_ids": passage["input_ids"].squeeze(0),
             "passage_attention_mask": passage["attention_mask"].squeeze(0),
+            "negative_input_ids": negative["input_ids"].squeeze(0) if negative else None,
+            "negative_attention_mask": negative["attention_mask"].squeeze(0) if negative else None,
         }
+
+
+def embedding_collate_fn(batch):
+    """Collate fn that handles optional MEDI2 hard negatives."""
+    collated = {
+        "query_input_ids": torch.stack([item["query_input_ids"] for item in batch]),
+        "query_attention_mask": torch.stack([item["query_attention_mask"] for item in batch]),
+        "passage_input_ids": torch.stack([item["passage_input_ids"] for item in batch]),
+        "passage_attention_mask": torch.stack([item["passage_attention_mask"] for item in batch]),
+    }
+
+    negatives = [item for item in batch if item["negative_input_ids"] is not None]
+    if negatives:
+        collated["negative_input_ids"] = torch.stack([item["negative_input_ids"] for item in negatives])
+        collated["negative_attention_mask"] = torch.stack([item["negative_attention_mask"] for item in negatives])
+    else:
+        collated["negative_input_ids"] = None
+        collated["negative_attention_mask"] = None
+
+    return collated
 
 
 class GenerationDataset(Dataset):
@@ -453,8 +487,14 @@ def load_embedding_data(
                     pos_text = item["pos"]
                     if isinstance(pos_text, list):
                         pos_text = pos_text[0] if pos_text else ""
+                    neg_text = item.get("neg")
+                    if isinstance(neg_text, list):
+                        neg_text = neg_text[0] if neg_text else None
                     if pos_text:
-                        data.append({"query": item["query"], "passage": str(pos_text)[:1000]})
+                        row = {"query": item["query"], "passage": str(pos_text)[:1000]}
+                        if neg_text:
+                            row["negative"] = str(neg_text)[:1000]
+                        data.append(row)
                         count += 1
             logger.info(f"Loaded {count} MEDI2 pairs")
         except Exception as e:
@@ -858,6 +898,7 @@ def main():
         batch_size=effective_embedding_batch,
         shuffle=True,
         drop_last=True,  # Drop last incomplete batch for consistent contrastive learning
+        collate_fn=embedding_collate_fn,
     )
     generation_loader = DataLoader(
         generation_dataset,
@@ -1007,6 +1048,8 @@ def main():
                 # innovation: +5.5 MTEB points with zero generation impact.
                 query_attn_kwargs = {}
                 passage_attn_kwargs = {}
+                negative_attn_kwargs = {}
+                has_negatives = emb_batch.get("negative_input_ids") is not None
                 if args.use_bidirectional_embedding:
                     query_attn_kwargs["attention_mask"] = make_bidirectional_attention_mask(
                         emb_batch["query_attention_mask"], dtype=torch.bfloat16
@@ -1014,9 +1057,15 @@ def main():
                     passage_attn_kwargs["attention_mask"] = make_bidirectional_attention_mask(
                         emb_batch["passage_attention_mask"], dtype=torch.bfloat16
                     )
+                    if has_negatives:
+                        negative_attn_kwargs["attention_mask"] = make_bidirectional_attention_mask(
+                            emb_batch["negative_attention_mask"], dtype=torch.bfloat16
+                        )
                 else:
                     query_attn_kwargs["attention_mask"] = emb_batch["query_attention_mask"]
                     passage_attn_kwargs["attention_mask"] = emb_batch["passage_attention_mask"]
+                    if has_negatives:
+                        negative_attn_kwargs["attention_mask"] = emb_batch["negative_attention_mask"]
 
                 # Get query embeddings
                 query_outputs = model(
@@ -1039,6 +1088,17 @@ def main():
                 passage_hidden = passage_outputs.hidden_states[-1]
                 passage_emb = mean_pooling(passage_hidden, emb_batch["passage_attention_mask"])
 
+                negative_emb = None
+                if has_negatives:
+                    negative_outputs = model(
+                        input_ids=emb_batch["negative_input_ids"],
+                        output_hidden_states=True,
+                        use_cache=False,
+                        **negative_attn_kwargs,
+                    )
+                    negative_hidden = negative_outputs.hidden_states[-1]
+                    negative_emb = mean_pooling(negative_hidden, emb_batch["negative_attention_mask"])
+
                 # Debug: log embedding statistics for first few steps
                 if debug_mode and accelerator.is_main_process:
                     logger.info(f"[DEBUG Step {completed_steps}] Query emb shape: {query_emb.shape}, "
@@ -1059,11 +1119,17 @@ def main():
                         logger.info(f"[DEBUG Step {completed_steps}] After gathering: "
                                    f"query shape {all_query_emb.shape}, passage shape {all_passage_emb.shape}")
 
+                    if negative_emb is not None:
+                        all_passage_emb = torch.cat([all_passage_emb, negative_emb], dim=0)
+
                     # Compute contrastive loss on gathered embeddings (all processes compute same loss)
                     emb_loss = contrastive_loss(all_query_emb, all_passage_emb, args.temperature, debug=debug_mode)
                 else:
                     # Single GPU: use local batch only
-                    emb_loss = contrastive_loss(query_emb, passage_emb, args.temperature, debug=debug_mode)
+                    candidate_emb = passage_emb
+                    if negative_emb is not None:
+                        candidate_emb = torch.cat([candidate_emb, negative_emb], dim=0)
+                    emb_loss = contrastive_loss(query_emb, candidate_emb, args.temperature, debug=debug_mode)
 
                 # Debug: log contrastive loss
                 if debug_mode and accelerator.is_main_process:
