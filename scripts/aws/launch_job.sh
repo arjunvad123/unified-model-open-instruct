@@ -83,13 +83,19 @@ shutdown -h +1 "job complete (exit \$JOB_EXIT)"
 EOF
 )
 
-USER_DATA_B64=$(printf '%s' "$USER_DATA" | base64 | tr -d '\n')
+# AWS CLI base64-encodes the user-data automatically when you pass a string or
+# `file://` reference. Pre-encoding ourselves caused double-encoding (cloud-init
+# saw base64 text instead of an executable script). Fix per Codex review on
+# PR #2: write to a tempfile and reference via `file://`.
+USER_DATA_FILE=$(mktemp -t unified-userdata.XXXXXX)
+trap 'rm -f "$USER_DATA_FILE"' EXIT
+printf '%s' "$USER_DATA" > "$USER_DATA_FILE"
 
 echo "=== launching $INSTANCE_TYPE for job=$JOB_NAME (git $GIT_SHA on $GIT_BRANCH) ==="
 INSTANCE_ID=$(aws ec2 run-instances \
   --launch-template "LaunchTemplateName=${LAUNCH_TEMPLATE_NAME},Version=\$Latest" \
   --instance-type "$INSTANCE_TYPE" \
-  --user-data "$USER_DATA_B64" \
+  --user-data "file://$USER_DATA_FILE" \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=unified-${JOB_NAME}},{Key=Job,Value=${JOB_NAME}},{Key=GitSha,Value=${GIT_SHA}}]" \
   --query 'Instances[0].InstanceId' --output text)
 

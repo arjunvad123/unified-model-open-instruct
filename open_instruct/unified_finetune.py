@@ -1115,12 +1115,17 @@ def main():
                     all_query_emb = accelerator.gather(query_emb)
                     all_passage_emb = accelerator.gather(passage_emb)
 
+                    # Gather hard negatives across ranks too — otherwise each
+                    # rank optimizes a different loss (its local negatives only),
+                    # which destabilizes distributed training and weakens the
+                    # MEDI2 hard-negative signal. Fix per Codex review on PR #2.
+                    if negative_emb is not None:
+                        all_negative_emb = accelerator.gather(negative_emb)
+                        all_passage_emb = torch.cat([all_passage_emb, all_negative_emb], dim=0)
+
                     if debug_mode and accelerator.is_main_process:
                         logger.info(f"[DEBUG Step {completed_steps}] After gathering: "
                                    f"query shape {all_query_emb.shape}, passage shape {all_passage_emb.shape}")
-
-                    if negative_emb is not None:
-                        all_passage_emb = torch.cat([all_passage_emb, negative_emb], dim=0)
 
                     # Compute contrastive loss on gathered embeddings (all processes compute same loss)
                     emb_loss = contrastive_loss(all_query_emb, all_passage_emb, args.temperature, debug=debug_mode)
