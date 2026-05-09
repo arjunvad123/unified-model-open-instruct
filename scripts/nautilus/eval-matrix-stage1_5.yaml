@@ -205,38 +205,68 @@ spec:
                       "last_token": np.concatenate(last_chunks, axis=0),
                   }
 
-              def first_available_split(task):
-                  for split_name in ("test", "dev", "validation", "train"):
-                      if split_name in task.corpus and split_name in task.queries and split_name in task.relevant_docs:
-                          return split_name
-                  common = set(task.corpus.keys()) & set(task.queries.keys()) & set(task.relevant_docs.keys())
-                  if not common:
-                      raise RuntimeError("No common corpus/query/qrels split found")
-                  return sorted(common)[0]
-
               def load_retrieval_task(task_name):
+                  # mteb 2.x exposes retrieval data via task.dataset[subset][split]
+                  # with keys "corpus", "queries", "relevant_docs". (The older
+                  # task.corpus / task.queries attributes from mteb 1.x are gone.)
                   print(f"Loading MTEB task {task_name}", flush=True)
                   task = mteb.get_task(task_name)
                   task.load_data()
-                  split = first_available_split(task)
 
-                  corpus = task.corpus[split]
-                  queries = task.queries[split]
-                  qrels = task.relevant_docs[split]
+                  subsets = list(task.dataset.keys())
+                  if not subsets:
+                      raise RuntimeError(f"{task_name}: empty task.dataset")
+                  subset = subsets[0]
+                  splits = task.dataset[subset]
 
-                  corpus_ids = list(corpus.keys())
+                  split = None
+                  for candidate in ("test", "dev", "validation", "train"):
+                      if candidate in splits:
+                          split = candidate
+                          break
+                  if split is None:
+                      split = sorted(splits.keys())[0]
+
+                  split_data = splits[split]
+                  corpus_ds = split_data["corpus"]
+                  queries_ds = split_data["queries"]
+                  qrels_raw = split_data["relevant_docs"]
+
+                  # corpus / queries are HF Dataset objects (rows with id + text/title)
+                  corpus_ids = []
                   corpus_texts = []
-                  for corpus_id in corpus_ids:
-                      doc = corpus[corpus_id]
-                      title = doc.get("title", "") if isinstance(doc, dict) else ""
-                      text = doc.get("text", doc) if isinstance(doc, dict) else doc
-                      full_text = f"{title} {text}".strip() if title else str(text).strip()
-                      corpus_texts.append(full_text)
+                  for row in corpus_ds:
+                      corpus_id = str(row["id"])
+                      title = (row.get("title") or "").strip()
+                      text = (row.get("text") or "").strip()
+                      doc = f"{title} {text}".strip()
+                      corpus_ids.append(corpus_id)
+                      corpus_texts.append(doc)
 
-                  query_ids = list(queries.keys())
-                  query_texts = [queries[query_id] for query_id in query_ids]
+                  query_ids = []
+                  query_texts = []
+                  for row in queries_ds:
+                      query_ids.append(str(row["id"]))
+                      query_texts.append(row["text"])
+
+                  # qrels: dict-of-dicts {qid: {doc_id: score}} OR list of rows.
+                  qrels = {}
+                  if isinstance(qrels_raw, dict):
+                      for qid, docs in qrels_raw.items():
+                          if isinstance(docs, dict):
+                              qrels[str(qid)] = {str(d): float(s) for d, s in docs.items()}
+                          else:
+                              qrels[str(qid)] = {str(d): 1.0 for d in docs}
+                  else:
+                      for row in qrels_raw:
+                          qid = row.get("query-id", row.get("query_id", row.get("qid")))
+                          did = row.get("corpus-id", row.get("corpus_id", row.get("docid")))
+                          score = float(row.get("score", 1))
+                          if qid is not None and did is not None:
+                              qrels.setdefault(str(qid), {})[str(did)] = score
 
                   return {
+                      "subset": subset,
                       "split": split,
                       "corpus_ids": corpus_ids,
                       "corpus_texts": corpus_texts,
