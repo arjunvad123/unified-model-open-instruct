@@ -27,7 +27,7 @@ Only use AWS account **723951822728** for all AWS operations in this project.
 
 ## Action / control tokens
 The trained tokens are defined ONCE in `open_instruct/action_tokens.py`:
-`<ACT:THINK>`, `<ACT:RET>`, `<ACT:GEN>`, `<ACT:STOP>`, `<WAIT>`, `<RET_RESULT>`.
+`<ACT:GEN>`, `<ACT:RET>`, `<ACT:THINK>`, `<ACT:STOP>`.
 Both training (`open_instruct/unified_finetune.py`) and every benchmark/eval/demo
 script imports from there. **Never hardcode token lists in scripts.** Earlier
 versions referenced `<ACT:TOOL>` and `<ACT:CODE>` which were never trained;

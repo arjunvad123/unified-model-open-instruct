@@ -26,8 +26,6 @@ ACTION_TOKENS = {
     "retrieve": "<ACT:RET>",
     "generate": "<ACT:GEN>",
     "stop": "<ACT:STOP>",
-    "wait": "<WAIT>",
-    "ret_result": "<RET_RESULT>"
 }
 
 # ============================================================================

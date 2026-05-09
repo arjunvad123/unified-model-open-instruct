@@ -134,7 +134,7 @@
 ### Strengths
 1. **Strong MMLU performance** (0.6269) — beats models 2-4x larger (Mistral-7B, Phi-2)
 2. **Unified architecture** — single model handles both generation and embedding tasks
-3. **Action token routing** — eval pending; the original harness tested untrained `<ACT:TOOL>`/`<ACT:CODE>` tokens. Trained set is THINK/RET/GEN/STOP/WAIT/RET_RESULT (see `open_instruct/action_tokens.py`). Reproducible routing number to be added after re-running the corrected `benchmarks/inference-scripts/03_action_token_routing.py`.
+3. **Action token routing** — eval pending; the original harness tested untrained `<ACT:TOOL>`/`<ACT:CODE>` tokens. Trained set is GEN/RET/THINK/STOP (see `open_instruct/action_tokens.py`). Reproducible routing number to be added after re-running the corrected `benchmarks/inference-scripts/03_action_token_routing.py`.
 
 ### Weaknesses
 1. **Embedding quality is the primary bottleneck** — 2.4x worse than specialized models

@@ -11,7 +11,7 @@ This directory contains all benchmarking and evaluation code for the **Unified A
 | Stage | Model | What It Does |
 |-------|-------|--------------|
 | Base | `Qwen/Qwen2.5-3B-Instruct` | Pretrained instruction-following LLM |
-| **Stage 1** | `Arjunvad/unified-model-stage1-action-tokens-v2` | + Action token SFT (`<ACT:THINK>`, `<ACT:RET>`, `<ACT:GEN>`, `<ACT:STOP>`, `<WAIT>`, `<RET_RESULT>`) |
+| **Stage 1** | `Arjunvad/unified-model-stage1-action-tokens-v2` | + Action token SFT (`<ACT:GEN>`, `<ACT:RET>`, `<ACT:THINK>`, `<ACT:STOP>`) |
 | **Stage 1.5** | `Arjunvad/unified-model-stage1-5-embedding-v2` | + Contrastive fine-tuning (MEDI2 500K, LoRA r=32, temp=0.02) |
 
 ### HuggingFace Models
@@ -154,8 +154,7 @@ The trained tokens used by the unified model are defined in
 (`open_instruct/unified_finetune.py`) and every script in this directory.
 **Do not hardcode token lists in eval scripts** — import from there so the
 tokenizer and the eval harness can never drift apart. The current trained
-set is `<ACT:THINK>`, `<ACT:RET>`, `<ACT:GEN>`, `<ACT:STOP>`, `<WAIT>`,
-`<RET_RESULT>`. (Earlier versions of these scripts referenced
+set is `<ACT:GEN>`, `<ACT:RET>`, `<ACT:THINK>`, `<ACT:STOP>`. (Earlier versions of these scripts referenced
 `<ACT:TOOL>` / `<ACT:CODE>` which were never trained — those tests have been
 removed.)
 
@@ -258,7 +257,7 @@ Our embedding method: Mean pooling over `output_hidden_states[-1]`, L2 normalize
 
 1. **MMLU is our strongest benchmark** (0.6269) — competitive with models 2-4x larger, beats Phi-2 and SmolLM2
 2. **Unified architecture works** — single model handles generation, embedding, and action token routing
-3. **Action token routing — eval pending.** Original harness tested untrained `<ACT:TOOL>`/`<ACT:CODE>` tokens; trained set is THINK/RET/GEN/STOP/WAIT/RET_RESULT (see `open_instruct/action_tokens.py`). Reproducible number to be added after re-running the corrected `benchmarks/inference-scripts/03_action_token_routing.py`
+3. **Action token routing — eval pending.** Original harness tested untrained `<ACT:TOOL>`/`<ACT:CODE>` tokens; trained set is GEN/RET/THINK/STOP (see `open_instruct/action_tokens.py`). Reproducible number to be added after re-running the corrected `benchmarks/inference-scripts/03_action_token_routing.py`
 4. **Contrastive training (Stage 1.5) improved embeddings +31%** — especially FiQA2018 (+801%)
 5. **But degraded generation -22%** — catastrophic forgetting from contrastive fine-tuning
 6. **Catastrophic forgetting is universal** — Qwen3-Embedding-4B loses -44.3% generation vs its base; our -22% is actually less severe

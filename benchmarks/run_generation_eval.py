@@ -107,7 +107,7 @@ def eval_action_token_routing(model: GenerationModel) -> Dict:
     """Smoke-test action token routing.
 
     Trained tokens (per open_instruct.action_tokens) are
-    THINK/RET/GEN/STOP/WAIT/RET_RESULT. Synthetic trajectories teach two
+    GEN/RET/THINK/STOP. Synthetic trajectories teach two
     routes:
       - direct:    <ACT:THINK> ... <ACT:GEN> ... <ACT:STOP>
       - retrieval: <ACT:THINK> ... <ACT:RET> ... <ACT:GEN> ... <ACT:STOP>

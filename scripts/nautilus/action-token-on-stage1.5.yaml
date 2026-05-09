@@ -238,7 +238,7 @@ spec:
           # NOTE: Earlier versions of this YAML generated TOOL and CODE examples
           # using <ACT:TOOL> / <ACT:CODE> tokens. Those tokens were never trained
           # into the model and have been removed. The trained set is
-          # THINK/RET/GEN/STOP/WAIT/RET_RESULT (open_instruct/action_tokens.py).
+          # GEN/RET/THINK/STOP (open_instruct/action_tokens.py).
           # If a future round wants to add TOOL or CODE as routed actions, add
           # them to the registry first and restore the corresponding example
           # blocks here.
@@ -280,8 +280,6 @@ spec:
               "<ACT:RET>",
               "<ACT:GEN>",
               "<ACT:STOP>",
-              "<WAIT>",
-              "<RET_RESULT>",
           ]
 
           print(f"Loading tokenizer from Stage 1.5 model...")
@@ -538,8 +536,6 @@ spec:
               "<ACT:RET>",
               "<ACT:GEN>",
               "<ACT:STOP>",
-              "<WAIT>",
-              "<RET_RESULT>",
           ]
           HF_TOKEN = os.environ.get("HF_TOKEN")
 

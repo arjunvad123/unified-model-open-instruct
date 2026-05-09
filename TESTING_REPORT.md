@@ -170,8 +170,6 @@ Distance = 150 miles
 | `<ACT:RET>` | 151666 | ✅ |
 | `<ACT:GEN>` | 151667 | ✅ |
 | `<ACT:STOP>` | 151668 | ✅ |
-| `<WAIT>` | 151669 | ✅ |
-| `<RET_RESULT>` | 151670 | ✅ |
 
 #### Routing Test Results
 

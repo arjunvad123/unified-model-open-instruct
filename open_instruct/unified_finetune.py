@@ -119,8 +119,6 @@ except ImportError:
         "<ACT:RET>",
         "<ACT:GEN>",
         "<ACT:STOP>",
-        "<WAIT>",
-        "<RET_RESULT>",
     ]
 
 logger = get_logger(__name__)
