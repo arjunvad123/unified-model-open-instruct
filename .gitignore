@@ -4,6 +4,15 @@ rejection_sampling/shards1
 token_length.png
 *.tfevents.*
 
+# Personal / per-clone workspace. These are notes, scratch artifacts, and
+# tooling state that don't belong in the shared repo. Kept out of source
+# control on purpose; nothing here is required for anyone else to build,
+# train, or evaluate the model.
+.agents/
+.claude/settings.local.json
+.claude/worktrees/
+.gstack/
+
 # For generating datasets.
 *.jsonl
 !open_instruct/test_data/*.jsonl
