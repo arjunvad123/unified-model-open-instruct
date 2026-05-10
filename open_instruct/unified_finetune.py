@@ -1122,43 +1122,56 @@ def main():
 
                     # Always gather hard negatives across ranks, padding-with-mask
                     # so the collective sees same-shape tensors regardless of
-                    # which ranks had negatives in their local batch.
+                    # which ranks had negatives in their local batch -- AND
+                    # regardless of how many negatives each rank has within its
+                    # batch.
                     #
-                    # Why: `embedding_sources` mixes datasets with and without a
-                    # `negative` field (MEDI2 has them; some auxiliary sources
-                    # don't). The collate_fn only returns negatives if every row
-                    # in a per-device batch has them, so a single rank can flip
-                    # between "has negatives" and "no negatives" between steps,
-                    # and different ranks can disagree at the same step. An
-                    # earlier unanimity gate dropped negatives entirely whenever
-                    # any rank lacked them -- which Codex flagged as P1 because
-                    # mixed-source training makes that condition frequently true,
-                    # silently regressing to in-batch-only negatives.
+                    # Why: `embedding_collate_fn` only stacks negatives for the
+                    # subset of items in a batch that have them. So
+                    # `negative_emb.size(0)` can be 0..B per rank in mixed-source
+                    # training (MEDI2 rows have a `negative` field, auxiliary
+                    # rows often don't, and the per-rank shuffle puts arbitrary
+                    # mixes into each batch). Two earlier fixes were incomplete:
+                    #   - Unanimity gate (round 2): silently dropped negatives
+                    #     globally whenever any rank had 0 negatives. Frequent
+                    #     under mixed sources -> hard-negative signal lost.
+                    #   - Pad-to-passage (round 3): used `torch.zeros_like(passage_emb)`
+                    #     which assumed `negative_emb.size(0) == B`. False when
+                    #     a rank has e.g. 7/16 rows with negatives -> gather sees
+                    #     [7, hidden] vs [B, hidden] across ranks -> shape error.
+                    # Fix per Codex review on PR #2 (round 4).
                     #
-                    # Approach: each rank produces a same-shape `local_neg`
-                    # tensor and a 1D validity mask. Ranks with no negatives
-                    # contribute zero rows; the gathered mask filters those out
-                    # before concatenating onto `all_passage_emb`. The collective
-                    # is uniform-shape and never diverges. Fix per Codex review
-                    # on PR #2 (round 3).
+                    # Approach: pad each rank's `negative_emb` up to a fixed
+                    # `[B, hidden]` shape (B = per-device batch size, identical
+                    # across ranks under DDP). Validity mask records which rows
+                    # are real. Gather both, filter out padded rows, concat real
+                    # negatives onto `all_passage_emb`. Collective is uniform.
+                    B = passage_emb.size(0)
+                    hidden_dim = passage_emb.size(-1)
                     if negative_emb is not None:
-                        local_neg = negative_emb
-                        local_neg_valid = torch.ones(
-                            negative_emb.size(0),
-                            device=accelerator.device,
-                            dtype=torch.long,
-                        )
+                        n_real = negative_emb.size(0)
+                        if n_real < B:
+                            pad = torch.zeros(
+                                B - n_real, hidden_dim,
+                                device=accelerator.device,
+                                dtype=passage_emb.dtype,
+                            )
+                            local_neg = torch.cat([negative_emb, pad], dim=0)
+                        else:
+                            local_neg = negative_emb
                     else:
-                        # Zero-pad to the same shape as `passage_emb`. Per-device
-                        # batch size is uniform across ranks under DDP, so this
-                        # matches what other ranks may produce when they DO have
-                        # negatives.
-                        local_neg = torch.zeros_like(passage_emb)
-                        local_neg_valid = torch.zeros(
-                            passage_emb.size(0),
+                        n_real = 0
+                        local_neg = torch.zeros(
+                            B, hidden_dim,
                             device=accelerator.device,
-                            dtype=torch.long,
+                            dtype=passage_emb.dtype,
                         )
+
+                    local_neg_valid = torch.zeros(
+                        B, device=accelerator.device, dtype=torch.long,
+                    )
+                    if n_real > 0:
+                        local_neg_valid[:n_real] = 1
 
                     all_negative_emb = accelerator.gather(local_neg)
                     all_negative_valid = accelerator.gather(local_neg_valid).bool()
