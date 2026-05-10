@@ -73,7 +73,32 @@ spec:
               # Shallow-clone the repo for action_tokens.py registry import.
               # Same convention as eval-matrix-stage1_5.yaml so the act_ret
               # prefix here is bit-identical to what the matrix used.
-              git clone --depth 1 https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/unified-model-open-instruct
+              #
+              # ACT_RET_REPO_REF pins the revision used for the import. Default
+              # is `main` (latest), but for strict calibration against an
+              # already-completed eval-matrix run, set this env var to the
+              # exact commit SHA the matrix used so action_tokens.py can't
+              # silently change between the two runs. Fix per Codex review on
+              # PR #5 -- without pinning, an `action_tokens.py` token rename
+              # between the matrix and the anchor would invalidate the
+              # calibration comparison without warning.
+              ACT_RET_REPO_REF="${ACT_RET_REPO_REF:-main}"
+              echo "Cloning open_instruct/action_tokens.py at ref=$ACT_RET_REPO_REF"
+              # `--branch` accepts branches and tags. For a bare commit SHA we
+              # need a slightly fuller flow (clone then checkout), so try the
+              # fast path first and fall back if it fails.
+              if ! git clone --depth 1 --branch "$ACT_RET_REPO_REF" \
+                     https://github.com/arjunvad123/unified-model-open-instruct.git \
+                     /workspace/unified-model-open-instruct 2>/dev/null; then
+                echo "  --branch failed (likely a SHA, not a branch/tag); using full clone + checkout"
+                git clone https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/unified-model-open-instruct
+                ( cd /workspace/unified-model-open-instruct && git checkout "$ACT_RET_REPO_REF" )
+              fi
+              # Record the actual SHA used so eval_matrix.json captures
+              # provenance even if ACT_RET_REPO_REF was a branch (moving target).
+              export ACT_RET_SOURCE_REF="$ACT_RET_REPO_REF"
+              export ACT_RET_SOURCE_SHA=$(cd /workspace/unified-model-open-instruct && git rev-parse HEAD)
+              echo "Resolved ACT_RET source: ref=$ACT_RET_SOURCE_REF sha=$ACT_RET_SOURCE_SHA"
 
               cat > run_anchor_eval.py << 'PYTHON_SCRIPT'
               import gc
@@ -391,6 +416,14 @@ spec:
                       "max_length": MAX_LENGTH,
                       "batch_size": BATCH_SIZE,
                       "dtype": "bfloat16",
+                      # Provenance for the action_tokens.py registry import.
+                      # Bash side resolves ACT_RET_REPO_REF (default "main")
+                      # and records the actual SHA so a future audit can
+                      # verify whether action_tokens.py changed between this
+                      # anchor run and the eval-matrix run it was meant to
+                      # validate. Fix per Codex review on PR #5.
+                      "act_ret_source_ref": os.environ.get("ACT_RET_SOURCE_REF", "unknown"),
+                      "act_ret_source_sha": os.environ.get("ACT_RET_SOURCE_SHA", "unknown"),
                       "hidden_state_cache_policy": "One model forward pass per encoded text batch returns last hidden state; mean and last-token embeddings are both derived from that cached tensor.",
                       "versions": {
                           "python": os.sys.version,
