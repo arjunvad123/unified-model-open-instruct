@@ -95,7 +95,8 @@ spec:
                 huggingface_hub \
                 tqdm \
                 numpy \
-                bitsandbytes
+                bitsandbytes \
+                rich  # required by open_instruct.unified_finetune (line 35)
 
               # ---- Clone repo ----
               # Use main, not benchmarking-suite. PR #2's bug fixes
