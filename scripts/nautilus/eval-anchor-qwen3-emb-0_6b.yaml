@@ -83,7 +83,15 @@ spec:
               from datetime import datetime, timezone
 
               sys.path.insert(0, "/workspace/unified-model-open-instruct")
-              from open_instruct.action_tokens import ACT_RET  # noqa: E402
+              # Resilient import: ACT_RET (the named constant) is on PR #2's
+              # branch but main might not have merged yet. Fall back to
+              # selecting the routing token by name from ACTION_TOKENS
+              # (always present, just not always exposed as a constant).
+              try:
+                  from open_instruct.action_tokens import ACT_RET  # noqa: E402
+              except ImportError:
+                  from open_instruct.action_tokens import ACTION_TOKENS  # noqa: E402
+                  ACT_RET = next(t for t in ACTION_TOKENS if t == "<ACT:RET>")
 
               import mteb
               import numpy as np
