@@ -96,7 +96,9 @@ spec:
                 tqdm \
                 numpy \
                 bitsandbytes \
-                rich  # required by open_instruct.unified_finetune (line 35)
+                rich \
+                protobuf \
+                sentencepiece
 
               # ---- Clone repo ----
               # Use main, not benchmarking-suite. PR #2's bug fixes
