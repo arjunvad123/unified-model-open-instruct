@@ -65,7 +65,9 @@ spec:
               pip install torch --index-url https://download.pytorch.org/whl/cu121
               pip install "transformers>=4.51.0" accelerate peft mteb numpy
 
-              mkdir -p "/workspace/results/${JOB_NAME}"
+              # /workspace/results is already job-scoped via subPathExpr;
+              # no need to mkdir a JOB_NAME subdir under it.
+              mkdir -p /workspace/results
               cd /workspace
 
               # Shallow-clone the repo for action_tokens.py registry import.
@@ -102,7 +104,13 @@ spec:
               from peft import PeftConfig, PeftModel
               from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
-              RESULTS_DIR = os.path.join("/workspace/results", os.environ["JOB_NAME"])
+              # The volume mount already applies subPathExpr "$(JOB_NAME)",
+              # so /workspace/results is already job-scoped at the storage
+              # layer. Don't re-nest JOB_NAME at the path layer or output
+              # lands at <PVC>/<job>/<job>/eval_matrix.json instead of the
+              # one-level <PVC>/<job>/eval_matrix.json that fetch_pvc_results.sh
+              # expects. Fix per Codex review on PR #5.
+              RESULTS_DIR = "/workspace/results"
               OUTPUT_PATH = os.path.join(RESULTS_DIR, "eval_matrix.json")
 
               TASKS = ["NFCorpus", "SciFact", "ArguAna", "SCIDOCS"]
@@ -494,12 +502,16 @@ spec:
                   name: hf-token
                   key: token
           resources:
+            # Memory limit:request <= 1.2x to satisfy the Nautilus
+            # `container-must-meet-memory-and-cpu-ratio` admission policy.
+            # 18Gi/16Gi = 1.125x. Fix per Codex review on PR #5; same
+            # ratio convention as scripts/nautilus/repro-stage1-with-base-baseline.yaml.
             requests:
               memory: 16Gi
               cpu: "4"
               nvidia.com/gpu: "1"
             limits:
-              memory: 24Gi
+              memory: 18Gi
               cpu: 4800m
               nvidia.com/gpu: "1"
           volumeMounts:

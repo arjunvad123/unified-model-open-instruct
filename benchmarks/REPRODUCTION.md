@@ -136,7 +136,18 @@ that landed 2026-05-10 — `eval-matrix-stage1-5` job, eval_matrix.json):
 
 **Reproduce on Nautilus:**
 
+> Note: the matrix YAML (`scripts/nautilus/eval-matrix-stage1_5.yaml`)
+> ships in PR #2 ("Week 1 defensive eval lock-in"). If it isn't on
+> `main` yet, the `kubectl apply` below fails. Either merge PR #2
+> first or run from PR #2's branch (`week1-eval-fixes`). Same applies
+> to `scripts/nautilus/fetch_pvc_results.sh`, which ships in PR #4
+> (already merged) — sanity-check it exists with
+> `ls scripts/nautilus/fetch_pvc_results.sh` before running.
+
 ```bash
+# Pre-check: confirm both files exist locally
+ls scripts/nautilus/eval-matrix-stage1_5.yaml scripts/nautilus/fetch_pvc_results.sh
+
 # Launch the matrix (3 models × 6 recipes × 4 tasks, ~3h on one A100)
 kubectl apply -f scripts/nautilus/eval-matrix-stage1_5.yaml -n svcl-self-improve
 
