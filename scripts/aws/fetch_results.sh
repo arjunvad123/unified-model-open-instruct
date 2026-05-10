@@ -50,7 +50,13 @@ echo
 for cand in eval_matrix.json reproduction_summary.json variance_summary.json; do
   if [[ -f "$LOCAL_DIR/$cand" ]]; then
     echo "=== ${cand} ==="
-    python3 -m json.tool "$LOCAL_DIR/$cand" | head -80
+    # Use awk instead of `head -80` so the producer (`python3 -m json.tool`)
+    # never sees SIGPIPE on long JSON. With `set -euo pipefail`, head closing
+    # the pipe early would abort the whole script even though the sync
+    # already succeeded -- making fetches flaky for any summary >80 lines
+    # (e.g. eval_matrix.json). awk reads stdin to EOF, prints only the
+    # first 80 lines, exits clean. Fix per Codex review on PR #2.
+    python3 -m json.tool "$LOCAL_DIR/$cand" | awk 'NR<=80'
     break
   fi
 done

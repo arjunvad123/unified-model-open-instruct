@@ -61,13 +61,27 @@ spec:
               mkdir -p "/workspace/results/${JOB_NAME}"
               cd /workspace
 
+              # Shallow-clone the repo so the inline Python can import the
+              # action-tokens registry (open_instruct/action_tokens.py).
+              # Without this we'd hardcode the routing-token literal inside
+              # this YAML and silently drift from training-time behavior on
+              # any future token rename. Fix per Codex review on PR #2.
+              git clone --depth 1 https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/unified-model-open-instruct
+
               cat > run_eval_matrix.py << 'PYTHON_SCRIPT'
               import gc
               import json
               import math
               import os
+              import sys
               import time
               from datetime import datetime, timezone
+
+              # Source the trained routing token from the project's single
+              # source of truth so the eval matrix can never drift from the
+              # tokenizer the model was trained with.
+              sys.path.insert(0, "/workspace/unified-model-open-instruct")
+              from open_instruct.action_tokens import ACT_RET  # noqa: E402
 
               import mteb
               import numpy as np
@@ -102,7 +116,10 @@ spec:
               }
               QUERY_PREFIXES = {
                   "raw": "",
-                  "act_ret": "<ACT:RET> ",
+                  # ACT_RET is imported from open_instruct/action_tokens.py
+                  # (see clone step above). Trailing space matches the
+                  # training-time prefix in EmbeddingDataset.QUERY_PREFIX.
+                  "act_ret": f"{ACT_RET} ",
                   "qwen_instruction": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ",
               }
               POOLINGS = ["mean", "last_token"]

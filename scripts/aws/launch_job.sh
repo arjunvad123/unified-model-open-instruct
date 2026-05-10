@@ -41,6 +41,29 @@ GIT_SHA=$(git rev-parse HEAD)
 GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 JOB_SCRIPT_B64=$(base64 -i "$JOB_SCRIPT_PATH" | tr -d '\n')
 
+# Preflight: the EC2 user-data clones the public GitHub repo and runs
+# `git checkout $GIT_SHA` on the instance. If the local commit hasn't been
+# pushed to the remote, that checkout fails and the instance burns money
+# doing nothing useful. Verify the SHA is reachable from `origin` before
+# we spend a cent. Fix per Codex review on PR #2.
+git fetch origin --quiet 2>/dev/null || true
+if ! git branch -r --contains "$GIT_SHA" 2>/dev/null | grep -q '^[[:space:]]*origin/'; then
+  cat >&2 <<EOF
+ERROR: commit $GIT_SHA is not present on any 'origin/*' branch.
+
+The EC2 instance clones https://github.com/arjunvad123/unified-model-open-instruct.git
+and then runs 'git checkout $GIT_SHA'. If the SHA only exists locally, the
+instance launches successfully but the job never runs (silent failure that
+still bills GPU-hours).
+
+Fix: push the current branch first --
+  git push origin $GIT_BRANCH
+
+Then re-run this launcher.
+EOF
+  exit 1
+fi
+
 USER_DATA=$(cat <<EOF
 #!/bin/bash
 set -euo pipefail
