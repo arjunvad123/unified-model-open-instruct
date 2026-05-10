@@ -63,69 +63,92 @@ logger = get_logger(__name__)
 class EmbeddingDataset(Dataset):
     """Query + passage (+ optional hard negative) for distillation.
 
-    Mirrors unified_finetune.EmbeddingDataset so checkpoints trained here
-    eval cleanly through the same code path.
+    Tokenizes separately for the student and teacher because their
+    vocabularies differ: Stage 1.5 students add the project's action
+    tokens (`<ACT:RET>`, etc.) which the published Qwen3-Embedding
+    teacher tokenizer doesn't have. Both also use different canonical
+    query prefixes per the H1 / anchor results:
+      - student: `<ACT:RET> ` (the trained routing token)
+      - teacher: `Instruct: Given...\nQuery: ` (Qwen-style, the
+        teacher's best recipe at 0.4427 avg vs only 0.2573 for raw)
+    Documents are passed without a prefix on either side (raw doc was
+    the doc-prefix ablation winner for v1, and the teacher's published
+    recipe is also raw doc).
+
+    Fix per Codex review on PR #9 (round 2, P1).
     """
 
-    QUERY_PREFIX = f"{ACT_RET} "
-
-    def __init__(self, data: List[Dict], tokenizer, max_length: int = 256):
+    def __init__(
+        self,
+        data: List[Dict],
+        student_tok,
+        teacher_tok,
+        student_query_prefix: str,
+        teacher_query_prefix: str,
+        max_length: int = 256,
+    ):
         self.data = data
-        self.tokenizer = tokenizer
+        self.student_tok = student_tok
+        self.teacher_tok = teacher_tok
+        self.student_query_prefix = student_query_prefix
+        self.teacher_query_prefix = teacher_query_prefix
         self.max_length = max_length
 
     def __len__(self):
         return len(self.data)
 
+    def _tokenize(self, tok, text):
+        return tok(
+            text,
+            max_length=self.max_length,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
     def __getitem__(self, idx):
         item = self.data[idx]
-        query = self.tokenizer(
-            self.QUERY_PREFIX + item["query"],
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        passage = self.tokenizer(
-            item["passage"],
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        negative = None
+        s_q = self._tokenize(self.student_tok, self.student_query_prefix + item["query"])
+        s_p = self._tokenize(self.student_tok, item["passage"])
+        t_q = self._tokenize(self.teacher_tok, self.teacher_query_prefix + item["query"])
+        t_p = self._tokenize(self.teacher_tok, item["passage"])
+        s_n = None
         if item.get("negative"):
-            negative = self.tokenizer(
-                item["negative"],
-                max_length=self.max_length,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt",
-            )
+            # Hard negatives only feed the student-side InfoNCE anchor,
+            # so we tokenize them only with the student tokenizer.
+            s_n = self._tokenize(self.student_tok, item["negative"])
         return {
-            "query_input_ids": query["input_ids"].squeeze(0),
-            "query_attention_mask": query["attention_mask"].squeeze(0),
-            "passage_input_ids": passage["input_ids"].squeeze(0),
-            "passage_attention_mask": passage["attention_mask"].squeeze(0),
-            "negative_input_ids": negative["input_ids"].squeeze(0) if negative else None,
-            "negative_attention_mask": negative["attention_mask"].squeeze(0) if negative else None,
+            "s_query_ids": s_q["input_ids"].squeeze(0),
+            "s_query_mask": s_q["attention_mask"].squeeze(0),
+            "s_passage_ids": s_p["input_ids"].squeeze(0),
+            "s_passage_mask": s_p["attention_mask"].squeeze(0),
+            "t_query_ids": t_q["input_ids"].squeeze(0),
+            "t_query_mask": t_q["attention_mask"].squeeze(0),
+            "t_passage_ids": t_p["input_ids"].squeeze(0),
+            "t_passage_mask": t_p["attention_mask"].squeeze(0),
+            "s_negative_ids": s_n["input_ids"].squeeze(0) if s_n else None,
+            "s_negative_mask": s_n["attention_mask"].squeeze(0) if s_n else None,
         }
 
 
 def embedding_collate_fn(batch):
     collated = {
-        "query_input_ids": torch.stack([item["query_input_ids"] for item in batch]),
-        "query_attention_mask": torch.stack([item["query_attention_mask"] for item in batch]),
-        "passage_input_ids": torch.stack([item["passage_input_ids"] for item in batch]),
-        "passage_attention_mask": torch.stack([item["passage_attention_mask"] for item in batch]),
+        "s_query_ids": torch.stack([it["s_query_ids"] for it in batch]),
+        "s_query_mask": torch.stack([it["s_query_mask"] for it in batch]),
+        "s_passage_ids": torch.stack([it["s_passage_ids"] for it in batch]),
+        "s_passage_mask": torch.stack([it["s_passage_mask"] for it in batch]),
+        "t_query_ids": torch.stack([it["t_query_ids"] for it in batch]),
+        "t_query_mask": torch.stack([it["t_query_mask"] for it in batch]),
+        "t_passage_ids": torch.stack([it["t_passage_ids"] for it in batch]),
+        "t_passage_mask": torch.stack([it["t_passage_mask"] for it in batch]),
     }
-    negs = [it for it in batch if it["negative_input_ids"] is not None]
+    negs = [it for it in batch if it.get("s_negative_ids") is not None]
     if negs:
-        collated["negative_input_ids"] = torch.stack([it["negative_input_ids"] for it in negs])
-        collated["negative_attention_mask"] = torch.stack([it["negative_attention_mask"] for it in negs])
+        collated["s_negative_ids"] = torch.stack([it["s_negative_ids"] for it in negs])
+        collated["s_negative_mask"] = torch.stack([it["s_negative_mask"] for it in negs])
     else:
-        collated["negative_input_ids"] = None
-        collated["negative_attention_mask"] = None
+        collated["s_negative_ids"] = None
+        collated["s_negative_mask"] = None
     return collated
 
 
@@ -161,8 +184,7 @@ def load_medi2_examples(num_examples: int, seed: int = 42) -> List[Dict]:
 # POOLING + ENCODE
 # =============================================================================
 def mean_pool(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Masked mean over the last hidden state. Matches the canonical
-    `act_ret + mean` recipe established by the eval-matrix H1 result."""
+    """Masked mean over the last hidden state."""
     hidden = hidden.float()
     mask = attention_mask.unsqueeze(-1).float()
     summed = (hidden * mask).sum(dim=1)
@@ -170,8 +192,28 @@ def mean_pool(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tenso
     return summed / counts
 
 
-def encode_student(model, input_ids, attention_mask) -> torch.Tensor:
-    """Forward through student (causal LM, returns last hidden state)."""
+def last_token_pool(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Pool the final non-pad token. Matches Qwen3-Embedding's published
+    recipe (the teacher hits 0.4427 avg under this; mean-pool collapses
+    it to 0.2573 -- using mean for the teacher would distill from a
+    badly-degraded signal)."""
+    hidden = hidden.float()
+    seq_lens = attention_mask.sum(dim=1).clamp(min=1) - 1   # last non-pad index
+    return hidden[torch.arange(hidden.size(0), device=hidden.device), seq_lens]
+
+
+def _pool(name: str, hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    if name == "mean":
+        return mean_pool(hidden, attention_mask)
+    if name == "last_token":
+        return last_token_pool(hidden, attention_mask)
+    raise ValueError(f"unknown pooling: {name!r}")
+
+
+def encode_student(model, input_ids, attention_mask, pooling: str) -> torch.Tensor:
+    """Forward through student (causal LM, returns last hidden state).
+    Pooling is configurable -- canonical recipe per H1 result is
+    `mean`, but we keep it parameterized for future ablations."""
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -179,14 +221,16 @@ def encode_student(model, input_ids, attention_mask) -> torch.Tensor:
         use_cache=False,
         return_dict=True,
     )
-    pooled = mean_pool(outputs.hidden_states[-1], attention_mask)
+    pooled = _pool(pooling, outputs.hidden_states[-1], attention_mask)
     return F.normalize(pooled, p=2, dim=-1)
 
 
 @torch.no_grad()
-def encode_teacher(model, input_ids, attention_mask) -> torch.Tensor:
-    """Forward through teacher (frozen). Same mean-pool over last
-    hidden state. Teacher returns AutoModel-style outputs."""
+def encode_teacher(model, input_ids, attention_mask, pooling: str) -> torch.Tensor:
+    """Forward through teacher (frozen). Pooling is whatever the
+    teacher's canonical recipe is -- for Qwen3-Embedding-0.6B that's
+    `last_token` per the anchor result (best 0.4427 avg vs mean's
+    0.2573)."""
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -194,7 +238,7 @@ def encode_teacher(model, input_ids, attention_mask) -> torch.Tensor:
         use_cache=False,
         return_dict=True,
     )
-    pooled = mean_pool(outputs.hidden_states[-1], attention_mask)
+    pooled = _pool(pooling, outputs.hidden_states[-1], attention_mask)
     return F.normalize(pooled, p=2, dim=-1)
 
 
@@ -265,6 +309,14 @@ class DistillArgs:
     distill_temperature: float = 0.05
     distill_weight: float = 1.0
     info_nce_weight: float = 0.1
+
+    # Per-model encoding recipes. Defaults match each model's anchor-
+    # winning recipe so we distill from the best teacher signal into the
+    # student under its own canonical eval recipe.
+    student_query_prefix: str = "<ACT:RET> "
+    student_pooling: str = "mean"            # H1 winner for Stage 1.5
+    teacher_query_prefix: str = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+    teacher_pooling: str = "last_token"      # Qwen3-Emb anchor winner
 
     lora_rank: int = 32
     lora_alpha: int = 64
@@ -384,25 +436,29 @@ def main():
     for p in teacher.parameters():
         p.requires_grad = False
 
-    # Tokenizer compatibility check, ONCE before training. Doing this
-    # per-batch (as the v1 draft did) is O(vocab_size) per step and
-    # delays the failure until after expensive model+data setup. Hoist
-    # to startup so we fail fast with a clear error. Fix per Codex
-    # review on PR #9 (P2).
-    if teacher_tok.get_vocab() != student_tok.get_vocab():
-        raise RuntimeError(
-            f"teacher tokenizer ({args.teacher_model}) and student tokenizer "
-            f"({args.student_model}) have different vocabularies. v1 of this "
-            f"script reuses student-tokenized batches for teacher encoding, "
-            f"which is only valid when the vocabs are identical (Qwen-family "
-            f"teacher with Qwen-family student). Re-tokenization for cross-"
-            f"vocab teachers is not implemented."
-        )
-    logger.info("Tokenizer compatibility verified (student/teacher vocabs match)")
+    # Note: we deliberately do NOT require student/teacher tokenizers to
+    # share a vocabulary. Stage 1.5 students add Stage 1's action tokens
+    # (`<ACT:RET>`, etc.) which the published Qwen3-Embedding teacher
+    # tokenizer doesn't have, so a vocab-equality check would always
+    # fail with the advertised defaults. Instead, the dataset tokenizes
+    # each side with its own tokenizer at __getitem__ time, with each
+    # side's own canonical query prefix. Fix per Codex review on PR #9
+    # (round 2, P1).
+    logger.info(
+        f"Student tokenizer vocab={len(student_tok)}, teacher tokenizer "
+        f"vocab={len(teacher_tok)} (separate tokenization paths)"
+    )
 
     # ----- Data -----
     raw = load_medi2_examples(args.num_train_examples, seed=args.seed)
-    dataset = EmbeddingDataset(raw, student_tok, max_length=args.max_length)
+    dataset = EmbeddingDataset(
+        raw,
+        student_tok=student_tok,
+        teacher_tok=teacher_tok,
+        student_query_prefix=args.student_query_prefix,
+        teacher_query_prefix=args.teacher_query_prefix,
+        max_length=args.max_length,
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.per_device_batch_size,
@@ -440,6 +496,14 @@ def main():
         student, teacher, optimizer, loader, scheduler
     )
 
+    # `from_pretrained` returns models in eval() mode by default, so
+    # without this call dropout (including LoRA dropout=0.05) stays
+    # disabled for the entire run. Fix per Codex review on PR #9
+    # (round 2, P2).
+    student.train()
+    # Teacher stays in eval() mode -- dropout disabled for stable
+    # distillation targets.
+
     # ----- Training loop -----
     logger.info(f"Starting distillation ({total_steps} optimization steps)")
     completed_steps = 0
@@ -449,26 +513,42 @@ def main():
     for epoch in range(args.num_train_epochs):
         for step, batch in enumerate(loader):
             with accelerator.accumulate(student):
-                # Student encodes
-                q_s = encode_student(student, batch["query_input_ids"], batch["query_attention_mask"])
-                p_s = encode_student(student, batch["passage_input_ids"], batch["passage_attention_mask"])
+                # Student encodes its OWN tokenized inputs (with the
+                # student's canonical query prefix `<ACT:RET>`).
+                q_s = encode_student(
+                    student, batch["s_query_ids"], batch["s_query_mask"], args.student_pooling
+                )
+                p_s = encode_student(
+                    student, batch["s_passage_ids"], batch["s_passage_mask"], args.student_pooling
+                )
 
-                # Teacher encodes the SAME tokenized batch (vocab compat
-                # was verified once at startup, so we can reuse the
-                # student's tokenized IDs without re-encoding).
-                q_t = encode_teacher(teacher, batch["query_input_ids"], batch["query_attention_mask"])
-                p_t = encode_teacher(teacher, batch["passage_input_ids"], batch["passage_attention_mask"])
+                # Teacher encodes its OWN tokenized inputs (with the
+                # teacher's Qwen-style instruction prefix). This is
+                # the recipe that scored 0.4427 avg in the anchor; using
+                # the student's tokenization here would feed the teacher
+                # OOV action-token IDs and degrade the signal.
+                q_t = encode_teacher(
+                    teacher, batch["t_query_ids"], batch["t_query_mask"], args.teacher_pooling
+                )
+                p_t = encode_teacher(
+                    teacher, batch["t_passage_ids"], batch["t_passage_mask"], args.teacher_pooling
+                )
 
-                # Distillation loss (similarity-matrix KL)
+                # Distillation loss (similarity-matrix KL).
+                # Note: q_s and q_t come from different models with
+                # different hidden dims (3B Qwen2.5 = 2048, Qwen3-Emb-
+                # 0.6B = 1024), but the loss is over scalar similarity
+                # distributions so the dim difference is invisible.
                 distill_loss = similarity_matrix_kl_loss(
                     q_t, p_t, q_s, p_s, temperature=args.distill_temperature
                 )
 
-                # InfoNCE anchor on the student
+                # InfoNCE anchor on the student (uses student-tokenized
+                # negatives only).
                 neg_emb = None
-                if batch["negative_input_ids"] is not None:
+                if batch["s_negative_ids"] is not None:
                     neg_emb = encode_student(
-                        student, batch["negative_input_ids"], batch["negative_attention_mask"]
+                        student, batch["s_negative_ids"], batch["s_negative_mask"], args.student_pooling
                     )
                 info_loss = info_nce_loss(q_s, p_s, neg_emb, temperature=args.distill_temperature)
 
