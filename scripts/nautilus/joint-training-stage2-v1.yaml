@@ -74,9 +74,21 @@ spec:
               python3 -m venv /opt/venv
               export PATH="/opt/venv/bin:$PATH"
 
+              # Pin transformers to the 4.x line. The 5.x release refactored
+              # the attention-mask infrastructure (`masking_utils.and_mask`)
+              # and breaks our 4D bidirectional embedding mask in
+              # `make_bidirectional_attention_mask`. The April 4D-mask fix
+              # was written against transformers 4.51.x; under 5.x the same
+              # mask shape produces RuntimeError "size of tensor a (2) must
+              # match the size of tensor b (512) at non-singleton dimension
+              # 3" on the very first forward pass. Pinning < 5.0 restores
+              # the working state. If we want to support transformers 5.x
+              # long-term, `make_bidirectional_attention_mask` needs to be
+              # updated to the new mask interface -- that's a separate
+              # refactor, not blocking this run.
               pip install --no-cache-dir \
                 torch \
-                transformers \
+                "transformers>=4.51.0,<5.0" \
                 accelerate \
                 peft \
                 datasets \
@@ -86,11 +98,17 @@ spec:
                 bitsandbytes
 
               # ---- Clone repo ----
+              # Use main, not benchmarking-suite. PR #2's bug fixes
+              # (hard-negative gather padding, query prefix wiring, MEDI2
+              # negatives in contrastive candidate set) all merged to main
+              # on 2026-05-10. benchmarking-suite is Arjun's older branch
+              # without those fixes -- launching off it would silently
+              # repeat the April-stall bug profile.
               echo "Cloning repository..."
               git clone https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/repo
               cd /workspace/repo
-              git checkout benchmarking-suite
-              echo "Checked out benchmarking-suite branch"
+              git checkout main
+              echo "Checked out main branch"
 
               # ---- Login to HuggingFace ----
               python3 -c "from huggingface_hub import login; login(token='${HF_TOKEN}')"
