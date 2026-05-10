@@ -294,6 +294,25 @@ def parse_args() -> DistillArgs:
     return DistillArgs(**{f.name: getattr(args, f.name) for f in DistillArgs.__dataclass_fields__.values()})
 
 
+# Fields that must NEVER be serialized to disk -- they contain live
+# credentials. Any persisted artifact (training_log.json, distill_summary.json,
+# wandb config, anything else) MUST go through `_args_for_log()` first.
+# Fix per Codex review on PR #9 (P1).
+_SENSITIVE_ARG_FIELDS = frozenset({"hub_token"})
+
+
+def _args_for_log(args: DistillArgs) -> Dict:
+    """Return a dict-of-args with sensitive fields masked. Use this
+    instead of `vars(args)` for anything that lands in a file."""
+    safe = {}
+    for k, v in vars(args).items():
+        if k in _SENSITIVE_ARG_FIELDS:
+            safe[k] = "<redacted>" if v else None
+        else:
+            safe[k] = v
+    return safe
+
+
 def main():
     args = parse_args()
 
@@ -311,7 +330,9 @@ def main():
     set_seed(args.seed)
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
-        pprint(vars(args))
+        # Pretty-print the safe view -- never leak hub_token to stdout
+        # (logs may be captured by CI, sent to monitoring, etc).
+        pprint(_args_for_log(args))
 
     # ----- Tokenizers -----
     student_tok = AutoTokenizer.from_pretrained(args.student_model, trust_remote_code=True, token=args.hub_token)
@@ -363,6 +384,22 @@ def main():
     for p in teacher.parameters():
         p.requires_grad = False
 
+    # Tokenizer compatibility check, ONCE before training. Doing this
+    # per-batch (as the v1 draft did) is O(vocab_size) per step and
+    # delays the failure until after expensive model+data setup. Hoist
+    # to startup so we fail fast with a clear error. Fix per Codex
+    # review on PR #9 (P2).
+    if teacher_tok.get_vocab() != student_tok.get_vocab():
+        raise RuntimeError(
+            f"teacher tokenizer ({args.teacher_model}) and student tokenizer "
+            f"({args.student_model}) have different vocabularies. v1 of this "
+            f"script reuses student-tokenized batches for teacher encoding, "
+            f"which is only valid when the vocabs are identical (Qwen-family "
+            f"teacher with Qwen-family student). Re-tokenization for cross-"
+            f"vocab teachers is not implemented."
+        )
+    logger.info("Tokenizer compatibility verified (student/teacher vocabs match)")
+
     # ----- Data -----
     raw = load_medi2_examples(args.num_train_examples, seed=args.seed)
     dataset = EmbeddingDataset(raw, student_tok, max_length=args.max_length)
@@ -381,11 +418,17 @@ def main():
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    total_steps = (
-        args.max_train_steps
-        if args.max_train_steps
-        else len(loader) // args.gradient_accumulation_steps * args.num_train_epochs
-    )
+    # Use ceil so a partial accumulation cycle at the end of an epoch
+    # still gets counted as one optimizer step. Floor division here
+    # underestimates total_steps and causes the LR scheduler's
+    # warmup/decay to terminate before the actual last step, drifting
+    # the LR off-schedule for the final partial cycle. Fix per Codex
+    # review on PR #9 (P2).
+    if args.max_train_steps:
+        total_steps = args.max_train_steps
+    else:
+        steps_per_epoch = math.ceil(len(loader) / args.gradient_accumulation_steps)
+        total_steps = steps_per_epoch * args.num_train_epochs
     scheduler = get_scheduler(
         args.lr_scheduler_type,
         optimizer=optimizer,
@@ -410,20 +453,9 @@ def main():
                 q_s = encode_student(student, batch["query_input_ids"], batch["query_attention_mask"])
                 p_s = encode_student(student, batch["passage_input_ids"], batch["passage_attention_mask"])
 
-                # Teacher encodes the SAME texts. Tokenization could
-                # differ between teacher_tok and student_tok in
-                # principle, but both Qwen tokenizers use the same
-                # underlying BPE so the IDs are compatible. To be safe
-                # we re-tokenize for the teacher when teacher_tok != student_tok.
-                if teacher_tok.get_vocab() != student_tok.get_vocab():
-                    # Different tokenizer -> re-tokenize the raw text.
-                    # We don't have raw text in the collated batch, so this
-                    # is currently a no-op (raise and refuse to silently
-                    # cross tokenizers).
-                    raise RuntimeError(
-                        "teacher and student tokenizers differ; re-tokenization "
-                        "not implemented in v1. Use Qwen-family teachers only."
-                    )
+                # Teacher encodes the SAME tokenized batch (vocab compat
+                # was verified once at startup, so we can reuse the
+                # student's tokenized IDs without re-encoding).
                 q_t = encode_teacher(teacher, batch["query_input_ids"], batch["query_attention_mask"])
                 p_t = encode_teacher(teacher, batch["passage_input_ids"], batch["passage_attention_mask"])
 
@@ -483,7 +515,11 @@ def main():
         accelerator.unwrap_model(student).save_pretrained(final_dir)
         student_tok.save_pretrained(final_dir)
         with open(os.path.join(args.output_dir, "training_log.json"), "w") as f:
-            json.dump({"args": vars(args), "losses": losses, "elapsed_s": time.time() - t0}, f, indent=2)
+            # Use the redacted view so hub_token never lands on disk.
+            json.dump(
+                {"args": _args_for_log(args), "losses": losses, "elapsed_s": time.time() - t0},
+                f, indent=2,
+            )
         logger.info(f"Final checkpoint saved to {final_dir}")
 
         if args.push_to_hub_repo:
