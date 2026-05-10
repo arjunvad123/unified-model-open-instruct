@@ -1120,33 +1120,58 @@ def main():
                     all_query_emb = accelerator.gather(query_emb)
                     all_passage_emb = accelerator.gather(passage_emb)
 
-                    # Synchronize whether every rank has negatives this step.
-                    # `embedding_sources` can mix datasets with and without a
-                    # `negative` field, so different ranks may end up with
-                    # `negative_emb is None` in the same step. Calling
-                    # `accelerator.gather(negative_emb)` only on some ranks
-                    # diverges the collective and hangs distributed training;
-                    # gathering with mismatched shapes (different per-rank
-                    # negative counts) errors. Use a unanimity check so all
-                    # ranks make the same decision. Fix per Codex review on
-                    # PR #2 (round 2).
-                    local_has_neg = torch.tensor(
-                        [1 if negative_emb is not None else 0],
-                        device=accelerator.device,
-                        dtype=torch.long,
-                    )
-                    all_has_neg = accelerator.gather(local_has_neg)
-                    all_ranks_have_negatives = bool(all_has_neg.min().item())
+                    # Always gather hard negatives across ranks, padding-with-mask
+                    # so the collective sees same-shape tensors regardless of
+                    # which ranks had negatives in their local batch.
+                    #
+                    # Why: `embedding_sources` mixes datasets with and without a
+                    # `negative` field (MEDI2 has them; some auxiliary sources
+                    # don't). The collate_fn only returns negatives if every row
+                    # in a per-device batch has them, so a single rank can flip
+                    # between "has negatives" and "no negatives" between steps,
+                    # and different ranks can disagree at the same step. An
+                    # earlier unanimity gate dropped negatives entirely whenever
+                    # any rank lacked them -- which Codex flagged as P1 because
+                    # mixed-source training makes that condition frequently true,
+                    # silently regressing to in-batch-only negatives.
+                    #
+                    # Approach: each rank produces a same-shape `local_neg`
+                    # tensor and a 1D validity mask. Ranks with no negatives
+                    # contribute zero rows; the gathered mask filters those out
+                    # before concatenating onto `all_passage_emb`. The collective
+                    # is uniform-shape and never diverges. Fix per Codex review
+                    # on PR #2 (round 3).
+                    if negative_emb is not None:
+                        local_neg = negative_emb
+                        local_neg_valid = torch.ones(
+                            negative_emb.size(0),
+                            device=accelerator.device,
+                            dtype=torch.long,
+                        )
+                    else:
+                        # Zero-pad to the same shape as `passage_emb`. Per-device
+                        # batch size is uniform across ranks under DDP, so this
+                        # matches what other ranks may produce when they DO have
+                        # negatives.
+                        local_neg = torch.zeros_like(passage_emb)
+                        local_neg_valid = torch.zeros(
+                            passage_emb.size(0),
+                            device=accelerator.device,
+                            dtype=torch.long,
+                        )
 
-                    if all_ranks_have_negatives:
-                        all_negative_emb = accelerator.gather(negative_emb)
-                        all_passage_emb = torch.cat([all_passage_emb, all_negative_emb], dim=0)
-                    elif debug_mode and accelerator.is_main_process and bool(all_has_neg.max().item()):
-                        # At least one rank had negatives but not all — we
-                        # dropped them this step to keep the collective safe.
+                    all_negative_emb = accelerator.gather(local_neg)
+                    all_negative_valid = accelerator.gather(local_neg_valid).bool()
+                    real_negatives = all_negative_emb[all_negative_valid]
+                    if real_negatives.numel() > 0:
+                        all_passage_emb = torch.cat([all_passage_emb, real_negatives], dim=0)
+
+                    if debug_mode and accelerator.is_main_process:
+                        n_real = int(all_negative_valid.sum().item())
+                        n_total = all_negative_valid.numel()
                         logger.info(
-                            f"[DEBUG Step {completed_steps}] Skipping hard negatives: "
-                            f"per-rank has_neg={all_has_neg.tolist()}"
+                            f"[DEBUG Step {completed_steps}] Gathered negatives: "
+                            f"{n_real}/{n_total} valid across {accelerator.num_processes} ranks"
                         )
 
                     if debug_mode and accelerator.is_main_process:

@@ -58,7 +58,9 @@ spec:
               pip install torch --index-url https://download.pytorch.org/whl/cu121
               pip install "transformers>=4.51.0" accelerate peft mteb numpy
 
-              mkdir -p "/workspace/results/${JOB_NAME}"
+              # /workspace/results is already job-scoped via subPathExpr;
+              # no need to mkdir a JOB_NAME subdir under it.
+              mkdir -p /workspace/results
               cd /workspace
 
               # Shallow-clone the repo so the inline Python can import the
@@ -92,7 +94,13 @@ spec:
               from peft import PeftConfig, PeftModel
               from transformers import AutoModelForCausalLM, AutoTokenizer
 
-              RESULTS_DIR = os.path.join("/workspace/results", os.environ["JOB_NAME"])
+              # The volume mount already applies subPathExpr "$(JOB_NAME)",
+              # so /workspace/results is already job-scoped at the storage
+              # layer. Re-joining JOB_NAME at the path layer landed the
+              # output at <PVC>/<job>/<job>/eval_matrix.json on the previous
+              # run, which fetch_pvc_results.sh doesn't auto-locate. Fix
+              # per Codex review on PR #2.
+              RESULTS_DIR = "/workspace/results"
               OUTPUT_PATH = os.path.join(RESULTS_DIR, "eval_matrix.json")
 
               TASKS = ["NFCorpus", "SciFact", "ArguAna", "SCIDOCS"]
