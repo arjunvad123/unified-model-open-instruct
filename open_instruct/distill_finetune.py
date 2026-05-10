@@ -193,13 +193,25 @@ def mean_pool(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tenso
 
 
 def last_token_pool(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Pool the final non-pad token. Matches Qwen3-Embedding's published
-    recipe (the teacher hits 0.4427 avg under this; mean-pool collapses
-    it to 0.2573 -- using mean for the teacher would distill from a
-    badly-degraded signal)."""
+    """Pool the final non-pad token, robust to padding side. Matches
+    Qwen3-Embedding's published recipe (the teacher hits 0.4427 avg
+    under this; mean-pool collapses it to 0.2573 -- using mean for the
+    teacher would distill from a badly-degraded signal).
+
+    The naive `sum(mask) - 1` only works for right-padded batches; for
+    left-padded inputs (e.g., mask [0,0,1,1] -> sum=2 -> index 1) it
+    picks a pad position. Instead, find the LAST 1 in the mask by
+    argmax-ing on the reversed mask -- works for any padding side.
+    Fix per Codex review on PR #9 (round 3, P1).
+    """
     hidden = hidden.float()
-    seq_lens = attention_mask.sum(dim=1).clamp(min=1) - 1   # last non-pad index
-    return hidden[torch.arange(hidden.size(0), device=hidden.device), seq_lens]
+    seq_len = attention_mask.size(1)
+    # Reverse the mask along the sequence axis, then argmax to find the
+    # first 1 in the reversed view = the last 1 in the original view.
+    reversed_mask = attention_mask.flip(dims=[1])
+    last_from_end = reversed_mask.argmax(dim=1)
+    last_valid = (seq_len - 1) - last_from_end
+    return hidden[torch.arange(hidden.size(0), device=hidden.device), last_valid]
 
 
 def _pool(name: str, hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -313,7 +325,11 @@ class DistillArgs:
     # Per-model encoding recipes. Defaults match each model's anchor-
     # winning recipe so we distill from the best teacher signal into the
     # student under its own canonical eval recipe.
-    student_query_prefix: str = "<ACT:RET> "
+    # `student_query_prefix` is derived from `ACT_RET` at module load so
+    # any future renaming of the routing token in the action_tokens
+    # registry propagates here automatically. Fix per Codex review on
+    # PR #9 (round 3, P2).
+    student_query_prefix: str = f"{ACT_RET} "
     student_pooling: str = "mean"            # H1 winner for Stage 1.5
     teacher_query_prefix: str = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
     teacher_pooling: str = "last_token"      # Qwen3-Emb anchor winner
