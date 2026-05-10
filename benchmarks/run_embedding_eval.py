@@ -184,55 +184,150 @@ def eval_banking77_classification(model: EmbeddingModel, num_train: int = 1000, 
 
 
 def eval_retrieval(model: EmbeddingModel, num_queries: int = 100) -> Dict:
-    """Evaluate retrieval quality on NQ-like task."""
+    """Evaluate retrieval quality on a held-out NQ task (BEIR/MTEB NQ test).
+
+    Replaces the previous use of `sentence-transformers/natural-questions` train
+    split, which Stage-1.5-v3's contrastive trainer also samples from
+    (scripts/data/create_contrastive_dataset.py) — contamination by construction.
+    MTEB's NQ task wraps the canonical BEIR NQ retrieval benchmark; the public
+    held-out eval split is `test`.
+
+    Schema differs from the old streaming source: BEIR exposes
+    queries / corpus / qrels separately rather than 1:1 query–answer pairs.
+    The function still returns Hits@k / MRR as before; "correct" is now defined
+    as any qrel-relevant document landing at the given rank.
+    """
     print("\n" + "="*60)
     print("RETRIEVAL EVALUATION")
     print("="*60)
 
-    # Load Natural Questions dataset
-    print("Loading Natural Questions dataset...")
-    # TODO(decontam): this loads sentence-transformers/natural-questions TRAIN
-    # split, which is the same source the Stage-1.5-v3 contrastive trainer
-    # samples from (scripts/data/create_contrastive_dataset.py). Any retrieval
-    # number reported from this code path against a Stage-1.5-v3 checkpoint
-    # is contaminated by construction. Swap to a held-out source before
-    # publishing -- candidates: BEIR/nq dev, sentence-transformers/nq dev
-    # split, or the MTEB NQ task. See decontamination/EVAL_CONTAMINATION_CHECK.md.
+    print("Loading MTEB NQ (BEIR) held-out test split...")
     try:
-        dataset = load_dataset("sentence-transformers/natural-questions", split="train", streaming=True)
-    except Exception:
-        print("Could not load NQ dataset, using synthetic data...")
+        import mteb
+
+        task = mteb.get_task("NQ", eval_splits=["test"])
+        task.load_data()
+
+        subset = list(task.dataset.keys())[0]
+        split_name = "test" if "test" in task.dataset[subset] else list(task.dataset[subset].keys())[0]
+        split_data = task.dataset[subset][split_name]
+
+        corpus_ds = split_data["corpus"]
+        queries_ds = split_data["queries"]
+        qrels = split_data["relevant_docs"]
+    except Exception as e:
+        print(f"Could not load MTEB NQ dataset ({e}), using synthetic data...")
         return eval_synthetic_retrieval(model)
 
-    # Collect query-answer pairs
-    pairs = []
-    for item in tqdm(dataset, total=num_queries * 2, desc="Loading data"):
-        query = item.get("query", "")
-        answer = item.get("answer", "")
+    # Convert MTEB retrieval schema into sampled query / relevant-passage pairs.
+    queries_by_id = {str(row["id"]): row["text"] for row in queries_ds}
+    qrels_by_query = defaultdict(list)
+    if isinstance(qrels, dict):
+        for query_id, docs in qrels.items():
+            if isinstance(docs, dict):
+                doc_items = docs.items()
+            else:
+                doc_items = ((doc_id, 1) for doc_id in docs)
+            for doc_id, score in doc_items:
+                if float(score) > 0:
+                    qrels_by_query[str(query_id)].append(str(doc_id))
+    else:
+        for row in qrels:
+            query_id = row.get("query-id", row.get("query_id", row.get("qid")))
+            doc_id = row.get("corpus-id", row.get("corpus_id", row.get("docid")))
+            score = row.get("score", 1)
+            if query_id is not None and doc_id is not None and float(score) > 0:
+                qrels_by_query[str(query_id)].append(str(doc_id))
 
-        if query.strip() and answer.strip() and len(answer) > 20:
-            pairs.append({"query": query, "answer": answer})
+    pairs = []
+    needed_doc_ids = set()
+    for query_id, doc_ids in qrels_by_query.items():
+        query = queries_by_id.get(query_id, "")
+        if not query.strip() or not doc_ids:
+            continue
+
+        pairs.append({"query": query, "relevant_doc_ids": doc_ids})
+        needed_doc_ids.update(doc_ids)
 
         if len(pairs) >= num_queries:
             break
+
+    # Filter the corpus down to only the documents referenced by the
+    # sampled queries, then iterate that filtered subset. The previous
+    # implementation walked every row of `corpus_ds` and used the early
+    # break as a best-effort short-circuit, which still degraded to a
+    # full corpus pass whenever the needed docs sat near the end of the
+    # corpus or any were missing. With a batched filter the scan happens
+    # at Arrow level (much faster than per-row Python) and the iteration
+    # below is O(needed) instead of O(corpus). Fix per Codex review on
+    # PR #2.
+    needed_doc_ids_set = {str(d) for d in needed_doc_ids}
+    if hasattr(corpus_ds, "filter"):
+        try:
+            filtered_corpus = corpus_ds.filter(
+                lambda batch: [str(d) in needed_doc_ids_set for d in batch["id"]],
+                batched=True,
+                batch_size=10_000,
+                desc="Filtering corpus to needed docs",
+            )
+        except Exception:
+            # Fall back to row-iteration with early break for non-HF
+            # dataset-like objects that don't support the batched filter.
+            filtered_corpus = corpus_ds
+    else:
+        filtered_corpus = corpus_ds
+
+    documents_by_id = {}
+    filtered_total = (
+        len(filtered_corpus) if hasattr(filtered_corpus, "__len__") else None
+    )
+    for row in tqdm(
+        filtered_corpus, total=filtered_total, desc="Loading documents"
+    ):
+        doc_id = str(row["id"])
+        if doc_id not in needed_doc_ids_set:
+            # Only reachable on the fallback path where filtered_corpus is
+            # the unfiltered corpus_ds; preserves the original semantics.
+            continue
+
+        title = (row.get("title") or "").strip()
+        text = (row.get("text") or "").strip()
+        document = f"{title} {text}".strip()
+        if document:
+            documents_by_id[doc_id] = document
+
+        if len(documents_by_id) >= len(needed_doc_ids_set):
+            break
+
+    pairs = [
+        {**pair, "relevant_doc_ids": [doc_id for doc_id in pair["relevant_doc_ids"] if doc_id in documents_by_id]}
+        for pair in pairs
+    ]
+    pairs = [pair for pair in pairs if pair["relevant_doc_ids"]]
 
     if len(pairs) < 10:
         print("Not enough data, using synthetic...")
         return eval_synthetic_retrieval(model)
 
-    print(f"Loaded {len(pairs)} query-answer pairs")
+    document_ids = []
+    for pair in pairs:
+        for doc_id in pair["relevant_doc_ids"]:
+            if doc_id not in document_ids:
+                document_ids.append(doc_id)
 
-    # Encode queries and answers
+    print(f"Loaded {len(pairs)} held-out NQ queries and {len(document_ids)} candidate documents")
+
+    # Encode queries and documents
     queries = [p["query"] for p in pairs]
-    answers = [p["answer"] for p in pairs]
+    documents = [documents_by_id[doc_id] for doc_id in document_ids]
 
     print("Encoding queries...")
     query_embs = model.encode(queries, batch_size=16)
-    print("Encoding answers...")
-    answer_embs = model.encode(answers, batch_size=16)
+    print("Encoding documents...")
+    document_embs = model.encode(documents, batch_size=16)
 
     # Compute similarities
-    similarities = query_embs @ answer_embs.T  # [num_queries, num_answers]
+    similarities = query_embs @ document_embs.T  # [num_queries, num_documents]
 
     # Compute metrics
     hits_at_1 = 0
@@ -244,8 +339,9 @@ def eval_retrieval(model: EmbeddingModel, num_queries: int = 100) -> Dict:
         # Get ranking (highest similarity first)
         ranking = np.argsort(-similarities[i])
 
-        # Find position of correct answer
-        correct_pos = np.where(ranking == i)[0][0]
+        # Find best rank of any qrel-relevant document.
+        relevant_doc_ids = set(pairs[i]["relevant_doc_ids"])
+        correct_pos = next(rank for rank, idx in enumerate(ranking) if document_ids[idx] in relevant_doc_ids)
 
         if correct_pos == 0:
             hits_at_1 += 1
@@ -259,8 +355,9 @@ def eval_retrieval(model: EmbeddingModel, num_queries: int = 100) -> Dict:
     n = len(queries)
     results = {
         "task": "Retrieval",
+        "dataset": "MTEB NQ (BEIR) test",
         "num_queries": n,
-        "num_documents": n,
+        "num_documents": len(document_ids),
         "hits@1": float(hits_at_1 / n),
         "hits@5": float(hits_at_5 / n),
         "hits@10": float(hits_at_10 / n),

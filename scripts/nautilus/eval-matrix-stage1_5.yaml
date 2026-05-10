@@ -1,0 +1,497 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: eval-matrix-stage1-5
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-80GB-PCIe
+                      - NVIDIA-A100-PCIE-40GB
+                      - NVIDIA-A100-SXM4-40GB
+                      - NVIDIA-L40S
+                      - NVIDIA-L40
+                      - NVIDIA-A40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-RTX-6000-Ada-Generation
+                      - NVIDIA-A10
+                      - NVIDIA-A30
+                      - NVIDIA-L4
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule
+      containers:
+        - name: eval-matrix
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "==========================================================="
+              echo "Stage 1 / Stage 1.5 BEIR retrieval prefix-pooling matrix"
+              echo "==========================================================="
+              date -u +"start_utc=%Y-%m-%dT%H:%M:%SZ"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              source /opt/venv/bin/activate
+
+              pip install --upgrade pip
+              pip install torch --index-url https://download.pytorch.org/whl/cu121
+              pip install "transformers>=4.51.0" accelerate peft mteb numpy
+
+              # /workspace/results is already job-scoped via subPathExpr;
+              # no need to mkdir a JOB_NAME subdir under it.
+              mkdir -p /workspace/results
+              cd /workspace
+
+              # Shallow-clone the repo so the inline Python can import the
+              # action-tokens registry (open_instruct/action_tokens.py).
+              # Without this we'd hardcode the routing-token literal inside
+              # this YAML and silently drift from training-time behavior on
+              # any future token rename. Fix per Codex review on PR #2.
+              git clone --depth 1 https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/unified-model-open-instruct
+
+              cat > run_eval_matrix.py << 'PYTHON_SCRIPT'
+              import gc
+              import json
+              import math
+              import os
+              import sys
+              import time
+              from datetime import datetime, timezone
+
+              # Source the trained routing token from the project's single
+              # source of truth so the eval matrix can never drift from the
+              # tokenizer the model was trained with.
+              sys.path.insert(0, "/workspace/unified-model-open-instruct")
+              from open_instruct.action_tokens import ACT_RET  # noqa: E402
+
+              import mteb
+              import numpy as np
+              import peft
+              import torch
+              import torch.nn.functional as F
+              import transformers
+              from peft import PeftConfig, PeftModel
+              from transformers import AutoModelForCausalLM, AutoTokenizer
+
+              # The volume mount already applies subPathExpr "$(JOB_NAME)",
+              # so /workspace/results is already job-scoped at the storage
+              # layer. Re-joining JOB_NAME at the path layer landed the
+              # output at <PVC>/<job>/<job>/eval_matrix.json on the previous
+              # run, which fetch_pvc_results.sh doesn't auto-locate. Fix
+              # per Codex review on PR #2.
+              RESULTS_DIR = "/workspace/results"
+              OUTPUT_PATH = os.path.join(RESULTS_DIR, "eval_matrix.json")
+
+              TASKS = ["NFCorpus", "SciFact", "ArguAna", "SCIDOCS"]
+              MODELS = {
+                  "stage1": {
+                      "model_id": "Arjunvad/unified-model-stage1-action-tokens-v2",
+                      "kind": "base",
+                  },
+                  # Stage 1.5 v1 (older lineage: full Qwen2.5-3B-Instruct fine-tune,
+                  # NOT a LoRA on top of stage1-action-tokens-v2). Kept here so we
+                  # can answer "did v1 -> v2 regress on retrieval?" without a
+                  # separate job. Loaded as a base model.
+                  "stage1_5_v1": {
+                      "model_id": "Arjunvad/unified-model-stage1-5",
+                      "kind": "base",
+                  },
+                  "stage1_5": {
+                      "model_id": "Arjunvad/unified-model-stage1-5-embedding-v2",
+                      "kind": "peft_lora",
+                  },
+              }
+              QUERY_PREFIXES = {
+                  "raw": "",
+                  # ACT_RET is imported from open_instruct/action_tokens.py
+                  # (see clone step above). Trailing space matches the
+                  # training-time prefix in EmbeddingDataset.QUERY_PREFIX.
+                  "act_ret": f"{ACT_RET} ",
+                  "qwen_instruction": "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: ",
+              }
+              POOLINGS = ["mean", "last_token"]
+              MAX_LENGTH = 512
+              BATCH_SIZE = 16
+              DTYPE = torch.bfloat16
+
+              def utc_now():
+                  return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+              def load_model(model_key, model_config):
+                  model_id = model_config["model_id"]
+                  print(f"\nLoading {model_key}: {model_id}", flush=True)
+
+                  if model_config["kind"] == "peft_lora":
+                      peft_config = PeftConfig.from_pretrained(model_id)
+                      base_model_id = peft_config.base_model_name_or_path
+                      print(f"  PEFT base: {base_model_id}", flush=True)
+                      tokenizer = AutoTokenizer.from_pretrained(
+                          base_model_id,
+                          trust_remote_code=True,
+                          token=os.environ.get("HF_TOKEN"),
+                      )
+                      base_model = AutoModelForCausalLM.from_pretrained(
+                          base_model_id,
+                          trust_remote_code=True,
+                          torch_dtype=DTYPE,
+                          device_map="auto",
+                          token=os.environ.get("HF_TOKEN"),
+                      )
+                      model = PeftModel.from_pretrained(
+                          base_model,
+                          model_id,
+                          token=os.environ.get("HF_TOKEN"),
+                      )
+                      print("  Merging LoRA adapter for inference", flush=True)
+                      model = model.merge_and_unload()
+                  else:
+                      tokenizer = AutoTokenizer.from_pretrained(
+                          model_id,
+                          trust_remote_code=True,
+                          token=os.environ.get("HF_TOKEN"),
+                      )
+                      model = AutoModelForCausalLM.from_pretrained(
+                          model_id,
+                          trust_remote_code=True,
+                          torch_dtype=DTYPE,
+                          device_map="auto",
+                          token=os.environ.get("HF_TOKEN"),
+                      )
+
+                  if tokenizer.pad_token is None:
+                      tokenizer.pad_token = tokenizer.eos_token
+                  model.eval()
+                  return tokenizer, model
+
+              def model_device(model):
+                  return next(model.parameters()).device
+
+              def encode_both_poolings(model, tokenizer, texts, prefix="", batch_size=BATCH_SIZE):
+                  mean_chunks = []
+                  last_chunks = []
+                  device = model_device(model)
+
+                  for start in range(0, len(texts), batch_size):
+                      raw_batch = texts[start:start + batch_size]
+                      batch = [prefix + text for text in raw_batch]
+                      inputs = tokenizer(
+                          batch,
+                          padding=True,
+                          truncation=True,
+                          max_length=MAX_LENGTH,
+                          return_tensors="pt",
+                      )
+                      inputs = {key: value.to(device) for key, value in inputs.items()}
+
+                      with torch.no_grad():
+                          outputs = model(
+                              **inputs,
+                              output_hidden_states=True,
+                              use_cache=False,
+                              return_dict=True,
+                          )
+                          hidden = outputs.hidden_states[-1].float()
+                          attention_mask = inputs["attention_mask"]
+                          mask = attention_mask.unsqueeze(-1).float()
+
+                          mean_emb = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
+                          seq_lens = attention_mask.sum(dim=1).clamp(min=1) - 1
+                          last_emb = hidden[torch.arange(hidden.size(0), device=hidden.device), seq_lens]
+
+                          mean_emb = F.normalize(mean_emb, p=2, dim=1)
+                          last_emb = F.normalize(last_emb, p=2, dim=1)
+
+                          mean_chunks.append(mean_emb.cpu().numpy().astype(np.float32))
+                          last_chunks.append(last_emb.cpu().numpy().astype(np.float32))
+
+                  return {
+                      "mean": np.concatenate(mean_chunks, axis=0),
+                      "last_token": np.concatenate(last_chunks, axis=0),
+                  }
+
+              def load_retrieval_task(task_name):
+                  # mteb 2.x exposes retrieval data via task.dataset[subset][split]
+                  # with keys "corpus", "queries", "relevant_docs". (The older
+                  # task.corpus / task.queries attributes from mteb 1.x are gone.)
+                  print(f"Loading MTEB task {task_name}", flush=True)
+                  task = mteb.get_task(task_name)
+                  task.load_data()
+
+                  subsets = list(task.dataset.keys())
+                  if not subsets:
+                      raise RuntimeError(f"{task_name}: empty task.dataset")
+                  subset = subsets[0]
+                  splits = task.dataset[subset]
+
+                  split = None
+                  for candidate in ("test", "dev", "validation", "train"):
+                      if candidate in splits:
+                          split = candidate
+                          break
+                  if split is None:
+                      split = sorted(splits.keys())[0]
+
+                  split_data = splits[split]
+                  corpus_ds = split_data["corpus"]
+                  queries_ds = split_data["queries"]
+                  qrels_raw = split_data["relevant_docs"]
+
+                  # corpus / queries are HF Dataset objects (rows with id + text/title)
+                  corpus_ids = []
+                  corpus_texts = []
+                  for row in corpus_ds:
+                      corpus_id = str(row["id"])
+                      title = (row.get("title") or "").strip()
+                      text = (row.get("text") or "").strip()
+                      doc = f"{title} {text}".strip()
+                      corpus_ids.append(corpus_id)
+                      corpus_texts.append(doc)
+
+                  query_ids = []
+                  query_texts = []
+                  for row in queries_ds:
+                      query_ids.append(str(row["id"]))
+                      query_texts.append(row["text"])
+
+                  # qrels: dict-of-dicts {qid: {doc_id: score}} OR list of rows.
+                  qrels = {}
+                  if isinstance(qrels_raw, dict):
+                      for qid, docs in qrels_raw.items():
+                          if isinstance(docs, dict):
+                              qrels[str(qid)] = {str(d): float(s) for d, s in docs.items()}
+                          else:
+                              qrels[str(qid)] = {str(d): 1.0 for d in docs}
+                  else:
+                      for row in qrels_raw:
+                          qid = row.get("query-id", row.get("query_id", row.get("qid")))
+                          did = row.get("corpus-id", row.get("corpus_id", row.get("docid")))
+                          score = float(row.get("score", 1))
+                          if qid is not None and did is not None:
+                              qrels.setdefault(str(qid), {})[str(did)] = score
+
+                  return {
+                      "subset": subset,
+                      "split": split,
+                      "corpus_ids": corpus_ids,
+                      "corpus_texts": corpus_texts,
+                      "query_ids": query_ids,
+                      "query_texts": query_texts,
+                      "qrels": qrels,
+                  }
+
+              def compute_metrics(query_emb, corpus_emb, query_ids, corpus_ids, qrels):
+                  scores = np.matmul(query_emb, corpus_emb.T)
+                  ndcg10_total = 0.0
+                  hits1_total = 0.0
+                  mrr_total = 0.0
+                  evaluated = 0
+
+                  for query_index, query_id in enumerate(query_ids):
+                      rels_raw = qrels.get(query_id, {})
+                      if not rels_raw:
+                          continue
+
+                      rel_scores = {}
+                      for doc_id, rel in rels_raw.items():
+                          try:
+                              rel_value = float(rel)
+                          except (TypeError, ValueError):
+                              rel_value = 1.0
+                          if rel_value > 0:
+                              rel_scores[doc_id] = rel_value
+
+                      if not rel_scores:
+                          continue
+
+                      evaluated += 1
+                      ranked_idx = np.argsort(scores[query_index])[::-1]
+                      ranked_doc_ids = [corpus_ids[idx] for idx in ranked_idx]
+
+                      if ranked_doc_ids[0] in rel_scores:
+                          hits1_total += 1.0
+
+                      for rank, doc_id in enumerate(ranked_doc_ids, start=1):
+                          if doc_id in rel_scores:
+                              mrr_total += 1.0 / rank
+                              break
+
+                      dcg = 0.0
+                      for rank, doc_id in enumerate(ranked_doc_ids[:10], start=1):
+                          gain = rel_scores.get(doc_id, 0.0)
+                          if gain > 0:
+                              dcg += gain / math.log2(rank + 1)
+
+                      ideal_gains = sorted(rel_scores.values(), reverse=True)[:10]
+                      idcg = sum(gain / math.log2(rank + 1) for rank, gain in enumerate(ideal_gains, start=1))
+                      if idcg > 0:
+                          ndcg10_total += dcg / idcg
+
+                  if evaluated == 0:
+                      return {"ndcg10": 0.0, "hits1": 0.0, "mrr": 0.0}
+
+                  return {
+                      "ndcg10": ndcg10_total / evaluated,
+                      "hits1": hits1_total / evaluated,
+                      "mrr": mrr_total / evaluated,
+                  }
+
+              def package_config():
+                  return {
+                      "job_name": os.environ["JOB_NAME"],
+                      "created_utc": utc_now(),
+                      "tasks": TASKS,
+                      "models": MODELS,
+                      "query_prefixes": QUERY_PREFIXES,
+                      "poolings": POOLINGS,
+                      "max_length": MAX_LENGTH,
+                      "batch_size": BATCH_SIZE,
+                      "dtype": "bfloat16",
+                      "hidden_state_cache_policy": "One model forward pass per encoded text batch returns last hidden state; mean and last-token embeddings are both derived from that cached tensor.",
+                      "versions": {
+                          "python": os.sys.version,
+                          "torch": torch.__version__,
+                          "transformers": transformers.__version__,
+                          "peft": peft.__version__,
+                          "mteb": getattr(mteb, "__version__", "unknown"),
+                          "numpy": np.__version__,
+                      },
+                      "pins": {
+                          "torch": "installed from https://download.pytorch.org/whl/cu121",
+                          "transformers": ">=4.51.0",
+                          "accelerate": "pip latest at job runtime",
+                          "peft": "pip latest at job runtime",
+                          "mteb": "pip latest at job runtime",
+                          "numpy": "pip latest at job runtime",
+                          "lm_eval": "not installed; embedding eval only",
+                      },
+                  }
+
+              def save_progress(config, results):
+                  tmp_path = OUTPUT_PATH + ".tmp"
+                  with open(tmp_path, "w") as f:
+                      json.dump({"config": config, "results": results}, f, indent=2, sort_keys=True)
+                  os.replace(tmp_path, OUTPUT_PATH)
+
+              def main():
+                  os.makedirs(RESULTS_DIR, exist_ok=True)
+                  config = package_config()
+                  results = {}
+
+                  task_data = {task_name: load_retrieval_task(task_name) for task_name in TASKS}
+                  save_progress(config, results)
+
+                  for model_key, model_config in MODELS.items():
+                      tokenizer, model = load_model(model_key, model_config)
+
+                      for task_name in TASKS:
+                          data = task_data[task_name]
+                          print(f"\nEvaluating {model_key} on {task_name}", flush=True)
+
+                          corpus_embeddings = encode_both_poolings(
+                              model,
+                              tokenizer,
+                              data["corpus_texts"],
+                              prefix="",
+                          )
+
+                          query_embeddings_by_prefix = {}
+                          for prefix_key, prefix in QUERY_PREFIXES.items():
+                              print(f"  Encoding queries with prefix={prefix_key}", flush=True)
+                              query_embeddings_by_prefix[prefix_key] = encode_both_poolings(
+                                  model,
+                                  tokenizer,
+                                  data["query_texts"],
+                                  prefix=prefix,
+                              )
+
+                          for prefix_key in QUERY_PREFIXES:
+                              for pooling in POOLINGS:
+                                  result_key = f"{model_key}__{prefix_key}__{pooling}"
+                                  if result_key not in results:
+                                      results[result_key] = {}
+
+                                  metrics = compute_metrics(
+                                      query_embeddings_by_prefix[prefix_key][pooling],
+                                      corpus_embeddings[pooling],
+                                      data["query_ids"],
+                                      data["corpus_ids"],
+                                      data["qrels"],
+                                  )
+                                  results[result_key][task_name] = metrics
+                                  print(
+                                      f"  {result_key} {task_name}: "
+                                      f"ndcg10={metrics['ndcg10']:.4f} "
+                                      f"hits1={metrics['hits1']:.4f} "
+                                      f"mrr={metrics['mrr']:.4f}",
+                                      flush=True,
+                                  )
+
+                          del corpus_embeddings
+                          del query_embeddings_by_prefix
+                          gc.collect()
+                          torch.cuda.empty_cache()
+                          save_progress(config, results)
+
+                      del model
+                      del tokenizer
+                      gc.collect()
+                      torch.cuda.empty_cache()
+
+                  config["finished_utc"] = utc_now()
+                  save_progress(config, results)
+                  print(f"\nWrote {OUTPUT_PATH}", flush=True)
+
+              if __name__ == "__main__":
+                  main()
+              PYTHON_SCRIPT
+
+              python run_eval_matrix.py
+              date -u +"finish_utc=%Y-%m-%dT%H:%M:%SZ"
+          env:
+            - name: JOB_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['batch.kubernetes.io/job-name']
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+          resources:
+            requests:
+              memory: 32Gi
+              cpu: "4"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: 38Gi
+              cpu: 4800m
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: results
+              mountPath: /workspace/results
+              subPathExpr: "$(JOB_NAME)"
+      volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: unified-model-data-vol
