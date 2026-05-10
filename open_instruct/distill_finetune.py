@@ -12,46 +12,25 @@
 # reviewer-defense evidence plan).
 
 import argparse
-import contextlib
 import json
 import math
 import os
-import random
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import timedelta
-from typing import Dict, List, Optional
 
-import datasets
 import torch
 import torch.nn.functional as F
-import transformers
 from accelerate import Accelerator, DataLoaderConfiguration
-from accelerate.accelerator import GradientAccumulationPlugin
 from accelerate.logging import get_logger
 from accelerate.utils import InitProcessGroupKwargs, set_seed
 from datasets import load_dataset
 from peft import LoraConfig, TaskType, get_peft_model
 from rich.pretty import pprint
 from torch.utils.data import DataLoader, Dataset
-from tqdm.auto import tqdm
-from transformers import (
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    get_scheduler,
-)
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
-# Resilient ACT_RET import (matches the eval matrix / anchor scripts).
-try:
-    from open_instruct.action_tokens import ACT_RET, ACTION_TOKENS
-except ImportError:
-    try:
-        from open_instruct.action_tokens import ACTION_TOKENS
-        ACT_RET = next(t for t in ACTION_TOKENS if t == "<ACT:RET>")
-    except ImportError:
-        ACT_RET = "<ACT:RET>"
-        ACTION_TOKENS = ["<ACT:THINK>", "<ACT:RET>", "<ACT:GEN>", "<ACT:STOP>", "<WAIT>", "<RET_RESULT>"]
+from open_instruct.action_tokens import ACT_RET
 
 logger = get_logger(__name__)
 
@@ -80,7 +59,7 @@ class EmbeddingDataset(Dataset):
 
     def __init__(
         self,
-        data: List[Dict],
+        data: list[dict],
         student_tok,
         teacher_tok,
         student_query_prefix: str,
@@ -98,13 +77,7 @@ class EmbeddingDataset(Dataset):
         return len(self.data)
 
     def _tokenize(self, tok, text):
-        return tok(
-            text,
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
+        return tok(text, max_length=self.max_length, padding="max_length", truncation=True, return_tensors="pt")
 
     def __getitem__(self, idx):
         item = self.data[idx]
@@ -152,7 +125,7 @@ def embedding_collate_fn(batch):
     return collated
 
 
-def load_medi2_examples(num_examples: int, seed: int = 42) -> List[Dict]:
+def load_medi2_examples(num_examples: int, seed: int = 42) -> list[dict]:
     """Load MEDI2 query-positive-(negative) triples, same source Stage 1.5 used."""
     logger.info(f"Loading {num_examples} MEDI2 examples (seed={seed})")
     ds = load_dataset("GritLM/MEDI2", split="train", streaming=True)
@@ -165,10 +138,7 @@ def load_medi2_examples(num_examples: int, seed: int = 42) -> List[Dict]:
         neg_list = item.get("neg", [])
         if not pos_list:
             continue
-        record = {
-            "query": item.get("query", ""),
-            "passage": pos_list[0],
-        }
+        record = {"query": item.get("query", ""), "passage": pos_list[0]}
         if neg_list:
             record["negative"] = neg_list[0]
         if not record["query"].strip() or not record["passage"].strip():
@@ -258,9 +228,7 @@ def encode_teacher(model, input_ids, attention_mask, pooling: str) -> torch.Tens
 # LOSSES
 # =============================================================================
 def similarity_matrix_kl_loss(
-    q_t: torch.Tensor, p_t: torch.Tensor,
-    q_s: torch.Tensor, p_s: torch.Tensor,
-    temperature: float = 0.05,
+    q_t: torch.Tensor, p_t: torch.Tensor, q_s: torch.Tensor, p_s: torch.Tensor, temperature: float = 0.05
 ) -> torch.Tensor:
     """
     KL(P_teacher || P_student) where P_x = softmax(q_x @ p_x.T / temperature).
@@ -270,7 +238,7 @@ def similarity_matrix_kl_loss(
     distribution over candidate passages. We push the student's
     distribution toward the teacher's.
     """
-    sim_t = q_t @ p_t.T / temperature   # [bsz, bsz]
+    sim_t = q_t @ p_t.T / temperature  # [bsz, bsz]
     sim_s = q_s @ p_s.T / temperature
 
     # log_softmax for student (numerator of KL), softmax for teacher (target)
@@ -283,17 +251,15 @@ def similarity_matrix_kl_loss(
 
 
 def info_nce_loss(
-    q: torch.Tensor, p: torch.Tensor,
-    negs: Optional[torch.Tensor] = None,
-    temperature: float = 0.05,
+    q: torch.Tensor, p: torch.Tensor, negs: torch.Tensor | None = None, temperature: float = 0.05
 ) -> torch.Tensor:
     """Standard contrastive loss on the student. Anchors training when
     distillation alone might collapse on noisy teacher signal."""
     candidates = p
     if negs is not None and negs.size(0) > 0:
         candidates = torch.cat([p, negs], dim=0)
-    sim = q @ candidates.T / temperature   # [bsz, bsz + n_negs]
-    labels = torch.arange(q.size(0), device=q.device)   # diagonal = positive
+    sim = q @ candidates.T / temperature  # [bsz, bsz + n_negs]
+    labels = torch.arange(q.size(0), device=q.device)  # diagonal = positive
     return F.cross_entropy(sim, labels)
 
 
@@ -311,7 +277,7 @@ class DistillArgs:
     per_device_batch_size: int = 32
     gradient_accumulation_steps: int = 1
     num_train_epochs: int = 1
-    max_train_steps: Optional[int] = None
+    max_train_steps: int | None = None
 
     learning_rate: float = 2e-4
     lr_scheduler_type: str = "cosine"
@@ -330,9 +296,11 @@ class DistillArgs:
     # registry propagates here automatically. Fix per Codex review on
     # PR #9 (round 3, P2).
     student_query_prefix: str = f"{ACT_RET} "
-    student_pooling: str = "mean"            # H1 winner for Stage 1.5
-    teacher_query_prefix: str = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
-    teacher_pooling: str = "last_token"      # Qwen3-Emb anchor winner
+    student_pooling: str = "mean"  # H1 winner for Stage 1.5
+    teacher_query_prefix: str = (
+        "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+    )
+    teacher_pooling: str = "last_token"  # Qwen3-Emb anchor winner
 
     lora_rank: int = 32
     lora_alpha: int = 64
@@ -342,8 +310,8 @@ class DistillArgs:
     seed: int = 42
     log_every: int = 10
     save_every: int = 500
-    push_to_hub_repo: Optional[str] = None
-    hub_token: Optional[str] = None
+    push_to_hub_repo: str | None = None
+    hub_token: str | None = None
 
 
 def parse_args() -> DistillArgs:
@@ -369,7 +337,7 @@ def parse_args() -> DistillArgs:
 _SENSITIVE_ARG_FIELDS = frozenset({"hub_token"})
 
 
-def _args_for_log(args: DistillArgs) -> Dict:
+def _args_for_log(args: DistillArgs) -> dict:
     """Return a dict-of-args with sensitive fields masked. Use this
     instead of `vars(args)` for anything that lands in a file."""
     safe = {}
@@ -413,10 +381,7 @@ def main():
     # ----- Student (LoRA on causal LM) -----
     logger.info(f"Loading student: {args.student_model}")
     student = AutoModelForCausalLM.from_pretrained(
-        args.student_model,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        token=args.hub_token,
+        args.student_model, trust_remote_code=True, torch_dtype=torch.bfloat16, token=args.hub_token
     )
     target_modules = [m.strip() for m in args.lora_target_modules.split(",")]
     lora_config = LoraConfig(
@@ -435,18 +400,12 @@ def main():
     logger.info(f"Loading teacher: {args.teacher_model}")
     try:
         teacher = AutoModel.from_pretrained(
-            args.teacher_model,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            token=args.hub_token,
+            args.teacher_model, trust_remote_code=True, torch_dtype=torch.bfloat16, token=args.hub_token
         )
     except Exception as e:
         logger.warning(f"AutoModel failed ({e!r}); falling back to AutoModelForCausalLM for teacher")
         teacher = AutoModelForCausalLM.from_pretrained(
-            args.teacher_model,
-            trust_remote_code=True,
-            torch_dtype=torch.bfloat16,
-            token=args.hub_token,
+            args.teacher_model, trust_remote_code=True, torch_dtype=torch.bfloat16, token=args.hub_token
         )
     teacher.eval()
     for p in teacher.parameters():
@@ -486,9 +445,7 @@ def main():
 
     # ----- Optimizer + scheduler -----
     optimizer = torch.optim.AdamW(
-        [p for p in student.parameters() if p.requires_grad],
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
+        [p for p in student.parameters() if p.requires_grad], lr=args.learning_rate, weight_decay=args.weight_decay
     )
     # Use ceil so a partial accumulation cycle at the end of an epoch
     # still gets counted as one optimizer step. Floor division here
@@ -526,38 +483,28 @@ def main():
     losses = {"distill": [], "info_nce": [], "total": []}
     t0 = time.time()
 
-    for epoch in range(args.num_train_epochs):
-        for step, batch in enumerate(loader):
+    for _epoch in range(args.num_train_epochs):
+        for _step, batch in enumerate(loader):
             with accelerator.accumulate(student):
                 # Student encodes its OWN tokenized inputs (with the
                 # student's canonical query prefix `<ACT:RET>`).
-                q_s = encode_student(
-                    student, batch["s_query_ids"], batch["s_query_mask"], args.student_pooling
-                )
-                p_s = encode_student(
-                    student, batch["s_passage_ids"], batch["s_passage_mask"], args.student_pooling
-                )
+                q_s = encode_student(student, batch["s_query_ids"], batch["s_query_mask"], args.student_pooling)
+                p_s = encode_student(student, batch["s_passage_ids"], batch["s_passage_mask"], args.student_pooling)
 
                 # Teacher encodes its OWN tokenized inputs (with the
                 # teacher's Qwen-style instruction prefix). This is
                 # the recipe that scored 0.4427 avg in the anchor; using
                 # the student's tokenization here would feed the teacher
                 # OOV action-token IDs and degrade the signal.
-                q_t = encode_teacher(
-                    teacher, batch["t_query_ids"], batch["t_query_mask"], args.teacher_pooling
-                )
-                p_t = encode_teacher(
-                    teacher, batch["t_passage_ids"], batch["t_passage_mask"], args.teacher_pooling
-                )
+                q_t = encode_teacher(teacher, batch["t_query_ids"], batch["t_query_mask"], args.teacher_pooling)
+                p_t = encode_teacher(teacher, batch["t_passage_ids"], batch["t_passage_mask"], args.teacher_pooling)
 
                 # Distillation loss (similarity-matrix KL).
                 # Note: q_s and q_t come from different models with
                 # different hidden dims (3B Qwen2.5 = 2048, Qwen3-Emb-
                 # 0.6B = 1024), but the loss is over scalar similarity
                 # distributions so the dim difference is invisible.
-                distill_loss = similarity_matrix_kl_loss(
-                    q_t, p_t, q_s, p_s, temperature=args.distill_temperature
-                )
+                distill_loss = similarity_matrix_kl_loss(q_t, p_t, q_s, p_s, temperature=args.distill_temperature)
 
                 # InfoNCE anchor on the student (uses student-tokenized
                 # negatives only).
@@ -612,20 +559,15 @@ def main():
         student_tok.save_pretrained(final_dir)
         with open(os.path.join(args.output_dir, "training_log.json"), "w") as f:
             # Use the redacted view so hub_token never lands on disk.
-            json.dump(
-                {"args": _args_for_log(args), "losses": losses, "elapsed_s": time.time() - t0},
-                f, indent=2,
-            )
+            json.dump({"args": _args_for_log(args), "losses": losses, "elapsed_s": time.time() - t0}, f, indent=2)
         logger.info(f"Final checkpoint saved to {final_dir}")
 
         if args.push_to_hub_repo:
             from huggingface_hub import HfApi
+
             api = HfApi()
             api.upload_folder(
-                folder_path=final_dir,
-                repo_id=args.push_to_hub_repo,
-                repo_type="model",
-                token=args.hub_token,
+                folder_path=final_dir, repo_id=args.push_to_hub_repo, repo_type="model", token=args.hub_token
             )
             logger.info(f"Pushed final adapter to https://huggingface.co/{args.push_to_hub_repo}")
 

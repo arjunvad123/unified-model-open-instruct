@@ -80,10 +80,18 @@ spec:
               cd /workspace
 
               echo "Cloning repository..."
-              git clone https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/repo
+              DISTILL_REPO_REF="${DISTILL_REPO_REF:-feat/distillation-stage1-5-from-qwen3-emb}"
+              echo "Checking out ref=$DISTILL_REPO_REF"
+              if ! git clone --depth 1 --branch "$DISTILL_REPO_REF" \
+                https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/repo; then
+                echo "  --branch failed (likely a SHA, not a branch/tag); using full clone + checkout"
+                git clone https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/repo
+                ( cd /workspace/repo && git checkout "$DISTILL_REPO_REF" )
+              fi
               cd /workspace/repo
-              git checkout main
-              echo "Checked out main (head=$(git rev-parse --short HEAD))"
+              export DISTILL_SOURCE_REF="$DISTILL_REPO_REF"
+              export DISTILL_SOURCE_COMMIT="$(git rev-parse HEAD)"
+              echo "Checked out $DISTILL_SOURCE_REF (head=$(git rev-parse --short HEAD))"
 
               # Make the open_instruct package importable.
               export PYTHONPATH=/workspace/repo:${PYTHONPATH:-}
