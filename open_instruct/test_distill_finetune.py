@@ -1,4 +1,13 @@
-from open_instruct.distill_finetune import _extract_medi2_text, load_medi2_examples
+from types import SimpleNamespace
+
+import torch
+
+from open_instruct.distill_finetune import (
+    StudentEmbeddingModel,
+    _extract_medi2_text,
+    encode_student,
+    load_medi2_examples,
+)
 
 
 class _FakeStreamingDataset:
@@ -56,3 +65,32 @@ def test_load_medi2_examples_normalizes_nested_text(monkeypatch):
             "negative": "Casey Neistat and Jesse Wellens, PrankvsPrank.",
         }
     ]
+
+
+def test_encode_student_skips_causal_lm_logits_path():
+    class FakeBackbone:
+        def __call__(self, input_ids, attention_mask, output_hidden_states, use_cache, return_dict):
+            assert output_hidden_states is True
+            assert use_cache is False
+            assert return_dict is True
+            hidden = input_ids.float().unsqueeze(-1).expand(-1, -1, 2)
+            return SimpleNamespace(hidden_states=(hidden,))
+
+    class FakeCausalLm:
+        def __init__(self):
+            self.model = FakeBackbone()
+
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("causal LM forward should not be used for embedding hidden states")
+
+    class FakePeftModel:
+        def __init__(self):
+            self.base_model = SimpleNamespace(model=FakeCausalLm())
+
+    input_ids = torch.tensor([[1, 2, 0], [3, 0, 0]])
+    attention_mask = torch.tensor([[1, 1, 0], [1, 0, 0]])
+
+    encoded = encode_student(StudentEmbeddingModel(FakePeftModel()), input_ids, attention_mask, "mean")
+
+    assert encoded.shape == (2, 2)
+    assert torch.isfinite(encoded).all()

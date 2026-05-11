@@ -215,18 +215,65 @@ def _pool(name: str, hidden: torch.Tensor, attention_mask: torch.Tensor) -> torc
     raise ValueError(f"unknown pooling: {name!r}")
 
 
+def _causal_lm_backbone(causal_lm):
+    """Return a causal LM's backbone module so embedding training skips logits.
+
+    `AutoModelForCausalLM.forward()` always materializes vocab-sized logits.
+    That is unnecessary for this distillation objective and can OOM before the
+    first training step. LoRA adapters are injected into the wrapped backbone
+    modules, so calling that backbone directly still trains the adapter weights.
+    """
+    peft_base = getattr(causal_lm, "base_model", None)
+    peft_wrapped = getattr(peft_base, "model", None) if peft_base is not None else None
+    peft_backbone = getattr(peft_wrapped, "model", None) if peft_wrapped is not None else None
+    if peft_backbone is not None:
+        return peft_backbone
+
+    direct_backbone = getattr(causal_lm, "model", None)
+    if direct_backbone is not None and direct_backbone is not causal_lm:
+        nested_backbone = getattr(direct_backbone, "model", None)
+        return nested_backbone if nested_backbone is not None else direct_backbone
+
+    return causal_lm
+
+
+class StudentEmbeddingModel(torch.nn.Module):
+    """Accelerate/DDP-wrappable student forward for embedding distillation.
+
+    The wrapped PEFT causal LM remains the saved artifact and owner of trainable
+    LoRA parameters, but the forward path returns hidden states from the
+    backbone instead of materializing vocab logits.
+    """
+
+    def __init__(self, causal_lm):
+        super().__init__()
+        self.causal_lm = causal_lm
+
+    def forward(self, input_ids, attention_mask):
+        outputs = _causal_lm_backbone(self.causal_lm)(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        return outputs.hidden_states[-1] if outputs.hidden_states is not None else outputs.last_hidden_state
+
+    def print_trainable_parameters(self):
+        return self.causal_lm.print_trainable_parameters()
+
+    def save_pretrained(self, *args, **kwargs):
+        return self.causal_lm.save_pretrained(*args, **kwargs)
+
+
 def encode_student(model, input_ids, attention_mask, pooling: str) -> torch.Tensor:
-    """Forward through student (causal LM, returns last hidden state).
-    Pooling is configurable -- canonical recipe per H1 result is
-    `mean`, but we keep it parameterized for future ablations."""
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        output_hidden_states=True,
-        use_cache=False,
-        return_dict=True,
-    )
-    pooled = _pool(pooling, outputs.hidden_states[-1], attention_mask)
+    """Forward through the student backbone and pool hidden states.
+
+    Pooling is configurable -- canonical recipe per H1 result is `mean`,
+    but we keep it parameterized for future ablations.
+    """
+    hidden_states = model(input_ids=input_ids, attention_mask=attention_mask)
+    pooled = _pool(pooling, hidden_states, attention_mask)
     return F.normalize(pooled, p=2, dim=-1)
 
 
@@ -415,7 +462,7 @@ def main():
         task_type=TaskType.CAUSAL_LM,
         target_modules=target_modules,
     )
-    student = get_peft_model(student, lora_config)
+    student = StudentEmbeddingModel(get_peft_model(student, lora_config))
     if accelerator.is_main_process:
         student.print_trainable_parameters()
 
