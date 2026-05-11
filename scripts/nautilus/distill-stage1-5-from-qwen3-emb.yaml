@@ -1,0 +1,187 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: distill-stage1-5-from-qwen3-emb
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-80GB-PCIe
+                      - NVIDIA-A100-PCIE-40GB
+                      - NVIDIA-A100-SXM4-40GB
+                      - NVIDIA-L40S
+                      - NVIDIA-L40
+                      - NVIDIA-A40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-RTX-6000-Ada-Generation
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule
+      containers:
+        - name: distill
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "==========================================================="
+              echo "Distillation: Qwen3-Embedding-0.6B -> unified Stage 1.5 v1"
+              echo "==========================================================="
+              echo "Goal: close the 0.090 avg nDCG@10 teacher gap measured by"
+              echo "the eval-anchor + eval-matrix runs on 2026-05-10. LoRA"
+              echo "adapters only -- generation behavior preserved by"
+              echo "construction. See .agents/distillation_design.md for the"
+              echo "full design (loss = similarity-matrix KL + InfoNCE anchor)."
+              date -u +"start_utc=%Y-%m-%dT%H:%M:%SZ"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              export PATH="/opt/venv/bin:$PATH"
+
+              # Same dep pin as Stage 2: transformers==4.51.3 to match the
+              # version the published Stage 1.5 model was authored against
+              # (avoids the tokenizer schema drift hit in Stage 2 round-4).
+              # Full set of deps audited from open_instruct/distill_finetune.py
+              # imports (rich for pprint, protobuf+sentencepiece for the Qwen
+              # tokenizer, etc).
+              pip install --no-cache-dir \
+                torch \
+                "transformers==4.51.3" \
+                accelerate \
+                peft \
+                datasets \
+                huggingface_hub \
+                tqdm \
+                numpy \
+                rich \
+                protobuf \
+                sentencepiece
+
+              # /workspace/results is already job-scoped via subPathExpr.
+              mkdir -p /workspace/results
+              cd /workspace
+
+              echo "Cloning repository..."
+              DISTILL_REPO_REF="${DISTILL_REPO_REF:-feat/distillation-stage1-5-from-qwen3-emb}"
+              echo "Checking out ref=$DISTILL_REPO_REF"
+              if ! git clone --depth 1 --branch "$DISTILL_REPO_REF" \
+                https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/repo; then
+                echo "  --branch failed (likely a SHA, not a branch/tag); using full clone + checkout"
+                git clone https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/repo
+                ( cd /workspace/repo && git checkout "$DISTILL_REPO_REF" )
+              fi
+              cd /workspace/repo
+              export DISTILL_SOURCE_REF="$DISTILL_REPO_REF"
+              export DISTILL_SOURCE_COMMIT="$(git rev-parse HEAD)"
+              echo "Checked out $DISTILL_SOURCE_REF (head=$(git rev-parse --short HEAD))"
+
+              # Make the open_instruct package importable.
+              export PYTHONPATH=/workspace/repo:${PYTHONPATH:-}
+
+              # Hand off to the training script. Hyperparameters from the
+              # design doc; can be overridden via args at apply time if we
+              # want to sweep.
+              python3 open_instruct/distill_finetune.py \
+                --student_model Arjunvad/unified-model-stage1-5 \
+                --teacher_model Qwen/Qwen3-Embedding-0.6B \
+                --output_dir /workspace/results \
+                --num_train_examples 100000 \
+                --max_length 256 \
+                --per_device_batch_size 32 \
+                --gradient_accumulation_steps 1 \
+                --num_train_epochs 1 \
+                --learning_rate 2e-4 \
+                --lr_scheduler_type cosine \
+                --warmup_ratio 0.03 \
+                --weight_decay 0.01 \
+                --distill_temperature 0.05 \
+                --distill_weight 1.0 \
+                --info_nce_weight 0.1 \
+                --lora_rank 32 \
+                --lora_alpha 64 \
+                --lora_dropout 0.05 \
+                --lora_target_modules q_proj,k_proj,v_proj,o_proj \
+                --seed 42 \
+                --log_every 10 \
+                --save_every 500 \
+                --hub_token "${HF_TOKEN}"
+
+              date -u +"finish_utc=%Y-%m-%dT%H:%M:%SZ"
+              echo "Distillation complete. Final adapter at /workspace/results/final"
+              ls -lh /workspace/results/
+
+              # Also dump a brief summary so fetch_pvc_results.sh can preview it.
+              python3 -c "
+              import json, os
+              log_path = '/workspace/results/training_log.json'
+              if os.path.exists(log_path):
+                  log = json.load(open(log_path))
+                  losses = log.get('losses', {})
+                  total = losses.get('total', [])
+                  if total:
+                      summary = {
+                          'first_total_loss': total[0],
+                          'last_total_loss': total[-1],
+                          'min_total_loss': min(total),
+                          'num_steps': len(total),
+                          'first_distill': losses.get('distill', [None])[0],
+                          'last_distill': losses.get('distill', [None])[-1],
+                          'first_info_nce': losses.get('info_nce', [None])[0],
+                          'last_info_nce': losses.get('info_nce', [None])[-1],
+                          'elapsed_s': log.get('elapsed_s'),
+                      }
+                      json.dump({'summary': summary, 'args': log.get('args')},
+                                open('/workspace/results/distill_summary.json', 'w'),
+                                indent=2)
+                      print('Wrote distill_summary.json')
+              "
+          env:
+            - name: JOB_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['batch.kubernetes.io/job-name']
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+          resources:
+            # 38Gi/32Gi = 1.1875 ratio (under 1.2x admission policy).
+            # 3B student + 0.6B teacher both in bf16 + LoRA adapters fits
+            # comfortably; bumping memory will reduce risk of OOM during
+            # the contrastive batch encoding (32 queries + 32 passages +
+            # up to 32 negatives, each at 256 tokens through both models).
+            requests:
+              memory: 32Gi
+              cpu: "4"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: 38Gi
+              cpu: 4800m
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: results
+              mountPath: /workspace/results
+              subPathExpr: "$(JOB_NAME)"
+      volumes:
+        - name: results
+          persistentVolumeClaim:
+            claimName: unified-model-data-vol
