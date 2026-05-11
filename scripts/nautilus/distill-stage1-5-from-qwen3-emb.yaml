@@ -105,8 +105,8 @@ spec:
                 --output_dir /workspace/results \
                 --num_train_examples 100000 \
                 --max_length 256 \
-                --per_device_batch_size 32 \
-                --gradient_accumulation_steps 1 \
+                --per_device_batch_size 8 \
+                --gradient_accumulation_steps 4 \
                 --num_train_epochs 1 \
                 --learning_rate 2e-4 \
                 --lr_scheduler_type cosine \
