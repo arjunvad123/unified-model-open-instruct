@@ -105,6 +105,9 @@ resolved, prefer editing `scripts/nautilus/` and propose moves explicitly.
 
 # Personal log
 This repo follows the personal-log convention from `~/.claude/CLAUDE.md`:
-append a dated entry to `.agents/log.md` before stopping if the turn made
+append a dated entry to `internal-log/log.md` before stopping if the turn made
 any decision, took action with non-obvious rationale, made an assumption,
 opened a question, or made meaningful progress.
+
+Internal handoff state lives in `internal-log/` (gitignored). Keep `.agents/`
+for agent-runtime files such as local skills, not human-readable project logs.
