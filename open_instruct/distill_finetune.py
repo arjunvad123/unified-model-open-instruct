@@ -125,6 +125,29 @@ def embedding_collate_fn(batch):
     return collated
 
 
+def _extract_medi2_text(value) -> str:
+    """Extract the actual text from MEDI2's instruction/text pair schema.
+
+    MEDI2 rows commonly store text as [instruction, text]. Positives and
+    negatives are lists of those pairs, i.e. [[instruction, text], ...].
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return ""
+        if len(value) >= 2 and isinstance(value[0], str) and isinstance(value[1], str):
+            return value[1].strip()
+        for item in value:
+            text = _extract_medi2_text(item)
+            if text:
+                return text
+        return ""
+    return str(value).strip()
+
+
 def load_medi2_examples(num_examples: int, seed: int = 42) -> list[dict]:
     """Load MEDI2 query-positive-(negative) triples, same source Stage 1.5 used."""
     logger.info(f"Loading {num_examples} MEDI2 examples (seed={seed})")
@@ -133,16 +156,16 @@ def load_medi2_examples(num_examples: int, seed: int = 42) -> list[dict]:
 
     out = []
     for item in ds:
-        # MEDI2 uses pos / neg lists; take the first of each.
-        pos_list = item.get("pos", [])
-        neg_list = item.get("neg", [])
-        if not pos_list:
+        # MEDI2 stores query/pos/neg as instruction-text pairs. The model
+        # already supplies its own query prefixes, so use only the text side.
+        query = _extract_medi2_text(item.get("query"))
+        passage = _extract_medi2_text(item.get("pos"))
+        if not query or not passage:
             continue
-        record = {"query": item.get("query", ""), "passage": pos_list[0]}
-        if neg_list:
-            record["negative"] = neg_list[0]
-        if not record["query"].strip() or not record["passage"].strip():
-            continue
+        record = {"query": query, "passage": passage}
+        negative = _extract_medi2_text(item.get("neg"))
+        if negative:
+            record["negative"] = negative
         out.append(record)
         if len(out) >= num_examples:
             break
