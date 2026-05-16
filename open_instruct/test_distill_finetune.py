@@ -3,10 +3,12 @@ from types import SimpleNamespace
 import torch
 
 from open_instruct.distill_finetune import (
+    GenerationReplayDataset,
     StudentEmbeddingModel,
     _extract_medi2_text,
     encode_student,
     load_medi2_examples,
+    masked_next_token_kl_loss,
 )
 
 
@@ -94,3 +96,41 @@ def test_encode_student_skips_causal_lm_logits_path():
 
     assert encoded.shape == (2, 2)
     assert torch.isfinite(encoded).all()
+
+
+def test_generation_replay_dataset_masks_prompt_tokens():
+    class FakeTokenizer:
+        pad_token_id = 0
+
+        def apply_chat_template(self, messages, add_generation_prompt, tokenize, truncation, max_length):
+            ids = []
+            for message in messages:
+                role_token = {"user": 10, "assistant": 20, "system": 30}[message["role"]]
+                ids.append(role_token)
+                ids.extend(ord(char) % 50 + 40 for char in message["content"])
+            if add_generation_prompt:
+                ids.append(20)
+            return ids[:max_length]
+
+    dataset = GenerationReplayDataset(
+        [{"messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}]}],
+        FakeTokenizer(),
+        max_length=64,
+    )
+
+    item = dataset[0]
+    first_label = next(index for index, token in enumerate(item["labels"].tolist()) if token != -100)
+
+    assert first_label > 0
+    assert all(token == -100 for token in item["labels"][:first_label])
+    assert item["labels"][first_label:].ne(-100).any()
+
+
+def test_masked_next_token_kl_loss_is_zero_for_identical_logits():
+    logits = torch.randn(2, 4, 8)
+    labels = torch.tensor([[-100, 1, 2, 3], [-100, -100, 4, 5]])
+
+    loss = masked_next_token_kl_loss(logits, logits.clone(), labels)
+
+    assert loss.item() > -1e-6
+    assert loss.item() < 1e-6

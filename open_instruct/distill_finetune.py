@@ -7,16 +7,20 @@
 # adapter enabled is not preserved by construction; use generation replay
 # or disable the adapter on generation paths if that behavior matters.
 #
-# Loss: similarity-matrix KL distillation, with a small InfoNCE
-# anchor for stability. See `internal-log/distillation_design.md` for the
-# full design rationale (loss choice, hyperparameters,
-# reviewer-defense evidence plan).
+# Loss: similarity-matrix KL distillation, with a small InfoNCE anchor for
+# stability. Optional generation replay adds KL(base logits || active-adapter
+# logits) on assistant tokens to target a single adapter that preserves
+# generation while improving retrieval. See `internal-log/distillation_design.md`
+# for the full design rationale.
 
 import argparse
+import ast
+import copy
 import json
 import math
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -126,6 +130,70 @@ def embedding_collate_fn(batch):
     return collated
 
 
+class GenerationReplayDataset(Dataset):
+    """Chat examples for preserving generation behavior during retrieval distillation.
+
+    The replay objective uses the Stage 1.5 base model itself as the teacher:
+    the active LoRA adapter is trained to match base-model next-token logits
+    on assistant tokens, while the retrieval losses train the embedding
+    geometry. This directly targets the stronger "one active adapter" claim.
+    """
+
+    def __init__(self, data: list[dict], tokenizer, max_length: int = 512):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        messages = self.data[idx]["messages"]
+        prompt_messages = messages[:-1] if messages and messages[-1].get("role") == "assistant" else messages
+
+        input_ids = _apply_chat_template_ids(
+            self.tokenizer, messages, add_generation_prompt=False, max_length=self.max_length
+        )
+        prompt_ids = _apply_chat_template_ids(
+            self.tokenizer, prompt_messages, add_generation_prompt=True, max_length=self.max_length
+        )
+
+        labels = copy.deepcopy(input_ids)
+        prompt_len = min(len(prompt_ids), len(labels))
+        labels[:prompt_len] = [-100] * prompt_len
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.ones(len(input_ids), dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
+
+
+def generation_replay_collate_fn(batch, pad_token_id: int):
+    max_len = max(item["input_ids"].numel() for item in batch)
+    input_ids = []
+    attention_mask = []
+    labels = []
+    for item in batch:
+        pad_len = max_len - item["input_ids"].numel()
+        input_ids.append(F.pad(item["input_ids"], (0, pad_len), value=pad_token_id))
+        attention_mask.append(F.pad(item["attention_mask"], (0, pad_len), value=0))
+        labels.append(F.pad(item["labels"], (0, pad_len), value=-100))
+    return {
+        "input_ids": torch.stack(input_ids),
+        "attention_mask": torch.stack(attention_mask),
+        "labels": torch.stack(labels),
+    }
+
+
+class GenerationReplayCollator:
+    def __init__(self, pad_token_id: int):
+        self.pad_token_id = pad_token_id
+
+    def __call__(self, batch):
+        return generation_replay_collate_fn(batch, self.pad_token_id)
+
+
 def _extract_medi2_text(value) -> str:
     """Extract the actual text from MEDI2's instruction/text pair schema.
 
@@ -147,6 +215,76 @@ def _extract_medi2_text(value) -> str:
                 return text
         return ""
     return str(value).strip()
+
+
+def _parse_messages(value) -> list[dict]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            try:
+                value = ast.literal_eval(value)
+            except (SyntaxError, ValueError):
+                return []
+    if not isinstance(value, list):
+        return []
+
+    messages = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role") or item.get("from")
+        content = item.get("content") or item.get("value")
+        if role == "human":
+            role = "user"
+        elif role == "gpt":
+            role = "assistant"
+        if role in {"system", "user", "assistant"} and isinstance(content, str) and content.strip():
+            messages.append({"role": role, "content": content.strip()})
+    return messages
+
+
+def _messages_from_generation_row(item: dict) -> list[dict]:
+    messages = _parse_messages(item.get("messages"))
+    if len(messages) >= 2 and any(msg["role"] == "assistant" for msg in messages):
+        return messages
+
+    conversions = [
+        ("instruction", "output"),
+        ("instruction", "response"),
+        ("prompt", "completion"),
+        ("question", "response"),
+        ("question", "answer"),
+        ("query", "answer"),
+        ("query", "response"),
+    ]
+    for prompt_key, response_key in conversions:
+        prompt = item.get(prompt_key)
+        response = item.get(response_key)
+        if isinstance(prompt, str) and isinstance(response, str) and prompt.strip() and response.strip():
+            return [{"role": "user", "content": prompt.strip()}, {"role": "assistant", "content": response.strip()}]
+    return []
+
+
+def _apply_chat_template_ids(
+    tokenizer, messages: list[dict], add_generation_prompt: bool, max_length: int
+) -> list[int]:
+    try:
+        ids = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            tokenize=True,
+            truncation=True,
+            max_length=max_length,
+        )
+    except TypeError:
+        text = tokenizer.apply_chat_template(messages, add_generation_prompt=add_generation_prompt, tokenize=False)
+        ids = tokenizer(text, truncation=True, max_length=max_length, add_special_tokens=False)["input_ids"]
+    if hasattr(ids, "tolist"):
+        ids = ids.tolist()
+    return list(ids)
 
 
 def load_medi2_examples(num_examples: int, seed: int = 42) -> list[dict]:
@@ -172,6 +310,61 @@ def load_medi2_examples(num_examples: int, seed: int = 42) -> list[dict]:
             break
     logger.info(f"Loaded {len(out)} MEDI2 examples ({sum(1 for r in out if 'negative' in r)} with hard negatives)")
     return out
+
+
+def load_generation_replay_examples(num_examples: int, seed: int = 42, sources: str = "tulu3") -> list[dict]:
+    """Load chat examples for base-logit generation replay.
+
+    Defaults to the same Tulu 3 SFT mixture used elsewhere in this repo's
+    generation data path. Additional sources can be enabled as a comma-separated
+    list: `tulu3,ragbench,hotpotqa`.
+    """
+    source_names = [s.strip().lower() for s in sources.split(",") if s.strip()]
+    if num_examples <= 0:
+        raise RuntimeError("generation replay requires generation_replay_num_examples > 0")
+    if not source_names:
+        raise RuntimeError("generation replay requires at least one generation_replay_sources entry")
+
+    out = []
+    per_source_target = max(1, math.ceil(num_examples / len(source_names)))
+    for source in source_names:
+        if len(out) >= num_examples:
+            break
+        try:
+            if source == "tulu3":
+                logger.info("Loading generation replay data from allenai/tulu-3-sft-mixture")
+                ds = load_dataset("allenai/tulu-3-sft-mixture", split="train", streaming=True)
+            elif source == "ragbench":
+                logger.info("Loading generation replay data from rungalileo/ragbench/hotpotqa")
+                ds = load_dataset("rungalileo/ragbench", "hotpotqa", split="test", streaming=True)
+            elif source == "hotpotqa":
+                logger.info("Loading generation replay data from hotpot_qa/fullwiki")
+                ds = load_dataset("hotpot_qa", "fullwiki", split="train", streaming=True)
+            else:
+                logger.info(f"Loading generation replay data from {source}")
+                ds = load_dataset(source, split="train", streaming=True)
+
+            ds = ds.shuffle(seed=seed, buffer_size=10_000)
+            source_count = 0
+            for item in ds:
+                messages = _messages_from_generation_row(item)
+                if not messages:
+                    continue
+                out.append({"messages": messages, "source": source})
+                source_count += 1
+                if source_count >= per_source_target or len(out) >= num_examples:
+                    break
+            logger.info(f"Loaded {source_count} generation replay examples from {source}")
+        except Exception as e:
+            logger.warning(f"Could not load generation replay source {source!r}: {e}")
+
+    if not out:
+        raise RuntimeError(
+            f"generation replay was requested but no examples loaded from sources={sources!r}; "
+            "set generation_replay_weight=0 to disable it"
+        )
+    logger.info(f"Loaded {len(out)} total generation replay examples")
+    return out[:num_examples]
 
 
 # =============================================================================
@@ -250,7 +443,22 @@ class StudentEmbeddingModel(torch.nn.Module):
         super().__init__()
         self.causal_lm = causal_lm
 
-    def forward(self, input_ids, attention_mask):
+    def forward(self, input_ids, attention_mask, return_lm_logits: bool = False, disable_adapter: bool = False):
+        if return_lm_logits:
+            adapter_context = self.causal_lm.disable_adapter() if disable_adapter else nullcontext()
+            was_training = self.causal_lm.training
+            with adapter_context:
+                try:
+                    if disable_adapter:
+                        self.causal_lm.eval()
+                    outputs = self.causal_lm(
+                        input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True
+                    )
+                finally:
+                    if disable_adapter and was_training:
+                        self.causal_lm.train()
+            return outputs.logits
+
         outputs = _causal_lm_backbone(self.causal_lm)(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -334,6 +542,42 @@ def info_nce_loss(
     return F.cross_entropy(sim, labels)
 
 
+def masked_next_token_kl_loss(
+    student_logits: torch.Tensor, teacher_logits: torch.Tensor, labels: torch.Tensor, temperature: float = 1.0
+) -> torch.Tensor:
+    """KL(base || active adapter) on next-token assistant positions."""
+    shifted_student = student_logits[:, :-1, :].float() / temperature
+    shifted_teacher = teacher_logits[:, :-1, :].float() / temperature
+    shifted_labels = labels[:, 1:]
+    mask = shifted_labels.ne(-100)
+    if not mask.any():
+        return shifted_student.sum() * 0.0
+
+    student_log_probs = F.log_softmax(shifted_student, dim=-1)
+    teacher_probs = F.softmax(shifted_teacher, dim=-1)
+    per_token_kl = F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(dim=-1)
+    return (per_token_kl * mask.float()).sum() / mask.float().sum() * (temperature**2)
+
+
+def generation_replay_kl_loss(
+    model, input_ids: torch.Tensor, attention_mask: torch.Tensor, labels: torch.Tensor, temperature: float = 1.0
+) -> torch.Tensor:
+    """Match active-adapter generation logits to the Stage 1.5 base.
+
+    This uses the same PEFT model twice: first with the adapter disabled as the
+    frozen base teacher, then with the adapter active as the trainable student.
+    It avoids loading a second 3B base model just to provide replay targets.
+    """
+    with torch.no_grad():
+        base_logits = model(
+            input_ids=input_ids, attention_mask=attention_mask, return_lm_logits=True, disable_adapter=True
+        )
+    active_logits = model(
+        input_ids=input_ids, attention_mask=attention_mask, return_lm_logits=True, disable_adapter=False
+    )
+    return masked_next_token_kl_loss(active_logits, base_logits, labels, temperature=temperature)
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -358,6 +602,12 @@ class DistillArgs:
     distill_temperature: float = 0.05
     distill_weight: float = 1.0
     info_nce_weight: float = 0.1
+    generation_replay_weight: float = 0.0
+    generation_replay_temperature: float = 1.0
+    generation_replay_num_examples: int = 0
+    generation_replay_sources: str = "tulu3"
+    generation_replay_max_length: int = 512
+    generation_replay_batch_size: int = 1
 
     # Per-model encoding recipes. Defaults match each model's anchor-
     # winning recipe so we distill from the best teacher signal into the
@@ -422,6 +672,8 @@ def _args_for_log(args: DistillArgs) -> dict:
 
 def main():
     args = parse_args()
+    if args.hub_token is None:
+        args.hub_token = os.environ.get("HF_TOKEN")
 
     # Accelerator setup. Distillation is single-GPU friendly but we
     # configure for DDP so a future multi-GPU spot AWS run drops in
@@ -514,6 +766,23 @@ def main():
         pin_memory=True,
     )
 
+    replay_loader = None
+    if args.generation_replay_weight > 0:
+        replay_raw = load_generation_replay_examples(
+            args.generation_replay_num_examples, seed=args.seed, sources=args.generation_replay_sources
+        )
+        replay_dataset = GenerationReplayDataset(
+            replay_raw, tokenizer=student_tok, max_length=args.generation_replay_max_length
+        )
+        replay_loader = DataLoader(
+            replay_dataset,
+            batch_size=args.generation_replay_batch_size,
+            shuffle=True,
+            collate_fn=GenerationReplayCollator(student_tok.pad_token_id),
+            num_workers=2,
+            pin_memory=True,
+        )
+
     # ----- Optimizer + scheduler -----
     optimizer = torch.optim.AdamW(
         [p for p in student.parameters() if p.requires_grad], lr=args.learning_rate, weight_decay=args.weight_decay
@@ -536,9 +805,14 @@ def main():
         num_training_steps=total_steps,
     )
 
-    student, teacher, optimizer, loader, scheduler = accelerator.prepare(
-        student, teacher, optimizer, loader, scheduler
-    )
+    if replay_loader is not None:
+        student, teacher, optimizer, loader, replay_loader, scheduler = accelerator.prepare(
+            student, teacher, optimizer, loader, replay_loader, scheduler
+        )
+    else:
+        student, teacher, optimizer, loader, scheduler = accelerator.prepare(
+            student, teacher, optimizer, loader, scheduler
+        )
 
     # `from_pretrained` returns models in eval() mode by default, so
     # without this call dropout (including LoRA dropout=0.05) stays
@@ -551,8 +825,9 @@ def main():
     # ----- Training loop -----
     logger.info(f"Starting distillation ({total_steps} optimization steps)")
     completed_steps = 0
-    losses = {"distill": [], "info_nce": [], "total": []}
+    losses = {"distill": [], "info_nce": [], "generation_kl": [], "total": []}
     t0 = time.time()
+    replay_iter = iter(replay_loader) if replay_loader is not None else None
 
     for _epoch in range(args.num_train_epochs):
         for _step, batch in enumerate(loader):
@@ -586,7 +861,24 @@ def main():
                     )
                 info_loss = info_nce_loss(q_s, p_s, neg_emb, temperature=args.distill_temperature)
 
+                gen_loss = None
+                if replay_iter is not None:
+                    try:
+                        replay_batch = next(replay_iter)
+                    except StopIteration:
+                        replay_iter = iter(replay_loader)
+                        replay_batch = next(replay_iter)
+                    gen_loss = generation_replay_kl_loss(
+                        student,
+                        replay_batch["input_ids"],
+                        replay_batch["attention_mask"],
+                        replay_batch["labels"],
+                        temperature=args.generation_replay_temperature,
+                    )
+
                 total_loss = args.distill_weight * distill_loss + args.info_nce_weight * info_loss
+                if gen_loss is not None:
+                    total_loss = total_loss + args.generation_replay_weight * gen_loss
 
                 accelerator.backward(total_loss)
                 optimizer.step()
@@ -597,16 +889,19 @@ def main():
                 completed_steps += 1
                 losses["distill"].append(distill_loss.item())
                 losses["info_nce"].append(info_loss.item())
+                losses["generation_kl"].append(gen_loss.item() if gen_loss is not None else 0.0)
                 losses["total"].append(total_loss.item())
 
                 if completed_steps % args.log_every == 0 and accelerator.is_main_process:
                     avg_d = sum(losses["distill"][-args.log_every :]) / args.log_every
                     avg_i = sum(losses["info_nce"][-args.log_every :]) / args.log_every
+                    avg_g = sum(losses["generation_kl"][-args.log_every :]) / args.log_every
                     avg_t = sum(losses["total"][-args.log_every :]) / args.log_every
                     elapsed = time.time() - t0
                     logger.info(
                         f"step {completed_steps}/{total_steps} | "
-                        f"distill={avg_d:.4f} info_nce={avg_i:.4f} total={avg_t:.4f} | "
+                        f"distill={avg_d:.4f} info_nce={avg_i:.4f} gen_kl={avg_g:.4f} "
+                        f"total={avg_t:.4f} | "
                         f"lr={scheduler.get_last_lr()[0]:.2e} | "
                         f"elapsed={elapsed:.0f}s"
                     )
