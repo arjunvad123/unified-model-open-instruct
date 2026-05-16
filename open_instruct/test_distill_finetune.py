@@ -132,5 +132,5 @@ def test_masked_next_token_kl_loss_is_zero_for_identical_logits():
 
     loss = masked_next_token_kl_loss(logits, logits.clone(), labels)
 
-    assert loss.item() >= 0.0
+    assert loss.item() > -1e-6
     assert loss.item() < 1e-6

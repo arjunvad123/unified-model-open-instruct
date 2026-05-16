@@ -1,0 +1,124 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: generation-preservation-gate-stage1-5-adapter
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-80GB-PCIe
+                      - NVIDIA-A100-PCIE-40GB
+                      - NVIDIA-A100-SXM4-40GB
+                      - NVIDIA-L40S
+                      - NVIDIA-L40
+                      - NVIDIA-A40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-RTX-6000-Ada-Generation
+                      - NVIDIA-A10
+                      - NVIDIA-A30
+                      - NVIDIA-L4
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule
+      containers:
+        - name: generation-preservation-gate
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "==========================================================="
+              echo "Generation preservation gate: active adapter vs disabled adapter"
+              echo "==========================================================="
+              echo "This is stricter than the old qualitative sanity check. It"
+              echo "reports active generation quality and next-token KL against"
+              echo "the same PEFT model with adapters disabled."
+              date -u +"start_utc=%Y-%m-%dT%H:%M:%SZ"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              export PATH="/opt/venv/bin:$PATH"
+
+              pip install --no-cache-dir --upgrade pip
+              pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu121
+              pip install --no-cache-dir "transformers==4.51.3" accelerate peft sentencepiece protobuf
+
+              mkdir -p /workspace/results
+              cd /workspace
+
+              GEN_GATE_REPO_REF="${GEN_GATE_REPO_REF:-main}"
+              echo "Checking out ref=$GEN_GATE_REPO_REF"
+              if ! git clone --depth 1 --branch "$GEN_GATE_REPO_REF" \
+                https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/repo; then
+                echo "  --branch failed (likely a SHA, not a branch/tag); using full clone + checkout"
+                git clone https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/repo
+                ( cd /workspace/repo && git checkout "$GEN_GATE_REPO_REF" )
+              fi
+              cd /workspace/repo
+              export GEN_GATE_SOURCE_REF="$GEN_GATE_REPO_REF"
+              export GEN_GATE_SOURCE_COMMIT="$(git rev-parse HEAD)"
+              echo "Checked out $GEN_GATE_SOURCE_REF (head=$(git rev-parse --short HEAD))"
+              export PYTHONPATH=/workspace/repo:${PYTHONPATH:-}
+
+              python3 benchmarks/run_generation_preservation_gate.py \
+                --base-model-id Arjunvad/unified-model-stage1-5 \
+                --adapter-path /workspace/distilled-adapter \
+                --output-path /workspace/results/generation_preservation_gate.json \
+                --dtype bfloat16 \
+                --mean-kl-threshold 0.12 \
+                --p95-kl-threshold 0.75 \
+                --min-quality-pass-rate 0.875
+
+              date -u +"finish_utc=%Y-%m-%dT%H:%M:%SZ"
+              echo "Saved gate output to /workspace/results/generation_preservation_gate.json"
+          env:
+            - name: JOB_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['batch.kubernetes.io/job-name']
+            - name: ADAPTER_SUBPATH
+              value: distill-stage1-5-qwen3-gen-replay-pilot/final
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+          resources:
+            requests:
+              memory: 24Gi
+              cpu: "2"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: 28Gi
+              cpu: 2400m
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /workspace/results
+              subPathExpr: "$(JOB_NAME)"
+            - name: data
+              mountPath: /workspace/distilled-adapter
+              subPathExpr: "$(ADAPTER_SUBPATH)"
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: unified-model-data-vol
