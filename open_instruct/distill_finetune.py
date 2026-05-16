@@ -672,6 +672,8 @@ def _args_for_log(args: DistillArgs) -> dict:
 
 def main():
     args = parse_args()
+    if args.hub_token is None:
+        args.hub_token = os.environ.get("HF_TOKEN")
 
     # Accelerator setup. Distillation is single-GPU friendly but we
     # configure for DDP so a future multi-GPU spot AWS run drops in

@@ -122,8 +122,7 @@ spec:
                 --lora_target_modules q_proj,k_proj,v_proj,o_proj \
                 --seed 42 \
                 --log_every 10 \
-                --save_every 500 \
-                --hub_token "${HF_TOKEN}"
+                --save_every 500
 
               date -u +"finish_utc=%Y-%m-%dT%H:%M:%SZ"
               echo "Distillation complete. Final adapter at /workspace/results/final"

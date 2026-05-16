@@ -114,8 +114,7 @@ spec:
                 --lora_target_modules q_proj,k_proj,v_proj,o_proj \
                 --seed 42 \
                 --log_every 10 \
-                --save_every 125 \
-                --hub_token "${HF_TOKEN}"
+                --save_every 125
 
               date -u +"finish_utc=%Y-%m-%dT%H:%M:%SZ"
               echo "Pilot complete. Final adapter at /workspace/results/final"
