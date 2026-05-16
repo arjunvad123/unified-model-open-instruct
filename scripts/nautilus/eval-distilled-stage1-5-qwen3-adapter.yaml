@@ -363,7 +363,10 @@ spec:
                       "created_utc": utc_now(),
                       "task_set": TASKS,
                       "distilled_adapter_path": DISTILLED_ADAPTER_PATH,
-                      "adapter_source_job": "distill-stage1-5-from-qwen3-emb",
+                      "adapter_source_job": os.environ.get(
+                          "ADAPTER_SOURCE_JOB",
+                          "distill-stage1-5-from-qwen3-emb",
+                      ),
                       "models": MODELS,
                       "max_length": MAX_LENGTH,
                       "batch_size": BATCH_SIZE,
@@ -497,6 +500,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.labels['batch.kubernetes.io/job-name']
+            - name: ADAPTER_SOURCE_JOB
+              value: distill-stage1-5-from-qwen3-emb
+            - name: ADAPTER_SUBPATH
+              value: distill-stage1-5-from-qwen3-emb/final
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -517,7 +524,7 @@ spec:
               subPathExpr: "$(JOB_NAME)"
             - name: data
               mountPath: /workspace/distilled-adapter
-              subPath: distill-stage1-5-from-qwen3-emb/final
+              subPathExpr: "$(ADAPTER_SUBPATH)"
               readOnly: true
       volumes:
         - name: data
