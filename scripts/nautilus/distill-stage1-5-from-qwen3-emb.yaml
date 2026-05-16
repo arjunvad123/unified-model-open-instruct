@@ -43,8 +43,9 @@ spec:
               echo "==========================================================="
               echo "Goal: close the 0.090 avg nDCG@10 teacher gap measured by"
               echo "the eval-anchor + eval-matrix runs on 2026-05-10. LoRA"
-              echo "adapters only -- generation behavior preserved by"
-              echo "construction. See .agents/distillation_design.md for the"
+              echo "adapters only -- base weights stay unchanged, but active"
+              echo "adapter generation still needs its own sanity check."
+              echo "See internal-log/distillation_design.md for the"
               echo "full design (loss = similarity-matrix KL + InfoNCE anchor)."
               date -u +"start_utc=%Y-%m-%dT%H:%M:%SZ"
               nvidia-smi --query-gpu=index,name,memory.total --format=csv

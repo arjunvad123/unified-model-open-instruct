@@ -2,12 +2,13 @@
 # Copyright 2026 SVCL/UCSD. All rights reserved.
 #
 # Distill embedding/retrieval geometry from Qwen3-Embedding-0.6B into
-# our unified Stage 1.5 model. Generation behavior is preserved by
-# construction: only LoRA adapters are trained; the un-adapted forward
-# pass is bit-identical to the Stage 1.5 base.
+# our unified Stage 1.5 model. Only LoRA adapters are trained, so the
+# un-adapted Stage 1.5 base remains bit-identical. Generation with the
+# adapter enabled is not preserved by construction; use generation replay
+# or disable the adapter on generation paths if that behavior matters.
 #
 # Loss: similarity-matrix KL distillation, with a small InfoNCE
-# anchor for stability. See `.agents/distillation_design.md` for the
+# anchor for stability. See `internal-log/distillation_design.md` for the
 # full design rationale (loss choice, hyperparameters,
 # reviewer-defense evidence plan).
 

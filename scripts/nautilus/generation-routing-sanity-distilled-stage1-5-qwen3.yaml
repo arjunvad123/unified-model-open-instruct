@@ -1,0 +1,324 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: generation-routing-sanity-distilled-stage1-5-qwen3
+  namespace: svcl-self-improve
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A100-SXM4-80GB
+                      - NVIDIA-A100-80GB-PCIe
+                      - NVIDIA-A100-PCIE-40GB
+                      - NVIDIA-A100-SXM4-40GB
+                      - NVIDIA-L40S
+                      - NVIDIA-L40
+                      - NVIDIA-A40
+                      - NVIDIA-RTX-A6000
+                      - NVIDIA-RTX-6000-Ada-Generation
+                      - NVIDIA-A10
+                      - NVIDIA-A30
+                      - NVIDIA-L4
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: PreferNoSchedule
+      containers:
+        - name: generation-routing-sanity
+          image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "==========================================================="
+              echo "Generation routing sanity: Stage 1.5 base vs active/disabled LoRA"
+              echo "==========================================================="
+              date -u +"start_utc=%Y-%m-%dT%H:%M:%SZ"
+              nvidia-smi --query-gpu=index,name,memory.total --format=csv
+
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y --no-install-recommends \
+                curl ca-certificates python3 python3-pip python3-venv git
+
+              python3 -m venv /opt/venv
+              source /opt/venv/bin/activate
+
+              pip install --upgrade pip
+              pip install torch --index-url https://download.pytorch.org/whl/cu121
+              pip install "transformers==4.51.3" accelerate peft
+
+              mkdir -p /workspace/results
+              cd /workspace
+
+              cat > run_generation_routing_sanity.py << 'PYTHON_SCRIPT'
+              import gc
+              import json
+              import os
+              import re
+              from contextlib import nullcontext
+              from datetime import datetime, timezone
+
+              import peft
+              import torch
+              import transformers
+              from peft import PeftModel
+              from transformers import AutoModelForCausalLM, AutoTokenizer
+
+              RESULTS_DIR = "/workspace/results"
+              OUTPUT_PATH = os.path.join(RESULTS_DIR, "generation_routing_sanity.json")
+              BASE_MODEL_ID = "Arjunvad/unified-model-stage1-5"
+              ADAPTER_PATH = "/workspace/distilled-adapter"
+              DTYPE = torch.bfloat16
+
+              PROMPTS = [
+                  {
+                      "id": "plain_explanation",
+                      "user": "Explain in two sentences why clean water matters for public health.",
+                      "max_new_tokens": 96,
+                      "min_chars": 60,
+                      "allow_control_tokens": False,
+                  },
+                  {
+                      "id": "simple_math",
+                      "user": "Solve: if a train travels 120 miles in 2 hours, what is its average speed? Give the number and units.",
+                      "max_new_tokens": 48,
+                      "min_chars": 12,
+                      "allow_control_tokens": False,
+                  },
+                  {
+                      "id": "small_code",
+                      "user": "Write a Python function called is_palindrome(s) that ignores case and spaces.",
+                      "max_new_tokens": 128,
+                      "min_chars": 80,
+                      "allow_control_tokens": False,
+                  },
+                  {
+                      "id": "concise_classification",
+                      "user": "Classify this request as generate, retrieve, or stop: Find papers about LoRA adapters. Answer with one word.",
+                      "max_new_tokens": 16,
+                      "min_chars": 3,
+                      "allow_control_tokens": False,
+                  },
+              ]
+
+              def utc_now():
+                  return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+              def first_device(model):
+                  return next(model.parameters()).device
+
+              def format_prompt(tokenizer, user_text):
+                  messages = [{"role": "user", "content": user_text}]
+                  try:
+                      return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                  except Exception:
+                      return f"<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n"
+
+              def load_tokenizer():
+                  tokenizer = AutoTokenizer.from_pretrained(
+                      ADAPTER_PATH,
+                      trust_remote_code=True,
+                      token=os.environ.get("HF_TOKEN"),
+                  )
+                  if tokenizer.pad_token is None:
+                      tokenizer.pad_token = tokenizer.eos_token
+                  return tokenizer
+
+              def load_base():
+                  model = AutoModelForCausalLM.from_pretrained(
+                      BASE_MODEL_ID,
+                      trust_remote_code=True,
+                      torch_dtype=DTYPE,
+                      device_map="auto",
+                      token=os.environ.get("HF_TOKEN"),
+                  )
+                  model.eval()
+                  return model
+
+              def load_peft():
+                  if not os.path.exists(os.path.join(ADAPTER_PATH, "adapter_config.json")):
+                      raise FileNotFoundError(f"Missing adapter_config.json in {ADAPTER_PATH}")
+                  model = PeftModel.from_pretrained(load_base(), ADAPTER_PATH)
+                  model.eval()
+                  return model
+
+              def max_repeated_ngram(words, n=4):
+                  if len(words) < n:
+                      return 0
+                  counts = {}
+                  for index in range(len(words) - n + 1):
+                      gram = tuple(words[index:index + n])
+                      counts[gram] = counts.get(gram, 0) + 1
+                  return max(counts.values(), default=0)
+
+              def analyze_text(text, prompt_config):
+                  words = re.findall(r"\w+", text.lower())
+                  unique_ratio = len(set(words)) / len(words) if words else 0.0
+                  repeated_4gram = max_repeated_ngram(words, 4)
+                  has_control_tokens = bool(re.search(r"<(?:ACT:[A-Z]+|WAIT|RET_RESULT|\|im_[^>]+\|)>", text))
+                  checks = {
+                      "non_empty": bool(text.strip()),
+                      "long_enough": len(text.strip()) >= prompt_config["min_chars"],
+                      "not_severely_repetitive": not (len(words) >= 20 and unique_ratio < 0.22),
+                      "no_repeated_4gram_spam": repeated_4gram < 4,
+                      "no_unexpected_control_tokens": prompt_config["allow_control_tokens"] or not has_control_tokens,
+                  }
+                  return {
+                      "char_count": len(text),
+                      "word_count": len(words),
+                      "unique_word_ratio": unique_ratio,
+                      "max_repeated_4gram_count": repeated_4gram,
+                      "has_control_tokens": has_control_tokens,
+                      "checks": checks,
+                      "passed": all(checks.values()),
+                  }
+
+              def generate_one(model, tokenizer, prompt_config, disable_adapter=False):
+                  prompt_text = format_prompt(tokenizer, prompt_config["user"])
+                  inputs = tokenizer(prompt_text, return_tensors="pt")
+                  input_len = inputs["input_ids"].shape[-1]
+                  inputs = {key: value.to(first_device(model)) for key, value in inputs.items()}
+                  context = model.disable_adapter() if disable_adapter else nullcontext()
+                  with context, torch.no_grad():
+                      generated = model.generate(
+                          **inputs,
+                          max_new_tokens=prompt_config["max_new_tokens"],
+                          do_sample=False,
+                          temperature=None,
+                          top_p=None,
+                          top_k=None,
+                          pad_token_id=tokenizer.pad_token_id,
+                          eos_token_id=tokenizer.eos_token_id,
+                          use_cache=True,
+                      )
+                  new_tokens = generated[0, input_len:]
+                  text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+                  return {
+                      "prompt": prompt_config["user"],
+                      "output": text,
+                      "generated_tokens": int(new_tokens.numel()),
+                      "analysis": analyze_text(text, prompt_config),
+                  }
+
+              def run_generation_set(model, tokenizer, mode, disable_adapter=False):
+                  print(f"\nRunning {mode}", flush=True)
+                  outputs = {}
+                  for prompt_config in PROMPTS:
+                      result = generate_one(model, tokenizer, prompt_config, disable_adapter=disable_adapter)
+                      outputs[prompt_config["id"]] = result
+                      print(f"{mode} / {prompt_config['id']}: {result['output'][:300]}", flush=True)
+                  return outputs
+
+              def all_passed(results):
+                  return all(item["analysis"]["passed"] for item in results.values())
+
+              def main():
+                  os.makedirs(RESULTS_DIR, exist_ok=True)
+                  tokenizer = load_tokenizer()
+                  payload = {
+                      "config": {
+                          "job_name": os.environ["JOB_NAME"],
+                          "created_utc": utc_now(),
+                          "base_model_id": BASE_MODEL_ID,
+                          "adapter_path": ADAPTER_PATH,
+                          "adapter_source_job": "distill-stage1-5-from-qwen3-emb",
+                          "dtype": "bfloat16",
+                          "prompts": PROMPTS,
+                          "versions": {
+                              "python": os.sys.version,
+                              "torch": torch.__version__,
+                              "transformers": transformers.__version__,
+                              "peft": peft.__version__,
+                          },
+                      },
+                      "results": {},
+                  }
+
+                  base = load_base()
+                  payload["results"]["stage1_5_base"] = run_generation_set(base, tokenizer, "stage1_5_base")
+                  del base
+                  gc.collect()
+                  torch.cuda.empty_cache()
+
+                  peft_model = load_peft()
+                  payload["results"]["adapter_active"] = run_generation_set(
+                      peft_model, tokenizer, "adapter_active", disable_adapter=False
+                  )
+                  payload["results"]["adapter_disabled"] = run_generation_set(
+                      peft_model, tokenizer, "adapter_disabled", disable_adapter=True
+                  )
+                  del peft_model
+                  gc.collect()
+                  torch.cuda.empty_cache()
+
+                  base_results = payload["results"]["stage1_5_base"]
+                  disabled_results = payload["results"]["adapter_disabled"]
+                  active_results = payload["results"]["adapter_active"]
+                  disabled_matches_base = {
+                      prompt_id: disabled_results[prompt_id]["output"] == base_results[prompt_id]["output"]
+                      for prompt_id in disabled_results
+                  }
+                  payload["summary"] = {
+                      "finished_utc": utc_now(),
+                      "base_passed": all_passed(base_results),
+                      "adapter_active_passed": all_passed(active_results),
+                      "adapter_disabled_passed": all_passed(disabled_results),
+                      "adapter_disabled_matches_base": disabled_matches_base,
+                      "adapter_disabled_all_match_base": all(disabled_matches_base.values()),
+                  }
+
+                  with open(OUTPUT_PATH, "w") as f:
+                      json.dump(payload, f, indent=2, sort_keys=True)
+
+                  print("\nSummary", flush=True)
+                  print(json.dumps(payload["summary"], indent=2, sort_keys=True), flush=True)
+                  print(f"Wrote {OUTPUT_PATH}", flush=True)
+
+              if __name__ == "__main__":
+                  main()
+              PYTHON_SCRIPT
+
+              python run_generation_routing_sanity.py
+              date -u +"finish_utc=%Y-%m-%dT%H:%M:%SZ"
+          env:
+            - name: JOB_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['batch.kubernetes.io/job-name']
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+          resources:
+            requests:
+              memory: 24Gi
+              cpu: "2"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: 28Gi
+              cpu: 2400m
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /workspace/results
+              subPathExpr: "$(JOB_NAME)"
+            - name: data
+              mountPath: /workspace/distilled-adapter
+              subPath: distill-stage1-5-from-qwen3-emb/final
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: unified-model-data-vol
