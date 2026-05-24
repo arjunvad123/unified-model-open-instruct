@@ -5,10 +5,13 @@ import torch
 from open_instruct.distill_finetune import (
     GenerationReplayDataset,
     StudentEmbeddingModel,
+    _balance_generation_replay_examples,
     _extract_medi2_text,
+    _generation_replay_category,
     encode_student,
     load_medi2_examples,
     masked_next_token_kl_loss,
+    validate_generation_replay_coverage,
 )
 
 
@@ -124,6 +127,73 @@ def test_generation_replay_dataset_masks_prompt_tokens():
     assert first_label > 0
     assert all(token == -100 for token in item["labels"][:first_label])
     assert item["labels"][first_label:].ne(-100).any()
+
+
+def test_generation_replay_category_covers_gate_prompt_shapes():
+    assert (
+        _generation_replay_category(
+            [{"role": "user", "content": "Summarize this in one sentence."}, {"role": "assistant", "content": "Ok."}]
+        )
+        == "summary"
+    )
+    assert (
+        _generation_replay_category(
+            [{"role": "user", "content": "Rewrite this politely."}, {"role": "assistant", "content": "Ok."}]
+        )
+        == "rewrite"
+    )
+    assert (
+        _generation_replay_category(
+            [{"role": "user", "content": "Write a Python function."}, {"role": "assistant", "content": "Ok."}]
+        )
+        == "code"
+    )
+    assert (
+        _generation_replay_category(
+            [{"role": "user", "content": "Classify this request."}, {"role": "assistant", "content": "Ok."}]
+        )
+        == "classification"
+    )
+    assert (
+        _generation_replay_category(
+            [{"role": "user", "content": "Solve the equation x + 1 = 2."}, {"role": "assistant", "content": "Ok."}]
+        )
+        == "math"
+    )
+    assert (
+        _generation_replay_category(
+            [{"role": "user", "content": "What does a tokenizer do?"}, {"role": "assistant", "content": "Ok."}]
+        )
+        == "qa"
+    )
+
+
+def test_balance_generation_replay_examples_round_robins_categories():
+    examples = [
+        {"messages": [], "category": "general", "source": "s"},
+        {"messages": [], "category": "general", "source": "s"},
+        {"messages": [], "category": "summary", "source": "s"},
+        {"messages": [], "category": "rewrite", "source": "s"},
+        {"messages": [], "category": "code", "source": "s"},
+    ]
+
+    balanced = _balance_generation_replay_examples(examples, 4)
+
+    assert [item["category"] for item in balanced] == ["summary", "rewrite", "code", "general"]
+
+
+def test_validate_generation_replay_coverage_rejects_missing_required_category():
+    examples = [
+        {"messages": [], "category": "summary", "source": "s"},
+        {"messages": [], "category": "qa", "source": "s"},
+    ]
+
+    try:
+        validate_generation_replay_coverage(examples, "summary,rewrite", 1)
+    except RuntimeError as exc:
+        assert "rewrite" in str(exc)
+    else:
+        raise AssertionError("expected missing replay category to fail validation")
 
 
 def test_masked_next_token_kl_loss_is_zero_for_identical_logits():

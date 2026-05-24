@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: distill-stage1-5-qwen3-gen-replay-pilot
+  name: distill-stage1-5-qwen3-gen-replay-balanced
   namespace: svcl-self-improve
 spec:
   backoffLimit: 0
@@ -39,12 +39,12 @@ spec:
               set -euo pipefail
 
               echo "==========================================================="
-              echo "Pilot: Qwen3 retrieval distillation + generation replay KL"
+              echo "Pilot: Qwen3 retrieval distillation + balanced generation replay KL"
               echo "==========================================================="
               echo "Goal: train one active LoRA adapter that improves retrieval"
               echo "while preserving Stage 1.5 generation logits on assistant"
-              echo "tokens. This is the first stronger-claim pilot, not the"
-              echo "final paper-scale run."
+              echo "tokens. Replay coverage is validated before training so"
+              echo "we do not repeat the NuminaMath-heavy replay failure."
               date -u +"start_utc=%Y-%m-%dT%H:%M:%SZ"
               nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
@@ -71,7 +71,7 @@ spec:
               mkdir -p /workspace/results
               cd /workspace
 
-              DISTILL_REPO_REF="${DISTILL_REPO_REF:-feature/generation-replay-distillation}"
+              DISTILL_REPO_REF="${DISTILL_REPO_REF:-main}"
               echo "Checking out ref=$DISTILL_REPO_REF"
               if ! git clone --depth 1 --branch "$DISTILL_REPO_REF" \
                 https://github.com/arjunvad123/unified-model-open-instruct.git /workspace/repo; then
@@ -95,19 +95,23 @@ spec:
                 --gradient_accumulation_steps 4 \
                 --num_train_epochs 1 \
                 --max_train_steps 250 \
-                --learning_rate 1e-4 \
+                --learning_rate 5e-5 \
                 --lr_scheduler_type cosine \
                 --warmup_ratio 0.03 \
                 --weight_decay 0.01 \
                 --distill_temperature 0.05 \
                 --distill_weight 1.0 \
                 --info_nce_weight 0.1 \
-                --generation_replay_weight 0.25 \
+                --generation_replay_weight 4.0 \
                 --generation_replay_temperature 1.0 \
                 --generation_replay_num_examples 4000 \
-                --generation_replay_sources tulu3 \
+                --generation_replay_sources dolly15k,alpaca,code_alpaca,tulu3,ragbench,hotpotqa \
                 --generation_replay_max_length 512 \
                 --generation_replay_batch_size 1 \
+                --generation_replay_balance_categories true \
+                --generation_replay_scan_multiplier 8 \
+                --generation_replay_required_categories summary,rewrite,code,classification,math,qa,general \
+                --generation_replay_min_category_examples 50 \
                 --lora_rank 32 \
                 --lora_alpha 64 \
                 --lora_dropout 0.05 \
