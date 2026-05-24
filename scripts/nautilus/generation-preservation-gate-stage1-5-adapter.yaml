@@ -83,9 +83,12 @@ spec:
                 --adapter-path /workspace/distilled-adapter \
                 --output-path /workspace/results/generation_preservation_gate.json \
                 --dtype bfloat16 \
+                --prompt-suite expanded \
                 --mean-kl-threshold 0.12 \
                 --p95-kl-threshold 0.75 \
-                --min-quality-pass-rate 0.875
+                --min-quality-pass-rate 0.875 \
+                --min-quality-preservation-pass-rate 0.875 \
+                --min-quality-preservation-evaluable-prompts 4
 
               date -u +"finish_utc=%Y-%m-%dT%H:%M:%SZ"
               echo "Saved gate output to /workspace/results/generation_preservation_gate.json"
@@ -95,7 +98,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.labels['batch.kubernetes.io/job-name']
             - name: ADAPTER_SUBPATH
-              value: distill-stage1-5-qwen3-gen-replay-pilot/final
+              value: distill-stage1-5-qwen3-gen-replay-balanced/final
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
