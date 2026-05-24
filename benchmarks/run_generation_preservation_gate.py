@@ -117,6 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mean-kl-threshold", type=float, default=0.12)
     parser.add_argument("--p95-kl-threshold", type=float, default=0.75)
     parser.add_argument("--min-quality-pass-rate", type=float, default=0.875)
+    parser.add_argument("--min-quality-preservation-pass-rate", type=float, default=0.875)
     parser.add_argument("--fail-on-gate-fail", action="store_true")
     return parser.parse_args()
 
@@ -263,7 +264,7 @@ def masked_next_token_kl(
     disabled_log_probs = F.log_softmax(disabled_logits[:, :-1, :].float(), dim=-1)
     disabled_probs = disabled_log_probs.exp()
     per_token = F.kl_div(active_log_probs, disabled_probs, reduction="none").sum(dim=-1)
-    selected = per_token[mask].detach().float().cpu()
+    selected = per_token[mask].detach().float().clamp_min(0.0).cpu()
     return {
         "mean": float(selected.mean().item()),
         "max": float(selected.max().item()),
@@ -290,6 +291,8 @@ def compute_kl_against_disabled(
 def summarize_prompt(
     prompt: PromptSpec, active_result: dict[str, Any], disabled_result: dict[str, Any], kl: dict[str, float]
 ) -> dict[str, Any]:
+    active_quality_passed = active_result["analysis"]["passed"]
+    disabled_quality_passed = disabled_result["analysis"]["passed"]
     return {
         "prompt": asdict(prompt),
         "adapter_active": active_result,
@@ -301,6 +304,13 @@ def summarize_prompt(
                 len(active_result["output"].strip()) / max(1, len(disabled_result["output"].strip()))
             ),
             "kl_active_vs_disabled_on_disabled_tokens": kl,
+            "quality": {
+                "active_passed": active_quality_passed,
+                "disabled_passed": disabled_quality_passed,
+                "base_already_failed": not disabled_quality_passed,
+                "quality_degraded": disabled_quality_passed and not active_quality_passed,
+                "quality_improved": active_quality_passed and not disabled_quality_passed,
+            },
         },
     }
 
@@ -309,6 +319,9 @@ def summarize_gate(results: list[dict[str, Any]], args: argparse.Namespace) -> d
     total = len(results)
     active_quality_passes = sum(1 for item in results if item["adapter_active"]["analysis"]["passed"])
     disabled_quality_passes = sum(1 for item in results if item["adapter_disabled"]["analysis"]["passed"])
+    quality_degradations = sum(1 for item in results if item["comparisons"]["quality"]["quality_degraded"])
+    quality_improvements = sum(1 for item in results if item["comparisons"]["quality"]["quality_improved"])
+    base_already_failed = sum(1 for item in results if item["comparisons"]["quality"]["base_already_failed"])
     exact_matches = sum(1 for item in results if item["comparisons"]["active_matches_disabled"])
     mean_kls = [item["comparisons"]["kl_active_vs_disabled_on_disabled_tokens"]["mean"] for item in results]
     p95_kls = [item["comparisons"]["kl_active_vs_disabled_on_disabled_tokens"]["p95"] for item in results]
@@ -316,13 +329,20 @@ def summarize_gate(results: list[dict[str, Any]], args: argparse.Namespace) -> d
 
     active_quality_pass_rate = active_quality_passes / max(1, total)
     disabled_quality_pass_rate = disabled_quality_passes / max(1, total)
+    quality_preservation_evaluable_prompts = disabled_quality_passes
+    if quality_preservation_evaluable_prompts:
+        quality_preservation_pass_rate = (
+            quality_preservation_evaluable_prompts - quality_degradations
+        ) / quality_preservation_evaluable_prompts
+    else:
+        quality_preservation_pass_rate = 1.0
     active_disabled_exact_match_rate = exact_matches / max(1, total)
     aggregate_mean_kl = sum(mean_kls) / max(1, len(mean_kls))
     aggregate_p95_kl = max(p95_kls) if p95_kls else 0.0
     average_similarity = sum(similarities) / max(1, len(similarities))
 
     checks = {
-        "active_quality_pass_rate": active_quality_pass_rate >= args.min_quality_pass_rate,
+        "quality_preservation_pass_rate": (quality_preservation_pass_rate >= args.min_quality_preservation_pass_rate),
         "mean_kl": aggregate_mean_kl <= args.mean_kl_threshold,
         "p95_kl": aggregate_p95_kl <= args.p95_kl_threshold,
     }
@@ -331,12 +351,18 @@ def summarize_gate(results: list[dict[str, Any]], args: argparse.Namespace) -> d
         "num_prompts": total,
         "active_quality_pass_rate": active_quality_pass_rate,
         "disabled_quality_pass_rate": disabled_quality_pass_rate,
+        "quality_preservation_pass_rate": quality_preservation_pass_rate,
+        "quality_preservation_evaluable_prompts": quality_preservation_evaluable_prompts,
+        "quality_degradation_count": quality_degradations,
+        "quality_improvement_count": quality_improvements,
+        "base_already_failed_count": base_already_failed,
         "active_disabled_exact_match_rate": active_disabled_exact_match_rate,
         "average_active_disabled_similarity": average_similarity,
         "mean_kl_active_vs_disabled": aggregate_mean_kl,
         "max_prompt_p95_kl_active_vs_disabled": aggregate_p95_kl,
         "thresholds": {
             "min_quality_pass_rate": args.min_quality_pass_rate,
+            "min_quality_preservation_pass_rate": args.min_quality_preservation_pass_rate,
             "mean_kl_threshold": args.mean_kl_threshold,
             "p95_kl_threshold": args.p95_kl_threshold,
         },

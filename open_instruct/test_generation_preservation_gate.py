@@ -29,14 +29,23 @@ def test_masked_next_token_kl_is_zero_for_identical_logits():
     assert metrics["p95"] < 1e-6
 
 
-def test_summarize_gate_requires_quality_and_kl_thresholds():
-    args = SimpleNamespace(min_quality_pass_rate=1.0, mean_kl_threshold=0.1, p95_kl_threshold=0.5)
+def test_summarize_gate_requires_preserved_quality_and_kl_thresholds():
+    args = SimpleNamespace(
+        min_quality_pass_rate=1.0, min_quality_preservation_pass_rate=1.0, mean_kl_threshold=0.1, p95_kl_threshold=0.5
+    )
     result = {
         "adapter_active": {"analysis": {"passed": False}},
         "adapter_disabled": {"analysis": {"passed": True}},
         "comparisons": {
             "active_matches_disabled": True,
             "active_disabled_similarity": 0.9,
+            "quality": {
+                "active_passed": False,
+                "disabled_passed": True,
+                "base_already_failed": False,
+                "quality_degraded": True,
+                "quality_improved": False,
+            },
             "kl_active_vs_disabled_on_disabled_tokens": {"mean": 0.2, "p95": 0.6},
         },
     }
@@ -44,7 +53,39 @@ def test_summarize_gate_requires_quality_and_kl_thresholds():
     summary = summarize_gate([result], args)
 
     assert summary["active_quality_pass_rate"] == 0.0
-    assert not summary["checks"]["active_quality_pass_rate"]
+    assert summary["quality_preservation_pass_rate"] == 0.0
+    assert not summary["checks"]["quality_preservation_pass_rate"]
     assert not summary["checks"]["mean_kl"]
     assert not summary["checks"]["p95_kl"]
     assert not summary["gate_passed"]
+
+
+def test_summarize_gate_does_not_treat_base_failure_as_adapter_degradation():
+    args = SimpleNamespace(
+        min_quality_pass_rate=1.0, min_quality_preservation_pass_rate=1.0, mean_kl_threshold=0.1, p95_kl_threshold=0.5
+    )
+    result = {
+        "adapter_active": {"analysis": {"passed": False}},
+        "adapter_disabled": {"analysis": {"passed": False}},
+        "comparisons": {
+            "active_matches_disabled": False,
+            "active_disabled_similarity": 0.2,
+            "quality": {
+                "active_passed": False,
+                "disabled_passed": False,
+                "base_already_failed": True,
+                "quality_degraded": False,
+                "quality_improved": False,
+            },
+            "kl_active_vs_disabled_on_disabled_tokens": {"mean": 0.01, "p95": 0.02},
+        },
+    }
+
+    summary = summarize_gate([result], args)
+
+    assert summary["active_quality_pass_rate"] == 0.0
+    assert summary["disabled_quality_pass_rate"] == 0.0
+    assert summary["quality_preservation_evaluable_prompts"] == 0
+    assert summary["quality_preservation_pass_rate"] == 1.0
+    assert summary["checks"]["quality_preservation_pass_rate"]
+    assert summary["gate_passed"]

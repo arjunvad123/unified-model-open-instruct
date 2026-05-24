@@ -19,7 +19,9 @@ import copy
 import json
 import math
 import os
+import re
 import time
+from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
@@ -264,6 +266,9 @@ def _messages_from_generation_row(item: dict) -> list[dict]:
         prompt = item.get(prompt_key)
         response = item.get(response_key)
         if isinstance(prompt, str) and isinstance(response, str) and prompt.strip() and response.strip():
+            context = item.get("context") or item.get("input")
+            if isinstance(context, str) and context.strip():
+                prompt = f"{prompt.strip()}\n\n{context.strip()}"
             return [{"role": "user", "content": prompt.strip()}, {"role": "assistant", "content": response.strip()}]
     return []
 
@@ -312,59 +317,188 @@ def load_medi2_examples(num_examples: int, seed: int = 42) -> list[dict]:
     return out
 
 
-def load_generation_replay_examples(num_examples: int, seed: int = 42, sources: str = "tulu3") -> list[dict]:
+GENERATION_REPLAY_CATEGORY_ORDER = ("summary", "rewrite", "code", "classification", "math", "qa", "general")
+GENERATION_REPLAY_CATEGORY_PATTERNS = (
+    ("summary", re.compile(r"\b(summarize|summary|tl;dr|one sentence|briefly summarize)\b", re.IGNORECASE)),
+    ("rewrite", re.compile(r"\b(rewrite|rephrase|paraphrase|polish|edit|grammar|politely)\b", re.IGNORECASE)),
+    (
+        "code",
+        re.compile(
+            r"```|\b(python|javascript|typescript|java|c\+\+|function|class|program|algorithm|debug|sql|code)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "classification",
+        re.compile(
+            r"\b(classify|classification|categorize|category|label|sentiment|answer with one word)\b", re.IGNORECASE
+        ),
+    ),
+    (
+        "math",
+        re.compile(
+            r"\\\(|\\\[|\$|\b(prove|solve|equation|integer|digits?|polygon|triangle|geometry|olympiad|log_|sin\^|frac\{)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    ("qa", re.compile(r"\?$|\b(what|why|how|when|where|who|explain)\b", re.IGNORECASE)),
+)
+
+
+def _generation_replay_category(messages: list[dict]) -> str:
+    user_text = " ".join(msg["content"] for msg in messages if msg.get("role") == "user")
+    for category, pattern in GENERATION_REPLAY_CATEGORY_PATTERNS:
+        if pattern.search(user_text):
+            return category
+    return "general"
+
+
+def summarize_generation_replay_examples(examples: list[dict]) -> dict:
+    return {
+        "num_examples": len(examples),
+        "source_counts": dict(Counter(example.get("source", "unknown") for example in examples)),
+        "upstream_source_counts": dict(Counter(example.get("upstream_source", "unknown") for example in examples)),
+        "category_counts": dict(Counter(example.get("category", "unknown") for example in examples)),
+    }
+
+
+def _load_generation_replay_dataset(source: str):
+    if source == "tulu3":
+        logger.info("Loading generation replay data from allenai/tulu-3-sft-mixture")
+        return load_dataset("allenai/tulu-3-sft-mixture", split="train", streaming=True)
+    if source == "dolly15k":
+        logger.info("Loading generation replay data from databricks/databricks-dolly-15k")
+        return load_dataset("databricks/databricks-dolly-15k", split="train", streaming=True)
+    if source == "alpaca":
+        logger.info("Loading generation replay data from tatsu-lab/alpaca")
+        return load_dataset("tatsu-lab/alpaca", split="train", streaming=True)
+    if source == "code_alpaca":
+        logger.info("Loading generation replay data from sahil2801/CodeAlpaca-20k")
+        return load_dataset("sahil2801/CodeAlpaca-20k", split="train", streaming=True)
+    if source == "ragbench":
+        logger.info("Loading generation replay data from rungalileo/ragbench/hotpotqa")
+        return load_dataset("rungalileo/ragbench", "hotpotqa", split="test", streaming=True)
+    if source == "hotpotqa":
+        logger.info("Loading generation replay data from hotpot_qa/fullwiki")
+        return load_dataset("hotpot_qa", "fullwiki", split="train", streaming=True)
+
+    logger.info(f"Loading generation replay data from {source}")
+    return load_dataset(source, split="train", streaming=True)
+
+
+def _balance_generation_replay_examples(examples: list[dict], num_examples: int) -> list[dict]:
+    buckets = {category: [] for category in GENERATION_REPLAY_CATEGORY_ORDER}
+    buckets["unknown"] = []
+    for example in examples:
+        buckets.setdefault(example.get("category", "unknown"), []).append(example)
+
+    selected = []
+    selected_ids = set()
+    while len(selected) < num_examples:
+        added = False
+        for category in GENERATION_REPLAY_CATEGORY_ORDER:
+            while buckets.get(category) and id(buckets[category][0]) in selected_ids:
+                buckets[category].pop(0)
+            if buckets.get(category):
+                example = buckets[category].pop(0)
+                selected.append(example)
+                selected_ids.add(id(example))
+                added = True
+                if len(selected) >= num_examples:
+                    break
+        if not added:
+            break
+
+    if len(selected) < num_examples:
+        for example in examples:
+            if id(example) in selected_ids:
+                continue
+            selected.append(example)
+            selected_ids.add(id(example))
+            if len(selected) >= num_examples:
+                break
+
+    return selected[:num_examples]
+
+
+def validate_generation_replay_coverage(
+    examples: list[dict], required_categories: str, min_category_examples: int
+) -> dict:
+    summary = summarize_generation_replay_examples(examples)
+    required = [category.strip() for category in required_categories.split(",") if category.strip()]
+    if required and min_category_examples > 0:
+        category_counts = summary["category_counts"]
+        missing = [category for category in required if category_counts.get(category, 0) < min_category_examples]
+        if missing:
+            raise RuntimeError(
+                "generation replay coverage check failed: "
+                f"required >= {min_category_examples} examples for {missing}; "
+                f"category_counts={category_counts}"
+            )
+    return summary
+
+
+def load_generation_replay_examples(
+    num_examples: int,
+    seed: int = 42,
+    sources: str = "tulu3",
+    balance_categories: bool = True,
+    scan_multiplier: int = 4,
+) -> list[dict]:
     """Load chat examples for base-logit generation replay.
 
     Defaults to the same Tulu 3 SFT mixture used elsewhere in this repo's
-    generation data path. Additional sources can be enabled as a comma-separated
-    list: `tulu3,ragbench,hotpotqa`.
+    generation data path. Additional source aliases can be enabled as a
+    comma-separated list: `dolly15k,alpaca,code_alpaca,tulu3,ragbench,hotpotqa`.
     """
     source_names = [s.strip().lower() for s in sources.split(",") if s.strip()]
     if num_examples <= 0:
         raise RuntimeError("generation replay requires generation_replay_num_examples > 0")
     if not source_names:
         raise RuntimeError("generation replay requires at least one generation_replay_sources entry")
+    if scan_multiplier < 1:
+        raise RuntimeError("generation replay scan_multiplier must be >= 1")
 
-    out = []
+    candidates = []
     per_source_target = max(1, math.ceil(num_examples / len(source_names)))
+    per_source_scan_limit = per_source_target * scan_multiplier
     for source in source_names:
-        if len(out) >= num_examples:
-            break
         try:
-            if source == "tulu3":
-                logger.info("Loading generation replay data from allenai/tulu-3-sft-mixture")
-                ds = load_dataset("allenai/tulu-3-sft-mixture", split="train", streaming=True)
-            elif source == "ragbench":
-                logger.info("Loading generation replay data from rungalileo/ragbench/hotpotqa")
-                ds = load_dataset("rungalileo/ragbench", "hotpotqa", split="test", streaming=True)
-            elif source == "hotpotqa":
-                logger.info("Loading generation replay data from hotpot_qa/fullwiki")
-                ds = load_dataset("hotpot_qa", "fullwiki", split="train", streaming=True)
-            else:
-                logger.info(f"Loading generation replay data from {source}")
-                ds = load_dataset(source, split="train", streaming=True)
-
+            ds = _load_generation_replay_dataset(source)
             ds = ds.shuffle(seed=seed, buffer_size=10_000)
             source_count = 0
             for item in ds:
                 messages = _messages_from_generation_row(item)
                 if not messages:
                     continue
-                out.append({"messages": messages, "source": source})
+                candidates.append(
+                    {
+                        "messages": messages,
+                        "source": source,
+                        "upstream_source": item.get("source", source),
+                        "category": _generation_replay_category(messages),
+                    }
+                )
                 source_count += 1
-                if source_count >= per_source_target or len(out) >= num_examples:
+                if source_count >= per_source_scan_limit:
                     break
             logger.info(f"Loaded {source_count} generation replay examples from {source}")
         except Exception as e:
             logger.warning(f"Could not load generation replay source {source!r}: {e}")
 
-    if not out:
+    if not candidates:
         raise RuntimeError(
             f"generation replay was requested but no examples loaded from sources={sources!r}; "
             "set generation_replay_weight=0 to disable it"
         )
-    logger.info(f"Loaded {len(out)} total generation replay examples")
-    return out[:num_examples]
+    out = (
+        _balance_generation_replay_examples(candidates, num_examples)
+        if balance_categories
+        else candidates[:num_examples]
+    )
+    summary = summarize_generation_replay_examples(out)
+    logger.info(f"Loaded {len(out)} total generation replay examples: {summary}")
+    return out
 
 
 # =============================================================================
@@ -608,6 +742,10 @@ class DistillArgs:
     generation_replay_sources: str = "tulu3"
     generation_replay_max_length: int = 512
     generation_replay_batch_size: int = 1
+    generation_replay_balance_categories: bool = True
+    generation_replay_scan_multiplier: int = 4
+    generation_replay_required_categories: str = ""
+    generation_replay_min_category_examples: int = 0
 
     # Per-model encoding recipes. Defaults match each model's anchor-
     # winning recipe so we distill from the best teacher signal into the
@@ -767,10 +905,23 @@ def main():
     )
 
     replay_loader = None
+    replay_preflight = None
     if args.generation_replay_weight > 0:
         replay_raw = load_generation_replay_examples(
-            args.generation_replay_num_examples, seed=args.seed, sources=args.generation_replay_sources
+            args.generation_replay_num_examples,
+            seed=args.seed,
+            sources=args.generation_replay_sources,
+            balance_categories=args.generation_replay_balance_categories,
+            scan_multiplier=args.generation_replay_scan_multiplier,
         )
+        replay_preflight = validate_generation_replay_coverage(
+            replay_raw,
+            required_categories=args.generation_replay_required_categories,
+            min_category_examples=args.generation_replay_min_category_examples,
+        )
+        if accelerator.is_main_process:
+            with open(os.path.join(args.output_dir, "generation_replay_preflight.json"), "w") as f:
+                json.dump(replay_preflight, f, indent=2, sort_keys=True)
         replay_dataset = GenerationReplayDataset(
             replay_raw, tokenizer=student_tok, max_length=args.generation_replay_max_length
         )
@@ -925,7 +1076,16 @@ def main():
         student_tok.save_pretrained(final_dir)
         with open(os.path.join(args.output_dir, "training_log.json"), "w") as f:
             # Use the redacted view so hub_token never lands on disk.
-            json.dump({"args": _args_for_log(args), "losses": losses, "elapsed_s": time.time() - t0}, f, indent=2)
+            json.dump(
+                {
+                    "args": _args_for_log(args),
+                    "losses": losses,
+                    "elapsed_s": time.time() - t0,
+                    "generation_replay_preflight": replay_preflight,
+                },
+                f,
+                indent=2,
+            )
         logger.info(f"Final checkpoint saved to {final_dir}")
 
         if args.push_to_hub_repo:
