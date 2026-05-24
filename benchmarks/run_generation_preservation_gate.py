@@ -27,14 +27,16 @@ class PromptSpec:
     max_chars: int | None = None
     required_regex: str | None = None
     max_non_ascii_ratio: float = 0.08
+    category: str = "general"
 
 
-PROMPTS: tuple[PromptSpec, ...] = (
+SMOKE_PROMPTS: tuple[PromptSpec, ...] = (
     PromptSpec(
         id="plain_explanation",
         user="Explain in two sentences why clean water matters for public health.",
         max_new_tokens=96,
         min_chars=70,
+        category="explanation",
     ),
     PromptSpec(
         id="simple_math",
@@ -43,6 +45,7 @@ PROMPTS: tuple[PromptSpec, ...] = (
         min_chars=8,
         max_chars=160,
         required_regex=r"\b60\b|sixty",
+        category="math",
     ),
     PromptSpec(
         id="small_code",
@@ -50,6 +53,7 @@ PROMPTS: tuple[PromptSpec, ...] = (
         max_new_tokens=128,
         min_chars=60,
         required_regex=r"def\s+is_palindrome|return",
+        category="code",
     ),
     PromptSpec(
         id="concise_classification",
@@ -61,6 +65,7 @@ PROMPTS: tuple[PromptSpec, ...] = (
         min_chars=3,
         max_chars=40,
         required_regex=r"^\s*retrieve\b",
+        category="classification",
     ),
     PromptSpec(
         id="short_summary",
@@ -68,6 +73,7 @@ PROMPTS: tuple[PromptSpec, ...] = (
         max_new_tokens=64,
         min_chars=35,
         max_chars=220,
+        category="summary",
     ),
     PromptSpec(
         id="rewrite",
@@ -75,6 +81,7 @@ PROMPTS: tuple[PromptSpec, ...] = (
         max_new_tokens=48,
         min_chars=25,
         max_chars=180,
+        category="rewrite",
     ),
     PromptSpec(
         id="factual_qa",
@@ -82,6 +89,7 @@ PROMPTS: tuple[PromptSpec, ...] = (
         max_new_tokens=72,
         min_chars=45,
         max_chars=260,
+        category="qa",
     ),
     PromptSpec(
         id="ordered_steps",
@@ -89,8 +97,123 @@ PROMPTS: tuple[PromptSpec, ...] = (
         max_new_tokens=96,
         min_chars=55,
         max_chars=360,
+        category="steps",
     ),
 )
+
+EXPANDED_PROMPTS: tuple[PromptSpec, ...] = SMOKE_PROMPTS + (
+    PromptSpec(
+        id="exact_hello",
+        user="Reply with exactly this word: hello",
+        max_new_tokens=8,
+        min_chars=5,
+        max_chars=24,
+        required_regex=r"^\s*hello\b",
+        category="exact",
+    ),
+    PromptSpec(
+        id="exact_ok",
+        user="Reply with exactly these two letters: OK",
+        max_new_tokens=8,
+        min_chars=2,
+        max_chars=24,
+        required_regex=r"^\s*ok\b",
+        category="exact",
+    ),
+    PromptSpec(
+        id="yes_no_fact",
+        user="Answer yes or no: is clean drinking water important for health?",
+        max_new_tokens=8,
+        min_chars=2,
+        max_chars=24,
+        required_regex=r"^\s*yes\b",
+        category="classification",
+    ),
+    PromptSpec(
+        id="extract_city",
+        user="Extract the city from this sentence and answer only with the city: I moved to San Diego in 2024.",
+        max_new_tokens=16,
+        min_chars=8,
+        max_chars=48,
+        required_regex=r"san\s+diego",
+        category="extraction",
+    ),
+    PromptSpec(
+        id="capital_completion",
+        user="Complete the sentence with one word: The capital of France is",
+        max_new_tokens=12,
+        min_chars=5,
+        max_chars=32,
+        required_regex=r"\bparis\b",
+        category="qa",
+    ),
+    PromptSpec(
+        id="json_yes",
+        user='Return JSON with one key "answer" and value "yes".',
+        max_new_tokens=32,
+        min_chars=15,
+        max_chars=96,
+        required_regex=r'"answer"\s*:\s*"yes"',
+        category="format",
+    ),
+    PromptSpec(
+        id="two_item_list",
+        user="List exactly two common sources of renewable energy.",
+        max_new_tokens=40,
+        min_chars=12,
+        max_chars=160,
+        required_regex=r"solar|wind|hydro|geothermal",
+        category="list",
+    ),
+    PromptSpec(
+        id="one_sentence_definition",
+        user="Define photosynthesis in one sentence.",
+        max_new_tokens=48,
+        min_chars=35,
+        max_chars=220,
+        required_regex=r"plants|light|energy|sunlight",
+        category="definition",
+    ),
+    PromptSpec(
+        id="polite_email_sentence",
+        user="Write one polite sentence asking a teammate to review a pull request.",
+        max_new_tokens=48,
+        min_chars=35,
+        max_chars=220,
+        required_regex=r"review|pull request|pr",
+        category="rewrite",
+    ),
+    PromptSpec(
+        id="unit_conversion",
+        user="How many centimeters are in 2 meters? Answer with the number and unit.",
+        max_new_tokens=24,
+        min_chars=5,
+        max_chars=80,
+        required_regex=r"\b200\b|two hundred",
+        category="math",
+    ),
+    PromptSpec(
+        id="short_summary_2",
+        user="Summarize in one sentence: A GPU can accelerate matrix multiplication for neural network training.",
+        max_new_tokens=48,
+        min_chars=35,
+        max_chars=220,
+        required_regex=r"gpu|matrix|neural|training",
+        category="summary",
+    ),
+    PromptSpec(
+        id="tiny_python",
+        user="Write a Python function add_one(x) that returns x plus one.",
+        max_new_tokens=64,
+        min_chars=35,
+        max_chars=260,
+        required_regex=r"def\s+add_one|return\s+x\s*\+\s*1",
+        category="code",
+    ),
+)
+
+PROMPT_SUITES: dict[str, tuple[PromptSpec, ...]] = {"smoke": SMOKE_PROMPTS, "expanded": EXPANDED_PROMPTS}
+PROMPTS = SMOKE_PROMPTS
 
 CHAT_ARTIFACT_RE = re.compile(r"<\|im_(?:start|end)\|>|<s>|</s>")
 ACTION_TOKEN_RE = re.compile("|".join(re.escape(token) for token in ACTION_TOKENS))
@@ -113,11 +236,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-path", required=True)
     parser.add_argument("--output-path", required=True)
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
-    parser.add_argument("--max-prompts", type=int, default=len(PROMPTS))
+    parser.add_argument("--prompt-suite", choices=tuple(PROMPT_SUITES), default="smoke")
+    parser.add_argument("--max-prompts", type=int, default=None)
     parser.add_argument("--mean-kl-threshold", type=float, default=0.12)
     parser.add_argument("--p95-kl-threshold", type=float, default=0.75)
     parser.add_argument("--min-quality-pass-rate", type=float, default=0.875)
     parser.add_argument("--min-quality-preservation-pass-rate", type=float, default=0.875)
+    parser.add_argument("--min-quality-preservation-evaluable-prompts", type=int, default=1)
     parser.add_argument("--fail-on-gate-fail", action="store_true")
     return parser.parse_args()
 
@@ -294,6 +419,7 @@ def summarize_prompt(
     active_quality_passed = active_result["analysis"]["passed"]
     disabled_quality_passed = disabled_result["analysis"]["passed"]
     return {
+        "id": prompt.id,
         "prompt": asdict(prompt),
         "adapter_active": active_result,
         "adapter_disabled": disabled_result,
@@ -342,6 +468,9 @@ def summarize_gate(results: list[dict[str, Any]], args: argparse.Namespace) -> d
     average_similarity = sum(similarities) / max(1, len(similarities))
 
     checks = {
+        "quality_preservation_evaluable_prompts": (
+            quality_preservation_evaluable_prompts >= args.min_quality_preservation_evaluable_prompts
+        ),
         "quality_preservation_pass_rate": (quality_preservation_pass_rate >= args.min_quality_preservation_pass_rate),
         "mean_kl": aggregate_mean_kl <= args.mean_kl_threshold,
         "p95_kl": aggregate_p95_kl <= args.p95_kl_threshold,
@@ -363,6 +492,7 @@ def summarize_gate(results: list[dict[str, Any]], args: argparse.Namespace) -> d
         "thresholds": {
             "min_quality_pass_rate": args.min_quality_pass_rate,
             "min_quality_preservation_pass_rate": args.min_quality_preservation_pass_rate,
+            "min_quality_preservation_evaluable_prompts": args.min_quality_preservation_evaluable_prompts,
             "mean_kl_threshold": args.mean_kl_threshold,
             "p95_kl_threshold": args.p95_kl_threshold,
         },
@@ -404,7 +534,9 @@ def load_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any]:
 
 def run_gate(args: argparse.Namespace) -> dict[str, Any]:
     model, tokenizer = load_model_and_tokenizer(args)
-    prompts = list(PROMPTS[: args.max_prompts])
+    prompts = list(PROMPT_SUITES[args.prompt_suite])
+    if args.max_prompts is not None:
+        prompts = prompts[: args.max_prompts]
     prompt_results = []
     for prompt in prompts:
         print(f"Running prompt: {prompt.id}", flush=True)
@@ -435,6 +567,8 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             "base_model_id": args.base_model_id,
             "adapter_path": args.adapter_path,
             "dtype": args.dtype,
+            "prompt_suite": args.prompt_suite,
+            "max_prompts": args.max_prompts,
             "argv": sys.argv,
         },
         "summary": summarize_gate(prompt_results, args),

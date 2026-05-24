@@ -1,7 +1,13 @@
 from types import SimpleNamespace
 
 import torch
-from benchmarks.run_generation_preservation_gate import PromptSpec, analyze_text, masked_next_token_kl, summarize_gate
+from benchmarks.run_generation_preservation_gate import (
+    PROMPT_SUITES,
+    PromptSpec,
+    analyze_text,
+    masked_next_token_kl,
+    summarize_gate,
+)
 
 
 def test_analyze_text_catches_repetition_and_unexpected_script():
@@ -31,7 +37,11 @@ def test_masked_next_token_kl_is_zero_for_identical_logits():
 
 def test_summarize_gate_requires_preserved_quality_and_kl_thresholds():
     args = SimpleNamespace(
-        min_quality_pass_rate=1.0, min_quality_preservation_pass_rate=1.0, mean_kl_threshold=0.1, p95_kl_threshold=0.5
+        min_quality_pass_rate=1.0,
+        min_quality_preservation_pass_rate=1.0,
+        min_quality_preservation_evaluable_prompts=1,
+        mean_kl_threshold=0.1,
+        p95_kl_threshold=0.5,
     )
     result = {
         "adapter_active": {"analysis": {"passed": False}},
@@ -62,7 +72,11 @@ def test_summarize_gate_requires_preserved_quality_and_kl_thresholds():
 
 def test_summarize_gate_does_not_treat_base_failure_as_adapter_degradation():
     args = SimpleNamespace(
-        min_quality_pass_rate=1.0, min_quality_preservation_pass_rate=1.0, mean_kl_threshold=0.1, p95_kl_threshold=0.5
+        min_quality_pass_rate=1.0,
+        min_quality_preservation_pass_rate=1.0,
+        min_quality_preservation_evaluable_prompts=1,
+        mean_kl_threshold=0.1,
+        p95_kl_threshold=0.5,
     )
     result = {
         "adapter_active": {"analysis": {"passed": False}},
@@ -87,5 +101,15 @@ def test_summarize_gate_does_not_treat_base_failure_as_adapter_degradation():
     assert summary["disabled_quality_pass_rate"] == 0.0
     assert summary["quality_preservation_evaluable_prompts"] == 0
     assert summary["quality_preservation_pass_rate"] == 1.0
+    assert not summary["checks"]["quality_preservation_evaluable_prompts"]
     assert summary["checks"]["quality_preservation_pass_rate"]
-    assert summary["gate_passed"]
+    assert not summary["gate_passed"]
+
+
+def test_expanded_prompt_suite_adds_easy_evaluable_anchors():
+    smoke_ids = {prompt.id for prompt in PROMPT_SUITES["smoke"]}
+    expanded_ids = {prompt.id for prompt in PROMPT_SUITES["expanded"]}
+
+    assert smoke_ids < expanded_ids
+    assert {"exact_hello", "exact_ok", "json_yes", "tiny_python"} <= expanded_ids
+    assert len(expanded_ids) == len(PROMPT_SUITES["expanded"])
