@@ -19,6 +19,7 @@ import copy
 import json
 import math
 import os
+import random
 import re
 import time
 from collections import Counter
@@ -317,8 +318,27 @@ def load_medi2_examples(num_examples: int, seed: int = 42) -> list[dict]:
     return out
 
 
-GENERATION_REPLAY_CATEGORY_ORDER = ("summary", "rewrite", "code", "classification", "math", "qa", "general")
+GENERATION_REPLAY_CATEGORY_ORDER = (
+    "exact",
+    "format",
+    "extraction",
+    "summary",
+    "rewrite",
+    "code",
+    "classification",
+    "math",
+    "qa",
+    "general",
+)
 GENERATION_REPLAY_CATEGORY_PATTERNS = (
+    (
+        "exact",
+        re.compile(
+            r"\b(exactly|answer only|reply only|return only|one word|two letters|single word)\b", re.IGNORECASE
+        ),
+    ),
+    ("format", re.compile(r"\b(json|yaml|csv|markdown|xml|key \"|one key)\b", re.IGNORECASE)),
+    ("extraction", re.compile(r"\b(extract|what is the .* from|answer with the .* only)\b", re.IGNORECASE)),
     ("summary", re.compile(r"\b(summarize|summary|tl;dr|one sentence|briefly summarize)\b", re.IGNORECASE)),
     ("rewrite", re.compile(r"\b(rewrite|rephrase|paraphrase|polish|edit|grammar|politely)\b", re.IGNORECASE)),
     (
@@ -360,6 +380,246 @@ def summarize_generation_replay_examples(examples: list[dict]) -> dict:
         "upstream_source_counts": dict(Counter(example.get("upstream_source", "unknown") for example in examples)),
         "category_counts": dict(Counter(example.get("category", "unknown") for example in examples)),
     }
+
+
+def _generation_replay_example(user: str, assistant: str, category: str, source: str = "exact_format") -> dict:
+    return {
+        "messages": [{"role": "user", "content": user}, {"role": "assistant", "content": assistant}],
+        "source": source,
+        "upstream_source": "synthetic_exact_format",
+        "category": category,
+    }
+
+
+def _synthetic_exact_format_replay_examples(seed: int = 42) -> list[dict]:
+    """Deterministic short-form replay examples for exact-answer preservation."""
+    examples: list[dict] = []
+
+    exact_words = [
+        "hello",
+        "OK",
+        "yes",
+        "no",
+        "done",
+        "ready",
+        "stop",
+        "retrieve",
+        "generate",
+        "true",
+        "false",
+        "pass",
+        "fail",
+        "blue",
+        "green",
+        "red",
+        "north",
+        "south",
+        "east",
+        "west",
+        "cat",
+        "dog",
+        "apple",
+        "banana",
+        "Paris",
+        "Tokyo",
+        "Python",
+        "CUDA",
+        "LoRA",
+        "GPU",
+        "CPU",
+        "JSON",
+        "UCSD",
+        "Monday",
+        "Friday",
+        "January",
+        "June",
+        "zero",
+        "one",
+        "two",
+        "three",
+        "ten",
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+        "review",
+        "merge",
+        "train",
+        "eval",
+    ]
+    exact_templates = [
+        ("Reply with exactly this word: {answer}", "{answer}"),
+        ("Return only this token: {answer}", "{answer}"),
+        ("Answer with the single word {answer}.", "{answer}"),
+        ("Write exactly {answer} and nothing else.", "{answer}"),
+        ("For this check, output just: {answer}", "{answer}"),
+        ("Repeat the target once, exactly: {answer}", "{answer}"),
+        ("Respond with two letters only if applicable: {answer}", "{answer}"),
+        ("The required response is {answer}. Output only that.", "{answer}"),
+    ]
+    for answer in exact_words:
+        for user_template, assistant_template in exact_templates:
+            examples.append(
+                _generation_replay_example(
+                    user_template.format(answer=answer), assistant_template.format(answer=answer), "exact"
+                )
+            )
+
+    exact_phrases = [
+        "thank you",
+        "good morning",
+        "pull request",
+        "unit test",
+        "clean water",
+        "machine learning",
+        "San Diego",
+        "New York",
+        "Los Angeles",
+        "data science",
+        "open source",
+        "model eval",
+        "quality gate",
+        "base model",
+        "active adapter",
+        "short answer",
+        "final answer",
+        "dry run",
+        "job complete",
+        "looks good",
+    ]
+    phrase_templates = [
+        ("Reply with exactly this phrase: {answer}", "{answer}"),
+        ("Output the phrase {answer} once and stop.", "{answer}"),
+        ("Answer only with this phrase: {answer}", "{answer}"),
+        ("Return exactly these words: {answer}", "{answer}"),
+    ]
+    for answer in exact_phrases:
+        for user_template, assistant_template in phrase_templates:
+            examples.append(
+                _generation_replay_example(
+                    user_template.format(answer=answer), assistant_template.format(answer=answer), "exact"
+                )
+            )
+
+    format_values = [
+        ("answer", "yes"),
+        ("answer", "no"),
+        ("status", "ok"),
+        ("status", "done"),
+        ("mode", "retrieve"),
+        ("mode", "generate"),
+        ("city", "San Diego"),
+        ("language", "Python"),
+        ("unit", "meters"),
+        ("result", "pass"),
+        ("label", "positive"),
+        ("label", "negative"),
+        ("priority", "high"),
+        ("priority", "low"),
+        ("device", "GPU"),
+        ("format", "json"),
+        ("task", "eval"),
+        ("task", "train"),
+        ("team", "research"),
+        ("decision", "merge"),
+        ("number", "200"),
+        ("color", "blue"),
+        ("month", "June"),
+        ("day", "Friday"),
+        ("model", "Stage 1.5"),
+    ]
+    format_templates = [
+        ('Return JSON with one key "{key}" and value "{value}".', '{{"{key}": "{value}"}}'),
+        ('Output a compact JSON object where {key} is "{value}".', '{{"{key}": "{value}"}}'),
+        ('Respond only as JSON: key "{key}", value "{value}".', '{{"{key}": "{value}"}}'),
+        ('Use JSON format with {key} set to "{value}".', '{{"{key}": "{value}"}}'),
+        ("Return a one-line JSON answer for {key} = {value}.", '{{"{key}": "{value}"}}'),
+        ('Give only valid JSON containing "{key}": "{value}".', '{{"{key}": "{value}"}}'),
+        (
+            'Format the answer as JSON with a single field named "{key}". The value is "{value}".',
+            '{{"{key}": "{value}"}}',
+        ),
+        ('Produce only this JSON field: "{key}" equals "{value}".', '{{"{key}": "{value}"}}'),
+        ("Return YAML with key {key} and value {value}.", "{key}: {value}"),
+        ('Output CSV with header "{key}" and one row "{value}".', "{key}\n{value}"),
+        ('Return markdown bold text for the value "{value}".', "**{value}**"),
+        ("Return XML with tag {key} containing {value}.", "<{key}>{value}</{key}>"),
+        ("Return a key-value line for {key} and {value}.", "{key}: {value}"),
+        ('Return a Python dict with key "{key}" and value "{value}".', '{{"{key}": "{value}"}}'),
+        ("Answer using bracketed format [{key}={value}].", "[{key}={value}]"),
+        ('Return exactly "{key}: {value}".', "{key}: {value}"),
+    ]
+    for key, value in format_values:
+        for user_template, assistant_template in format_templates:
+            examples.append(
+                _generation_replay_example(
+                    user_template.format(key=key, value=value),
+                    assistant_template.format(key=key, value=value),
+                    "format",
+                )
+            )
+
+    extraction_rows = [
+        ("city", "I moved to San Diego in 2024.", "San Diego"),
+        ("city", "The conference will be held in Boston next May.", "Boston"),
+        ("city", "Our office is in Seattle near the water.", "Seattle"),
+        ("city", "The launch event happened in Austin.", "Austin"),
+        ("city", "The team visited Chicago for the workshop.", "Chicago"),
+        ("name", "Please send the report to William before noon.", "William"),
+        ("name", "Arjun reviewed the experiment notes.", "Arjun"),
+        ("name", "Maya approved the benchmark change.", "Maya"),
+        ("name", "Priya uploaded the adapter artifact.", "Priya"),
+        ("name", "Ravi checked the Kubernetes job.", "Ravi"),
+        ("color", "The selected swatch is blue.", "blue"),
+        ("color", "The warning label should be red.", "red"),
+        ("color", "The success badge is green.", "green"),
+        ("color", "The neutral option is gray.", "gray"),
+        ("color", "The highlight color is yellow.", "yellow"),
+        ("number", "There are 200 centimeters in 2 meters.", "200"),
+        ("number", "The batch size was 16.", "16"),
+        ("number", "The run used 250 training steps.", "250"),
+        ("number", "The threshold is 0.875.", "0.875"),
+        ("number", "The answer is 60 miles per hour.", "60"),
+        ("language", "The function is written in Python.", "Python"),
+        ("language", "The frontend component uses TypeScript.", "TypeScript"),
+        ("language", "The query is expressed in SQL.", "SQL"),
+        ("language", "The kernel example uses CUDA.", "CUDA"),
+        ("language", "The script uses Bash.", "Bash"),
+        ("model", "We evaluated Qwen3-Embedding-0.6B.", "Qwen3-Embedding-0.6B"),
+        ("model", "The base is Stage 1.5.", "Stage 1.5"),
+        ("model", "The adapter source is LoRA.", "LoRA"),
+        ("model", "The checkpoint is named final.", "final"),
+        ("model", "The pooling mode is mean.", "mean"),
+    ]
+    extraction_templates = [
+        ("Extract the {field} from this sentence and answer only with the {field}: {sentence}", "{answer}"),
+        ("What is the {field} in this text? Answer with the {field} only: {sentence}", "{answer}"),
+        ("Return only the {field} mentioned here: {sentence}", "{answer}"),
+        ("Read the sentence and output just the {field}: {sentence}", "{answer}"),
+        ("Identify the {field}; do not add extra words. Sentence: {sentence}", "{answer}"),
+        ("From this text, copy the {field} exactly: {sentence}", "{answer}"),
+        ("Answer with the {field} only. Text: {sentence}", "{answer}"),
+        ("Extract one value for {field}: {sentence}", "{answer}"),
+        ("Find the {field} and return it once: {sentence}", "{answer}"),
+        ("Copy only the {field} from the sentence: {sentence}", "{answer}"),
+        ("Return the requested {field}, no explanation: {sentence}", "{answer}"),
+        ("For field {field}, extract the value from: {sentence}", "{answer}"),
+        ("Single-field extraction. Field: {field}. Text: {sentence}", "{answer}"),
+        ("Give the {field} as a short answer: {sentence}", "{answer}"),
+    ]
+    for field, sentence, answer in extraction_rows:
+        for user_template, assistant_template in extraction_templates:
+            examples.append(
+                _generation_replay_example(
+                    user_template.format(field=field, sentence=sentence, answer=answer),
+                    assistant_template.format(field=field, sentence=sentence, answer=answer),
+                    "extraction",
+                )
+            )
+
+    rng = random.Random(seed)
+    rng.shuffle(examples)
+    return examples
 
 
 def _load_generation_replay_dataset(source: str):
@@ -449,7 +709,8 @@ def load_generation_replay_examples(
 
     Defaults to the same Tulu 3 SFT mixture used elsewhere in this repo's
     generation data path. Additional source aliases can be enabled as a
-    comma-separated list: `dolly15k,alpaca,code_alpaca,tulu3,ragbench,hotpotqa`.
+    comma-separated list:
+    `exact_format,dolly15k,alpaca,code_alpaca,tulu3,ragbench,hotpotqa`.
     """
     source_names = [s.strip().lower() for s in sources.split(",") if s.strip()]
     if num_examples <= 0:
@@ -464,6 +725,13 @@ def load_generation_replay_examples(
     per_source_scan_limit = per_source_target * scan_multiplier
     for source in source_names:
         try:
+            if source in {"exact_format", "exact_answer", "synthetic_exact_format"}:
+                synthetic = _synthetic_exact_format_replay_examples(seed=seed)
+                source_count = min(len(synthetic), per_source_scan_limit)
+                candidates.extend(synthetic[:source_count])
+                logger.info(f"Loaded {source_count} synthetic exact-format replay examples")
+                continue
+
             ds = _load_generation_replay_dataset(source)
             ds = ds.shuffle(seed=seed, buffer_size=10_000)
             source_count = 0

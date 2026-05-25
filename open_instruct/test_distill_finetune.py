@@ -8,7 +8,9 @@ from open_instruct.distill_finetune import (
     _balance_generation_replay_examples,
     _extract_medi2_text,
     _generation_replay_category,
+    _synthetic_exact_format_replay_examples,
     encode_student,
+    load_generation_replay_examples,
     load_medi2_examples,
     masked_next_token_kl_loss,
     validate_generation_replay_coverage,
@@ -132,6 +134,30 @@ def test_generation_replay_dataset_masks_prompt_tokens():
 def test_generation_replay_category_covers_gate_prompt_shapes():
     assert (
         _generation_replay_category(
+            [
+                {"role": "user", "content": "Reply with exactly this word: hello"},
+                {"role": "assistant", "content": "hello"},
+            ]
+        )
+        == "exact"
+    )
+    assert (
+        _generation_replay_category(
+            [{"role": "user", "content": 'Return JSON with one key "answer".'}, {"role": "assistant", "content": "{}"}]
+        )
+        == "format"
+    )
+    assert (
+        _generation_replay_category(
+            [
+                {"role": "user", "content": "Extract the city from this sentence."},
+                {"role": "assistant", "content": "Ok."},
+            ]
+        )
+        == "extraction"
+    )
+    assert (
+        _generation_replay_category(
             [{"role": "user", "content": "Summarize this in one sentence."}, {"role": "assistant", "content": "Ok."}]
         )
         == "summary"
@@ -180,6 +206,35 @@ def test_balance_generation_replay_examples_round_robins_categories():
     balanced = _balance_generation_replay_examples(examples, 4)
 
     assert [item["category"] for item in balanced] == ["summary", "rewrite", "code", "general"]
+
+
+def test_synthetic_exact_format_replay_has_required_target_categories():
+    examples = _synthetic_exact_format_replay_examples(seed=123)
+    counts = {}
+    for example in examples:
+        counts[example["category"]] = counts.get(example["category"], 0) + 1
+
+    assert counts["exact"] >= 400
+    assert counts["format"] >= 400
+    assert counts["extraction"] >= 400
+    assert any(
+        example["messages"][0]["content"] == "Reply with exactly this word: hello"
+        and example["messages"][1]["content"] == "hello"
+        for example in examples
+    )
+
+
+def test_load_generation_replay_examples_supports_synthetic_exact_format_only(monkeypatch):
+    monkeypatch.setattr("open_instruct.distill_finetune.logger.info", lambda *args, **kwargs: None)
+    monkeypatch.setattr("open_instruct.distill_finetune.logger.warning", lambda *args, **kwargs: None)
+
+    examples = load_generation_replay_examples(
+        120, sources="exact_format", balance_categories=True, scan_multiplier=20
+    )
+    summary = validate_generation_replay_coverage(examples, "exact,format,extraction", 30)
+
+    assert summary["source_counts"] == {"exact_format": 120}
+    assert set(summary["category_counts"]) == {"exact", "format", "extraction"}
 
 
 def test_validate_generation_replay_coverage_rejects_missing_required_category():
