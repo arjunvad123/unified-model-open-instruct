@@ -214,9 +214,27 @@ def test_synthetic_exact_format_replay_has_required_target_categories():
     for example in examples:
         counts[example["category"]] = counts.get(example["category"], 0) + 1
 
-    assert counts["exact"] >= 400
-    assert counts["format"] >= 400
+    assert counts["exact"] >= 900
+    assert counts["format"] >= 900
     assert counts["extraction"] >= 400
+    assert (
+        sum(
+            1
+            for example in examples
+            if example["messages"][0]["content"] == "Reply with exactly this word: hello"
+            and example["messages"][1]["content"] == "hello"
+        )
+        >= 500
+    )
+    assert (
+        sum(
+            1
+            for example in examples
+            if example["messages"][0]["content"] == 'Return JSON with one key "answer" and value "yes".'
+            and example["messages"][1]["content"] == '{"answer": "yes"}'
+        )
+        >= 500
+    )
     assert any(
         example["messages"][0]["content"] == "Reply with exactly this word: hello"
         and example["messages"][1]["content"] == "hello"

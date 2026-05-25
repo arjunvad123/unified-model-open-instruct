@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: distill-stage1-5-qwen3-gen-replay-exact
+  name: distill-stage1-5-qwen3-gen-replay-anchors
   namespace: svcl-self-improve
 spec:
   backoffLimit: 0
@@ -39,12 +39,12 @@ spec:
               set -euo pipefail
 
               echo "==========================================================="
-              echo "Pilot: Qwen3 retrieval distillation + targeted exact-answer replay KL"
+              echo "Pilot: Qwen3 retrieval distillation + repeated gate-anchor replay KL"
               echo "==========================================================="
               echo "Goal: train one active LoRA adapter that improves retrieval"
               echo "while preserving Stage 1.5 generation logits on assistant"
-              echo "tokens. Replay now includes synthetic exact/format/extraction"
-              echo "anchors for the expanded gate's short-answer failure mode."
+              echo "tokens. Replay now heavily repeats exact_hello/json_yes"
+              echo "anchors to test whether the KL objective can fix them."
               date -u +"start_utc=%Y-%m-%dT%H:%M:%SZ"
               nvidia-smi --query-gpu=index,name,memory.total --format=csv
 

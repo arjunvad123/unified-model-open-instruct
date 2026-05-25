@@ -395,6 +395,18 @@ def _synthetic_exact_format_replay_examples(seed: int = 42) -> list[dict]:
     """Deterministic short-form replay examples for exact-answer preservation."""
     examples: list[dict] = []
 
+    # Diagnostic anchors from the expanded preservation gate. A single copy of
+    # these prompts is too easy to miss in a 4k replay pool with 250 training
+    # steps, so repeat them heavily to distinguish "not sampled enough" from
+    # "the replay objective cannot fix free-running short-answer repetition."
+    gate_anchors = [
+        ("Reply with exactly this word: hello", "hello", "exact"),
+        ('Return JSON with one key "answer" and value "yes".', '{"answer": "yes"}', "format"),
+    ]
+    for _ in range(500):
+        for user, assistant, category in gate_anchors:
+            examples.append(_generation_replay_example(user, assistant, category))
+
     exact_words = [
         "hello",
         "OK",
